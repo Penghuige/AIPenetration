@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.coverage
+
+# 运行产物与日志（保留 omega 快照：fused 模式的默认输入）
+logs/
+output/**
+!output/
+!output/reports/
+!output/reports/omega_ai_scores_20260819_105630.json
+
+# 断点文件
+*_cp*.json
+*checkpoint*.json
+
+# IDE
+.idea/
+.vscode/
