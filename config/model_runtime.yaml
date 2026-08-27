@@ -1,0 +1,9 @@
+# AIPenetration 模型运行时配置
+# 生成式 LLM 走 OpenAI-compatible API（默认指向本机 WSL vLLM）；
+# 环境变量 AIPEN_LLM_BASE_URL / AIPEN_LLM_MODEL / AIPEN_LLM_API_KEY 可覆盖。
+llm:
+  base_url: "http://localhost:8000/v1"
+  api_key: "EMPTY"
+  model: "Qwen3-8B"
+  # 单次请求失败重试次数
+  retry: 2

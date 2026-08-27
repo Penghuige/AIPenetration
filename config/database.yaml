@@ -1,0 +1,8 @@
+# AIPenetration 数据库配置（唯一数据源：eps 岗位数据库）
+# 优先级: 环境变量(AIPEN_PG_*) > 本文件 > 代码内默认值
+database:
+  host: localhost
+  port: 5432
+  dbname: eps
+  user: postgres
+  password: ""
