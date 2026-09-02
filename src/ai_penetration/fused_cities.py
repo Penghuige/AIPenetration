@@ -19,7 +19,6 @@ import argparse
 import json
 import logging
 import re
-import sys
 import threading
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
@@ -231,7 +230,6 @@ def main() -> None:
 
     done = _load_checkpoint()  # {city: {year_str: stats}}
     lock = threading.Lock()
-    results: dict[str, dict[int, dict]] = {}
     with ProcessPoolExecutor(max_workers=args.workers, initializer=_init_worker,
                              initargs=(args.omega_file,)) as pool:
         for city in cities:

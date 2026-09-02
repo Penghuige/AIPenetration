@@ -50,7 +50,6 @@ def _guard_single_instance() -> None:
     防多 runner 重生实例在 03:00 同时拉起多个全国面板互相踩踏断点。
     """
     import os
-    import time
 
     try:
         import psutil
