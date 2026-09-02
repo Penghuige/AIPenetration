@@ -66,34 +66,81 @@ def _init_worker(omega_path: str) -> None:
     _WORKER["regex"] = build_skill_regex(load_merged_skills(include_llm=True))
 
 
-def _score_aligned(pairs: list[tuple]) -> list[tuple]:
-    """对一批 (position, description) 返回对齐的 (a, b, fused) 判定三元组。
+def _ensure_map(shard: str, map_dir: str) -> tuple | None:
+    """worker 端按城加载 ent 映射（mmap，跨城自动重载，OS 页缓存共享）。
 
     Args:
-        pairs: 每元素为 (position, job_description)。
+        shard: job 分片表名（作映射代际标识）。
+        map_dir: 映射 npy 所在目录。
 
     Returns:
-        与输入对齐的三元组列表。
+        (ids_sorted, inds_sorted) mmap 数组；无映射文件返回 None。
     """
-    return [
-        is_ai_fused(str(p or ""), str(d or ""), _WORKER["omega"], _WORKER["regex"])
-        for p, d in pairs
-    ]
+    if _WORKER.get("map_shard") == shard:
+        return _WORKER.get("map")
+    idp = Path(map_dir) / f"{shard}_ids.npy"
+    indp = Path(map_dir) / f"{shard}_inds.npy"
+    if not idp.exists():
+        _WORKER["map_shard"], _WORKER["map"] = shard, None
+        return None
+    ids_arr = np.load(idp, mmap_mode="r")
+    inds_arr = np.load(indp, mmap_mode="r")
+    _WORKER["map_shard"] = shard
+    _WORKER["map"] = (ids_arr, inds_arr)
+    return _WORKER["map"]
 
 
-def _build_ent_map(city: str, ent_shard: str, params: dict):
-    """流式读 ent 表建 recruit_id→industry 的排序数组映射。
+def _process_batch(shard: str, map_dir: str, rows: list) -> dict:
+    """worker 端整批处理：映射行业 + 三口径判定 + 三粒度聚合。
+
+    主进程零逐行工作（架构教训：主进程逐行处理会把吞吐腰斩）。
+
+    Args:
+        shard: job 分片表名（映射代际）。
+        map_dir: ent 映射 npy 目录。
+        rows: (position, job_description, publish_time, recruit_id) 列表。
+
+    Returns:
+        {f"{gran}|{year}|{half}|{q}|{industry}": {total,a,b,fused}} 局部聚合。
+    """
+    out: dict = defaultdict(lambda: {"total": 0, "a": 0, "b": 0, "fused": 0})
+    ent_map = _ensure_map(shard, map_dir)
+    if ent_map is not None:
+        ids_arr, inds_arr = ent_map
+        q = np.array([str(r[3] or "").strip() for r in rows], dtype="S32")
+        idx = np.searchsorted(ids_arr, q)
+        idx_c = np.clip(idx, 0, len(ids_arr) - 1)
+        hit = ids_arr[idx_c] == q
+        codes = np.where(hit, inds_arr[idx_c], b"")
+        industries = [classify_industry(c.decode("ascii", "ignore")) for c in codes]
+    else:
+        industries = ["未知"] * len(rows)
+    for row, industry in zip(rows, industries):
+        a_ai, b_ai, f_ai = is_ai_fused(
+            str(row[0] or ""), str(row[1] or ""), _WORKER["omega"], _WORKER["regex"])
+        for gran, y, h, k in _period_keys(row[2]):
+            s = out[f"{gran}|{y}|{h}|{k}|{industry}"]
+            s["total"] += 1
+            s["a"] += a_ai
+            s["b"] += b_ai
+            s["fused"] += f_ai
+    return dict(out)
+
+
+def _build_ent_map(city: str, ent_shard: str, params: dict, map_dir: Path) -> bool:
+    """流式读 ent 表建排序映射并存为 npy（worker 端 mmap 加载）。
 
     重复 recruit_id 经稳定排序后 searchsorted 命中首条，
-    与 LATERAL LIMIT 1 语义一致。
+    与 LATERAL LIMIT 1 语义一致（ent 重复行行业码一致性已验证 100%）。
 
     Args:
         city: 城市名（日志用）。
         ent_shard: ent 分片表名。
         params: eps 连接参数。
+        map_dir: 映射输出目录。
 
     Returns:
-        (ids_sorted, inds_sorted) numpy 'S' 数组，表空/失败返回 None。
+        映射是否成功建立（空表返回 False，视为无行业数据可继续）。
     """
     t0 = time.time()
     ids, inds = [], []
@@ -110,38 +157,20 @@ def _build_ent_map(city: str, ent_shard: str, params: dict):
                 inds.append((ind or "").strip())
     except psycopg2.Error as exc:
         logger.error("%s ent 映射读取失败: %s", city, str(exc)[:150])
-        return None
+        return False
     finally:
         conn.close()
     if not ids:
-        return None
+        return False
     ids_arr = np.array(ids, dtype="S32")
     inds_arr = np.array(inds, dtype="S16")
     del ids, inds
     order = np.argsort(ids_arr, kind="stable")
+    np.save(map_dir / f"{ent_shard.replace('ent_', 'job_', 1)}_ids.npy", ids_arr[order])
+    np.save(map_dir / f"{ent_shard.replace('ent_', 'job_', 1)}_inds.npy", inds_arr[order])
+    del ids_arr, inds_arr
     logger.info("%s ent 映射就绪: %d 行，%.0f 秒", city, len(order), time.time() - t0)
-    return ids_arr[order], inds_arr[order]
-
-
-def _lookup_industry(rids: list, ent_map) -> list:
-    """numpy 排序数组批量查行业码并归类到 GB/T 大类。
-
-    Args:
-        rids: recruit_id 字符串列表。
-        ent_map: (ids_sorted, inds_sorted) 或 None。
-
-    Returns:
-        与 rids 对齐的行业大类标签列表（未命中/空为"未知"）。
-    """
-    if ent_map is None:
-        return ["未知"] * len(rids)
-    ids_arr, inds_arr = ent_map
-    q = np.array([r.strip() for r in rids], dtype="S32")
-    idx = np.searchsorted(ids_arr, q)
-    idx_c = np.clip(idx, 0, len(ids_arr) - 1)
-    hit = ids_arr[idx_c] == q
-    codes = np.where(hit, inds_arr[idx_c], b"")
-    return [classify_industry(c.decode("ascii", "ignore")) for c in codes]
+    return True
 
 
 def _period_keys(pub) -> list:
@@ -191,23 +220,19 @@ def _run_city_industry(
         失败返回 None。
     """
     ent_shard = shard.replace("job_", "ent_", 1)
-    ent_map = _build_ent_map(city, ent_shard, params)
+    map_dir = _cells_dir() / "_maps"
+    map_dir.mkdir(parents=True, exist_ok=True)
+    _build_ent_map(city, ent_shard, params, map_dir)  # 空表不阻断（worker 端归"未知"）
     cells: dict = defaultdict(lambda: {"total": 0, "a": 0, "b": 0, "fused": 0})
     counter = {"rows": 0}
     c_lock = threading.Lock()
 
-    def consume(batch_rows: list, scores: list) -> None:
-        rids = [str(r[3] or "") for r in batch_rows]
-        inds = _lookup_industry(rids, ent_map)
-        for row, (a_ai, b_ai, f_ai), industry in zip(batch_rows, scores, inds):
-            for gran, y, h, q in _period_keys(row[2]):
-                s = cells[f"{gran}|{y}|{h}|{q}|{industry}"]
-                s["total"] += 1
-                s["a"] += a_ai
-                s["b"] += b_ai
-                s["fused"] += f_ai
+    def merge(partial: dict) -> None:
         with c_lock:
-            counter["rows"] += len(batch_rows)
+            for key, s in partial.items():
+                acc = cells[key]
+                for k in ("total", "a", "b", "fused"):
+                    acc[k] += s[k]
 
     def scan_range(lo: int, hi: int) -> None:
         conn = psycopg2.connect(**params)
@@ -235,13 +260,17 @@ def _run_city_industry(
                 batch = cur.fetchmany(50000)
                 if not batch:
                     break
-                pairs = [(r[0], r[1]) for r in batch]
-                pending.append((batch, pool.submit(_score_aligned, pairs)))
+                fut = pool.submit(_process_batch, shard, str(map_dir), batch)
+                pending.append((len(batch), fut))
                 if len(pending) >= 3:
-                    b, fut = pending.pop(0)
-                    consume(b, fut.result())
-            for b, fut in pending:
-                consume(b, fut.result())
+                    n, f = pending.pop(0)
+                    merge(f.result())
+                    with c_lock:
+                        counter["rows"] += n
+            for n, f in pending:
+                merge(f.result())
+                with c_lock:
+                    counter["rows"] += n
         except psycopg2.Error as exc:
             logger.error("%s 扫描异常: %s", city, str(exc)[:150])
         finally:
@@ -271,10 +300,16 @@ def _run_city_industry(
         for t in threads:
             t.join()
 
+    # 映射文件删除容错：worker 的 mmap 句柄可能仍持有（Windows 锁定），
+    # 文件按 shard 命名互不冲突，残留由 run 结束统一清理；删不掉不影响结果
+    for npy in map_dir.glob(f"{shard}_*.npy"):
+        try:
+            npy.unlink()
+        except OSError:
+            pass
     if counter["rows"] == 0:
         logger.error("%s 扫描 0 行", city)
         return None
-    del ent_map
     return dict(cells)
 
 
@@ -375,6 +410,13 @@ def main() -> None:
                              initargs=(args.omega_file,)) as pool:
         with ThreadPoolExecutor(max_workers=args.city_concurrency) as ctp:
             list(ctp.map(lambda t: process(*t), todo))
+
+    # 统一清理映射临时文件（此时 pool 已关闭，mmap 句柄已释放）
+    for stale in (_cells_dir() / "_maps").glob("*.npy") if (_cells_dir() / "_maps").exists() else []:
+        try:
+            stale.unlink()
+        except OSError:
+            pass
 
     if not args.cities:
         counts = build_panels(timestamp)
