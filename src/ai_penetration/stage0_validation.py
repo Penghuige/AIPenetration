@@ -16,11 +16,9 @@ import argparse
 import json
 import logging
 import random
-import sys
 import time
 from collections import Counter
 from datetime import datetime
-from pathlib import Path
 
 import psycopg2
 

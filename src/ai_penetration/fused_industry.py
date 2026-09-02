@@ -18,19 +18,17 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import sys
 import threading
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
-import psycopg2
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
 
 from config.paths import get_project_paths
 
-from .common import DEFAULT_OMEGA_SNAPSHOT, eps_conn_params, resolve_artifact_path, setup_logging
+from .common import DEFAULT_OMEGA_SNAPSHOT, eps_conn_params, setup_logging
 
 from .industry_classification import classify_industry
 from .load_guangdong import GD_SHARDS
