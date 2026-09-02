@@ -27,27 +27,25 @@ def load_ai_keyword_set() -> set[str]:
 
 
 def load_skill_names() -> list[str]:
-    """从 PostgreSQL 加载硬技能 + 软技能名。
+    """加载通用技能名（静态词典）。
+
+    原依赖 Employ26 库 dict.hard_skills/soft_skills，分离后改为
+    dicts/skill_names_general.txt 静态文件（2026-09-02 自该库导出 1994 项）。
 
     Returns:
-        技能名列表；PG 不可用时返回空列表。
+        技能名列表；文件不存在时返回空列表。
     """
-    try:
-        from sqlalchemy import text
-        from src.db.postgres import create_pg_engine
-
-        engine = create_pg_engine()
-        with engine.connect() as conn:
-            rows = conn.execute(text(
-                "SELECT skill_name FROM dict.hard_skills "
-                "UNION SELECT skill_name FROM dict.soft_skills"
-            )).mappings().all()
-        names = [str(r["skill_name"]).strip() for r in rows if r["skill_name"]]
-        logger.info("技能词典加载: %d 个技能", len(names))
-        return names
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("技能词典加载失败（PG 不可用）: %s", exc)
+    path = get_project_paths().project_root / "dicts" / "skill_names_general.txt"
+    if not path.exists():
+        logger.warning("通用技能词典不存在: %s", path)
         return []
+    names = [
+        line.strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
+    logger.info("技能词典加载: %d 个技能", len(names))
+    return names
 
 
 def _ai_skill_path() -> Path:
