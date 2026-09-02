@@ -1,7 +1,8 @@
 # AI 渗透率分析：数据库调用速查
 
-> 更新：2026-08-24  
-> 数据库：`eps`（独立 PostgreSQL，2014-2024 广东招聘数据）
+> 更新：2026-09-01  
+> 数据库：`eps`（独立 PostgreSQL，2014-2024 广东招聘数据）  
+> 结果表：`Employ26` 库 `public` schema（见第 6 节，由 `import_penetration_results.py` 导入维护）
 
 ## 1. 怎么连
 
@@ -54,6 +55,37 @@ WHERE substr(j.publish_time,1,4)='2024'
 | 抽岗位技能 | `skill_ai_anchor.extract_skills_fast(desc, regex)` |
 | 全量渗透率（方法 A/B） | `stream_penetration` / `anchor_penetration` |
 | 融合渗透率（按年抽样） | `fusion_sampling.py` |
+| 融合城市面板（21 市全量，多进程） | `fused_cities.py --workers 24 --scan-workers 8` |
+| 融合行业渗透率（A/B/C 三口径，多进程） | `fused_industry.py --year 2024 --workers 24 --scan-workers 8` |
 | 公司级 AIRatio | `company_airatio.py --method a/fused` |
 | 行业大类映射 | `industry_classification.classify_industry` |
 | 技能词典 | `dicts/ai_skill_terms.txt`（方法A）、`dicts/ai_skill_terms_llm.txt`（方法B） |
+
+## 6. 结果表（Employ26 库 public schema）
+
+分析产出已入库（幂等导入：`python -m src.ai_penetration.import_penetration_results`，TRUNCATE 后重写）：
+
+| 表 | 内容 | 粒度 | 行数 |
+|---|---|---|---|
+| `public.ai_penetration_fused_cities` | 21 市融合面板：A/B/C 三口径计数与率 + A-only/B-only/both 分解 | city × year（2014-2024） | 226 |
+| `public.ai_penetration_fused_industry` | 广深行业三口径（GB/T 大类；导入时剔除 total<500 小样本） | city × year × industry（2024） | 153 |
+
+字段：`total / a_jobs / b_jobs / fused_jobs [ / ab_both_jobs / a_only_jobs / b_only_jobs] / a_rate / b_rate / fused_rate`。
+
+查询示例（注意 PG `round` 需 numeric cast）：
+
+```sql
+-- 21 市 2024 融合率排名
+SELECT city, total, fused_jobs, round(100*fused_rate::numeric, 2) AS pct
+FROM public.ai_penetration_fused_cities WHERE year = 2024
+ORDER BY fused_rate DESC;
+
+-- 行业 Top8（跨广深合并，样本≥500）
+SELECT industry, sum(total)::bigint AS n,
+       round(100.0*sum(fused_jobs)/sum(total), 2) AS fused_pct
+FROM public.ai_penetration_fused_industry
+GROUP BY industry HAVING sum(total) >= 500
+ORDER BY fused_pct DESC LIMIT 8;
+```
+
+数据锚点（与 CSV 一致）：广州 2024 total=5,939,763 fused=26,337；深圳 2024 total=7,414,265 fused=67,632。
