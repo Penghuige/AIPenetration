@@ -49,6 +49,7 @@ logger = logging.getLogger("ai_penetration.fused_industry_national")
 
 _WORKER: dict = {}
 _YEAR_MO_RE = re.compile(r"^\s*(\d{4})-(\d{2})")
+_YEAR_ONLY_RE = re.compile(r"^\s*(\d{4})")
 MIN_TOTAL_THRESHOLD = 500
 _CELLS_DIRNAME = "fused_industry_national_cells"
 
@@ -91,9 +92,11 @@ def _ensure_map(shard: str, map_dir: str) -> tuple | None:
 
 
 def _process_batch(shard: str, map_dir: str, rows: list) -> dict:
-    """worker 端整批处理：映射行业 + 三口径判定 + 三粒度聚合。
+    """worker 端整批处理：映射行业 + 三口径判定 + 三粒度聚合（分组式）。
 
-    主进程零逐行工作（架构教训：主进程逐行处理会把吞吐腰斩）。
+    性能结构（两轮教训）：主进程与 worker 内都不得对每行做字符串键/多桶 dict
+    更新——先按 (年,月,行业) 分组计数，再对组（每批仅数百个）展开三粒度桶；
+    行业标签走 dict 缓存（industry_code 全局仅数百值）。
 
     Args:
         shard: job 分片表名（映射代际）。
@@ -103,7 +106,6 @@ def _process_batch(shard: str, map_dir: str, rows: list) -> dict:
     Returns:
         {f"{gran}|{year}|{half}|{q}|{industry}": {total,a,b,fused}} 局部聚合。
     """
-    out: dict = defaultdict(lambda: {"total": 0, "a": 0, "b": 0, "fused": 0})
     ent_map = _ensure_map(shard, map_dir)
     if ent_map is not None:
         ids_arr, inds_arr = ent_map
@@ -112,19 +114,55 @@ def _process_batch(shard: str, map_dir: str, rows: list) -> dict:
         idx_c = np.clip(idx, 0, len(ids_arr) - 1)
         hit = ids_arr[idx_c] == q
         codes = np.where(hit, inds_arr[idx_c], b"")
-        industries = [classify_industry(c.decode("ascii", "ignore")) for c in codes]
     else:
-        industries = ["未知"] * len(rows)
-    for row, industry in zip(rows, industries):
+        codes = [b""] * len(rows)
+    cache = _WORKER.get("ind_cache")
+    if cache is None:
+        cache = _WORKER["ind_cache"] = {}
+    groups: dict = {}  # (year, month, industry) -> [n, a, b, fused]
+    for row, code in zip(rows, codes):
+        industry = cache.get(code)
+        if industry is None:
+            industry = cache[code] = classify_industry(
+                code.decode("ascii", "ignore"))
         a_ai, b_ai, f_ai = is_ai_fused(
             str(row[0] or ""), str(row[1] or ""), _WORKER["omega"], _WORKER["regex"])
-        for gran, y, h, k in _period_keys(row[2]):
-            s = out[f"{gran}|{y}|{h}|{k}|{industry}"]
-            s["total"] += 1
-            s["a"] += a_ai
-            s["b"] += b_ai
-            s["fused"] += f_ai
-    return dict(out)
+        pub = str(row[2] or "")
+        m = _YEAR_MO_RE.match(pub)
+        if m:
+            y, mo = int(m.group(1)), int(m.group(2))
+            if not 1 <= mo <= 12:
+                mo = 0
+        else:
+            m2 = _YEAR_ONLY_RE.match(pub)
+            if not m2:
+                continue
+            y, mo = int(m2.group(1)), 0
+        g = groups.get((y, mo, industry))
+        if g is None:
+            g = groups[(y, mo, industry)] = [0, 0, 0, 0]
+        g[0] += 1
+        g[1] += a_ai
+        g[2] += b_ai
+        g[3] += f_ai
+    out: dict = {}
+
+    def add(key: str, n: int, a: int, b: int, f: int) -> None:
+        s = out.get(key)
+        if s is None:
+            out[key] = {"total": n, "a": a, "b": b, "fused": f}
+            return
+        s["total"] += n
+        s["a"] += a
+        s["b"] += b
+        s["fused"] += f
+
+    for (y, mo, ind), (n, a, b, f) in groups.items():
+        add(f"年度|{y}|0|0|{ind}", n, a, b, f)
+        if mo:
+            add(f"半年度|{y}|{1 if mo <= 6 else 2}|0|{ind}", n, a, b, f)
+            add(f"季度|{y}|0|{(mo - 1) // 3 + 1}|{ind}", n, a, b, f)
+    return out
 
 
 def _build_ent_map(city: str, ent_shard: str, params: dict, map_dir: Path) -> bool:
@@ -172,29 +210,6 @@ def _build_ent_map(city: str, ent_shard: str, params: dict, map_dir: Path) -> bo
     logger.info("%s ent 映射就绪: %d 行，%.0f 秒", city, len(order), time.time() - t0)
     return True
 
-
-def _period_keys(pub) -> list:
-    """由 publish_time 生成三粒度期间键。
-
-    Args:
-        pub: 发布时间字符串（'YYYY-MM...' 起头）。
-
-    Returns:
-        [("年度", y, 0, 0)]，月份可解析时追加半年度/季度键；
-        年份不可解析时返回空列表。
-    """
-    m = _YEAR_MO_RE.match(str(pub or ""))
-    if m:
-        y, mo = int(m.group(1)), int(m.group(2))
-        if 1 <= mo <= 12:
-            return [
-                ("年度", y, 0, 0),
-                ("半年度", y, 1 if mo <= 6 else 2, 0),
-                ("季度", y, 0, (mo - 1) // 3 + 1),
-            ]
-        return [("年度", y, 0, 0)]
-    m2 = re.match(r"^\s*(\d{4})", str(pub or ""))
-    return [("年度", int(m2.group(1)), 0, 0)] if m2 else []
 
 
 def _run_city_industry(
