@@ -1,8 +1,10 @@
-# AIPenetration 数据库配置（唯一数据源：eps 岗位数据库）
-# 优先级: 环境变量(AIPEN_PG_*) > 本文件 > 代码内默认值
+# AIPenetration 数据库配置（数据源：eps 岗位数据库；产出：独立结果库）
+# 优先级: 环境变量(AIPEN_PG_* / AIPEN_RESULTS_*) > 本文件 > 代码内默认值
 database:
   host: localhost
   port: 5432
   dbname: eps
   user: postgres
   password: ""
+  # 结果库：分析产出表写入这里，与 eps 源库物理隔离（禁止写 eps.public）
+  results_db: ai_pen_results

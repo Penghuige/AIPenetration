@@ -183,18 +183,42 @@ def _cp():
     return eps_conn_params()
 
 
+def _existing_freq_rows(cur) -> int | None:
+    """返回 ai_dict.zh_alias_freq 现有行数；表不存在返回 None（防误重跑用）。"""
+    cur.execute("SELECT to_regclass('ai_dict.zh_alias_freq')")
+    if cur.fetchone()[0] is None:
+        return None
+    cur.execute("SELECT count(*) FROM ai_dict.zh_alias_freq")
+    return cur.fetchone()[0]
+
+
 def main() -> None:
     """中文别名频数计算入口。"""
     parser = argparse.ArgumentParser(description="中文/混合别名频数计算")
     parser.add_argument("--years", type=str, default="2024")
     parser.add_argument("--cities", type=str, default="广州市,深圳市")
     parser.add_argument("--batch-size", type=int, default=100000)
+    parser.add_argument("--force", action="store_true",
+                        help="已有频数表时也强制 DROP 重算（默认拒绝，防止误重跑丢历史结果）")
     args = parser.parse_args()
 
     paths = get_project_paths()
     setup_logging(paths.project_root / "logs" / "zh_alias_freq.log")
     cities = [c.strip() for c in args.cities.split(",") if c.strip()]
     years = [int(y.strip()) for y in args.years.split(",") if y.strip()]
+
+    if not args.force:
+        conn = eps_connect()
+        try:
+            existing = _existing_freq_rows(conn.cursor())
+        finally:
+            conn.close()
+        if existing is not None:
+            logger.error(
+                "ai_dict.zh_alias_freq 已存在（%d 行），重算会 DROP 覆盖历史结果；"
+                "确需重算请加 --force", existing,
+            )
+            raise SystemExit(2)
 
     alias_map = load_zh_mixed_aliases()
     automaton = build_automaton(alias_map)
