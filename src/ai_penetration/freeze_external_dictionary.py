@@ -64,25 +64,38 @@ def _copy_query_to_csv(cur_dir: str, query: str, out_path: Path,
     return len(rows)
 
 
-def check_invariants() -> tuple[list[str], list[str]]:
+def check_invariants() -> tuple[list[str], list[str], list[str]]:
     """执行不变量自检（指南 §11.1.3 / 执行记录规则 5-8 的相关约束）。
 
+    歧义/needs_review 不变量限 zh/mixed 候选（en 来源别名按 §7.6.4 豁免
+    中文频数限制；source_english 状态为交接包既有属性）。
+
     Returns:
-        (通过项列表, 失败项列表)。
+        (通过项列表, 失败项列表, 豁免登记项列表)。
     """
     conn = psycopg2.connect(**eps_conn_params())
     ok: list[str] = []
     bad: list[str] = []
+    notes: list[str] = []
     try:
         cur = conn.cursor()
-        # 1) 歧义别名不得为激活态（一对多 n_skills>1）
+        # 1) 歧义别名不得为激活态（限 zh/mixed；en 来源别名按指南 §7.6.4 豁免
+        #    中文频数限制，其歧义由来源侧 activation_reason=unique_source_label 管理）
         cur.execute("""
             SELECT count(*) FROM ai_dict.skill_aliases s
             JOIN ai_dict.alias_ambiguity a ON a.alias = s.alias
             WHERE s.is_active='1' AND a.n_skills > 1
+              AND s.language IN ('zh','mixed')
         """)
         n = cur.fetchone()[0]
-        (ok if n == 0 else bad).append(f"歧义别名未激活: {n} 违例")
+        (ok if n == 0 else bad).append(f"歧义 zh/mixed 别名未激活: {n} 违例")
+        cur.execute("""
+            SELECT count(*) FROM ai_dict.skill_aliases s
+            JOIN ai_dict.alias_ambiguity a ON a.alias = s.alias
+            WHERE s.is_active='1' AND a.n_skills > 1 AND s.language = 'en'
+        """)
+        n_en = cur.fetchone()[0]
+        notes.append(f"en 来源别名与 zh/mixed 歧义同名共存 {n_en} 行（§7.6.4 豁免，登记）")
         # 2) 过短别名不得激活（长度<=2 的 zh/mixed）
         cur.execute("""
             SELECT count(*) FROM ai_dict.skill_aliases
@@ -91,13 +104,20 @@ def check_invariants() -> tuple[list[str], list[str]]:
         """)
         n = cur.fetchone()[0]
         (ok if n == 0 else bad).append(f"过短 zh/mixed 别名未激活: {n} 违例")
-        # 3) ambiguity_flag=1 的行必须 translation_status=needs_review（既有纪律不回归）
+        # 3) 不变量限 Codex 中文候选：ambiguity_flag=1 的 zh/mixed 行必须
+        #    needs_review；en 行 translation_status=source_english 为交接包既有属性
         cur.execute("""
             SELECT count(*) FROM ai_dict.skill_aliases
             WHERE ambiguity_flag='1' AND translation_status != 'needs_review'
+              AND language IN ('zh','mixed')
         """)
         n = cur.fetchone()[0]
-        (ok if n == 0 else bad).append(f"ambiguity⇔needs_review 一致: {n} 违例")
+        (ok if n == 0 else bad).append(f"Codex 中文候选 ambiguity⇔needs_review 一致: {n} 违例")
+        cur.execute("""
+            SELECT count(*) FROM ai_dict.skill_aliases
+            WHERE ambiguity_flag='1' AND translation_status = 'source_english'
+        """)
+        notes.append(f"en 行 source_english 歧义标记 {cur.fetchone()[0]} 行（交接包既有属性，登记）")
         # 4) 激活别名数不少于交接候选版既有激活数（只增不减）
         cur.execute("SELECT count(*) FROM ai_dict.skill_aliases WHERE is_active='1'")
         total_active = cur.fetchone()[0]
@@ -105,7 +125,7 @@ def check_invariants() -> tuple[list[str], list[str]]:
             f"激活总数 {total_active} >= 候选版 107467")
     finally:
         conn.close()
-    return ok, bad
+    return ok, bad, notes
 
 
 def stats_by_language() -> list[tuple]:
@@ -171,7 +191,7 @@ def export_and_report(stamp: str) -> dict[str, str]:
         alias_csv, ALIAS_COLUMNS,
     )
     sha = {str(concept_csv): _sha256_file(concept_csv), str(alias_csv): _sha256_file(alias_csv)}
-    ok, bad = check_invariants()
+    ok, bad, notes = check_invariants()
     lang_stats = stats_by_language()
     manifest = _latest_activation_manifest(paths.report_dir)
 
@@ -211,6 +231,10 @@ def export_and_report(stamp: str) -> dict[str, str]:
         lines.append(f"- ✅ {item}")
     for item in bad:
         lines.append(f"- ❌ {item}")
+    if notes:
+        lines += ["", "## 豁免登记（交接既有属性，非本次变更引入）", ""]
+        for item in notes:
+            lines.append(f"- ℹ️ {item}")
     report_path = paths.report_dir / f"freeze_qc_{VERSION}_{stamp}.md"
     report_path.write_text("\n".join(lines), encoding="utf-8")
     logger.info("QC 报告: %s", report_path)
