@@ -90,11 +90,25 @@ class _SkipHeader:
         return self._f.closed
 
 
+def _already_imported(cur) -> bool:
+    """判断 ai_dict 两表是否已完整导入（行数达期望值），用于防误重跑。"""
+    for table, expected in ((CONCEPT_TABLE, EXPECTED_CONCEPTS), (ALIAS_TABLE, EXPECTED_ALIASES)):
+        cur.execute("SELECT to_regclass(%s)", (table,))
+        if cur.fetchone()[0] is None:
+            return False
+        cur.execute(f"SELECT count(*) FROM {table}")
+        if cur.fetchone()[0] < expected:
+            return False
+    return True
+
+
 def main() -> None:
     """导入交接包词典入口。"""
     parser = argparse.ArgumentParser(description="导入交接包技能词典")
     parser.add_argument("--exchange-dir", type=str,
                         default=r"D:\PythonProjects\exchange")
+    parser.add_argument("--force", action="store_true",
+                        help="已完整导入时也强制 DROP 重建（默认拒绝，防止误重跑覆盖 ai_dict）")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -114,6 +128,13 @@ def main() -> None:
     conn = _connect()
     try:
         cur = conn.cursor()
+        if not args.force and _already_imported(cur):
+            logger.error(
+                "ai_dict 词典已完整导入（概念 %d / 别名 %d）。本操作将 DROP 重建、"
+                "并连带影响 zh_alias_freq/alias_ambiguity 的下游一致性；确需重建请加 --force",
+                EXPECTED_CONCEPTS, EXPECTED_ALIASES,
+            )
+            raise SystemExit(2)
         cur.execute("SET LOCAL work_mem = '1GB'")
 
         cur.execute(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}")

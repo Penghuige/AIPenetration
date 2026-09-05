@@ -13,6 +13,8 @@
     AIPEN_PG_DBNAME   — 岗位数据库名（默认 eps）
     AIPEN_PG_USER     — 用户名
     AIPEN_PG_PASSWORD — 密码
+    AIPEN_RESULTS_DBNAME — 结果库名（默认 ai_pen_results，与 eps 源库隔离）
+    AIPEN_RESULTS_HOST/PORT/USER/PASSWORD — 结果库整体改向（默认沿用源库参数）
     AIPEN_LLM_BASE_URL — LLM OpenAI-compatible API 地址
     AIPEN_LLM_MODEL    — LLM 服务模型名
     AIPEN_LLM_API_KEY  — LLM API key
@@ -125,12 +127,14 @@ def load_config_yaml(name: str) -> dict[str, Any]:
 class ProjectPaths:
     """项目集中配置对象。
 
-    PostgreSQL 连接参数（默认即 eps 岗位库）与输出路径的统一来源。
-    每个字段都可通过环境变量覆盖，默认值基于项目根目录的相对路径。
+    PostgreSQL 连接参数（源库默认即 eps 岗位库）、独立结果库连接参数
+    与输出路径的统一来源。每个字段都可通过环境变量覆盖，
+    默认值基于项目根目录的相对路径。
     """
 
     project_root: Path
     pg_connection_params: dict = field(default_factory=dict)
+    results_connection_params: dict = field(default_factory=dict)
     output_dir: Path = field(default_factory=Path)
     dict_dir: Path = field(default_factory=Path)
     config_dir: Path = field(default_factory=Path)
@@ -180,11 +184,35 @@ class ProjectPaths:
         Returns:
             str: SQLAlchemy 连接 URL。
         """
-        target_db = dbname or self.pg_dbname
-        user = quote_plus(str(self.pg_user))
-        password = quote_plus(str(self.pg_password))
+        return self._url_for(self.pg_connection_params, dbname)
+
+    @property
+    def results_dbname(self) -> str:
+        """结果数据库名（与 eps 源库隔离，存放分析产出表）。"""
+        return self.results_connection_params.get("dbname", "ai_pen_results")
+
+    def results_pg_sqlalchemy_url(self) -> str:
+        """返回结果库的 SQLAlchemy 连接 URL。
+
+        结果库默认与源库同实例（host/port/user/password 沿用），
+        仅 dbname 独立；可通过 AIPEN_RESULTS_* 环境变量整体改向。
+
+        Returns:
+            str: SQLAlchemy 连接 URL。
+        """
+        return self._url_for(self.results_connection_params, None)
+
+    @staticmethod
+    def _url_for(params: dict, dbname_override: str | None) -> str:
+        """按连接参数 dict 生成 URL 编码后的 SQLAlchemy 连接串。"""
+        target_db = dbname_override or params.get("dbname", "eps")
+        user = quote_plus(str(params.get("user", "postgres")))
+        password = quote_plus(str(params.get("password", "")))
         auth = f"{user}:{password}" if password else user
-        return f"postgresql+psycopg2://{auth}@{self.pg_host}:{self.pg_port}/{target_db}"
+        return (
+            f"postgresql+psycopg2://{auth}@{params.get('host', 'localhost')}"
+            f":{params.get('port', 5432)}/{target_db}"
+        )
 
 
 def get_project_paths(
@@ -224,9 +252,30 @@ def get_project_paths(
         "password": str(_resolve_setting("password", "AIPEN_PG_PASSWORD", "")),
     }
 
+    # 结果库：默认与源库同实例，仅库名独立（yaml database.results_db）。
+    # 各键均可用 AIPEN_RESULTS_* 覆盖，未覆盖时沿用源库参数。
+    yaml_results_db = (
+        yaml_database.get("results_db") if isinstance(yaml_database, dict) else None
+    )
+    results_connection_params = {
+        "host": os.getenv("AIPEN_RESULTS_HOST") or pg_connection_params["host"],
+        "port": int(
+            os.getenv("AIPEN_RESULTS_PORT") or pg_connection_params["port"]
+        ),
+        "dbname": (
+            os.getenv("AIPEN_RESULTS_DBNAME")
+            or str(yaml_results_db or "ai_pen_results")
+        ),
+        "user": os.getenv("AIPEN_RESULTS_USER") or pg_connection_params["user"],
+        "password": str(
+            os.getenv("AIPEN_RESULTS_PASSWORD", pg_connection_params["password"])
+        ),
+    }
+
     return ProjectPaths(
         project_root=root,
         pg_connection_params=pg_connection_params,
+        results_connection_params=results_connection_params,
         output_dir=root / "output",
         dict_dir=root / "dicts",
         config_dir=root / "config",

@@ -46,12 +46,14 @@ logs/                 # 运行日志
    database:
      host: localhost
      port: 5432
-     dbname: eps
+     dbname: eps            # 源库（只读为主）
      user: postgres
      password: "<你的密码>"
+     results_db: ai_pen_results   # 结果库：分析产出表写这里，不污染 eps
    ```
-   也可用环境变量 `AIPEN_PG_*` 覆盖。LLM API 用 `AIPEN_LLM_BASE_URL/MODEL/API_KEY`
-   或编辑 `config/model_runtime.yaml`。
+   也可用环境变量 `AIPEN_PG_*`（源库）/ `AIPEN_RESULTS_*`（结果库）覆盖。
+   结果导入脚本 `import_penetration_results.py` 首次运行加 `--create-db` 建库。
+   LLM API 用 `AIPEN_LLM_BASE_URL/MODEL/API_KEY` 或编辑 `config/model_runtime.yaml`。
 
 3. **运行**（均从项目根目录执行）:
    ```bash

@@ -23,13 +23,19 @@
 
 ### 数据存储
 
-- PostgreSQL 是唯一正式数据库，本项目只连接 `eps` 库（默认 `localhost:5432`）
-- 连接参数统一来自 `config/database.yaml`（环境变量 `AIPEN_PG_*` 可覆盖）
+- PostgreSQL 是唯一正式数据库；两个角色库：`eps`（源库，默认 `localhost:5432`，
+  只读为主）与 `ai_pen_results`（结果库，分析产出表写入处）
+- 连接参数统一来自 `config/database.yaml`（环境变量 `AIPEN_PG_*` 覆盖源库、
+  `AIPEN_RESULTS_*` 覆盖结果库；结果库默认沿用源库实例参数，仅库名独立）
 - 代理**不得**执行 `pg_ctl start/stop/restart`，不得启动/停止/杀掉 PostgreSQL 进程；
   连接失败时报告状态，由用户自行处理
-- SQLAlchemy URL 一律通过 `paths.pg_sqlalchemy_url()` 获取，禁止手拼含密码的字符串
+- SQLAlchemy URL 一律通过 `paths.pg_sqlalchemy_url()` / `paths.results_pg_sqlalchemy_url()`
+  获取，禁止手拼含密码的字符串
 - 词典导入、频数计算等写入操作的目标 schema 是 `ai_dict`；
   临时验证数据如需写库，放入独立测试库或先征询用户，禁止污染正式表
+- **eps 保护**：分析结果表一律写结果库，禁止建在 `eps.public`；
+  写库脚本（词典导入/频数重算/结果导入）检测到目标已有完整数据时
+  默认拒绝重跑，需显式 `--force`（或 `--allow-source-db`）才重建
 
 ### 路径与配置
 
