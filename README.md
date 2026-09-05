@@ -68,6 +68,23 @@ logs/                 # 运行日志
    ```
    全量流式脚本支持断点续跑（`output/ai_penetration/*_cp*.json`），中断后重跑即可跳过已完成分片。
 
+## 外部技能词典冻结管线（exchange 交接·第二节四步）
+
+```bash
+# 1. 频数计算（广深语料，去重口径 COUNT(DISTINCT platform×规范化text)，约1-2h）
+python -X utf8 -m src.ai_penetration.zh_alias_freq --force
+
+# 2-3. 阈值激活（先 dry-run 看候选，确认后 --apply）
+python -m src.ai_penetration.zh_alias_activation --min-freq 100
+python -m src.ai_penetration.zh_alias_activation --min-freq 100 --apply
+
+# 4. 交叉验证（用既有 AI 率方法审计激活质量）
+python -m src.ai_penetration.cross_validate_alias_activation --per-city 10000
+
+# 5. 导出 A 级冻结词典 + QC 报告（不变量自检失败会阻断）
+python -m src.ai_penetration.freeze_external_dictionary
+```
+
 ## 判定方法速览
 
 | 口径 | 实现 | 说明 |

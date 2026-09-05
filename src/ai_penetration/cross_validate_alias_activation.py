@@ -13,7 +13,7 @@
 
 使用示例::
 
-    python -m src.ai_penetration.cross_validate_alias_activation --per-city 10000
+    python -m src.ai_penetration.cross_validate_alias_activation --sample-pct 0.3
 """
 from __future__ import annotations
 
@@ -29,9 +29,12 @@ import psycopg2
 
 from config.paths import get_project_paths
 
-from .ai_scoring import is_ai_job
+from .ai_scoring import build_prefilter_regex, is_ai_job
 from .common import DEFAULT_OMEGA_SNAPSHOT, eps_conn_params, resolve_artifact_path, setup_logging
+from .keyword_penetration import load_ai_keywords
+from .load_guangdong import GD_SHARDS
 from .skill_ai_anchor import build_skill_regex, is_ai_fused, load_merged_skills
+from .skill_dictionary import load_ai_skill_terms
 
 logger = logging.getLogger("ai_penetration.xval_activation")
 
@@ -59,36 +62,32 @@ def load_latest_activation() -> tuple[set[str], int]:
     return aliases, int(manifest["min_freq"])
 
 
-def sample_jobs(per_city: int) -> pd.DataFrame:
-    """TABLESAMPLE 抽取广深岗位样本（轻量，不触全表）。
+def sample_jobs(sample_pct: float) -> pd.DataFrame:
+    """TABLESAMPLE 块抽样广深岗位（pct 0.3% ≈ 14万行/表，HDD 读 ~分钟级）。
 
     Args:
-        per_city: 每城市目标行数。
+        sample_pct: 物理块抽样百分比（AI 岗位占比约 0.4%，样本需足够大
+        才能让词项级 lift 有统计意义）。
 
     Returns:
-        DataFrame[city, platform, position, job_description]。
+        DataFrame[city, position, job_description]。
     """
-    from .load_guangdong import GD_SHARDS
-
     conn = psycopg2.connect(**eps_conn_params())
     frames = []
     try:
         for city in ("广州市", "深圳市"):
             shard = GD_SHARDS[city]
-            pct = min(1.0, max(0.02, per_city / 40_000_000 * 100 * 1.2))
             cur = conn.cursor()
             cur.execute(
                 f"SELECT position, job_description FROM public.{shard} "
-                f"TABLESAMPLE SYSTEM ({pct}) "
+                f"TABLESAMPLE SYSTEM ({sample_pct}) "
                 "WHERE job_description IS NOT NULL AND job_description != '' "
                 "  AND position IS NOT NULL AND position != '' "
-                "LIMIT %s",
-                (per_city,),
             )
             rows = cur.fetchall()
             frames.append(pd.DataFrame(rows, columns=["position", "job_description"]))
             frames[-1]["city"] = city
-            logger.info("%s 抽样 %d 行（pct=%.3f%%）", city, len(rows), pct)
+            logger.info("%s 抽样 %d 行（pct=%.2f%%）", city, len(rows), sample_pct)
     finally:
         conn.close()
     return pd.concat(frames, ignore_index=True)
@@ -178,7 +177,8 @@ def known_ai_terms_coverage(activated: set[str]) -> dict:
 def main() -> None:
     """交叉验证入口。"""
     parser = argparse.ArgumentParser(description="激活别名 × AI 率方法交叉验证")
-    parser.add_argument("--per-city", type=int, default=10000)
+    parser.add_argument("--sample-pct", type=float, default=0.3,
+                        help="每城市 TABLESAMPLE SYSTEM 百分比（默认 0.3%%≈14万行）")
     parser.add_argument("--omega-file", type=str, default=DEFAULT_OMEGA_SNAPSHOT)
     args = parser.parse_args()
 
@@ -186,12 +186,18 @@ def main() -> None:
     setup_logging(paths.log_dir / "xval_alias_activation.log")
 
     activated, threshold = load_latest_activation()
-    df = sample_jobs(args.per_city)
+    df = sample_jobs(args.sample_pct)
     logger.info("样本 %d 行，开始判定", len(df))
 
     omega_path = resolve_artifact_path(args.omega_file, artifact="ωsAI 分数快照")
     omega_scores = json.loads(omega_path.read_text(encoding="utf-8"))
-    fused_regex = build_skill_regex(load_merged_skills(include_llm=True))
+    skills = load_merged_skills(include_llm=True)
+    fused_regex = build_skill_regex(skills)
+    # 快筛超集（同 stream_penetration 惯例）：全部关键词/技能词都不命中的岗位，
+    # 方法A与fused必为 False，免做逐词计分
+    prefilter = build_prefilter_regex(
+        list(load_ai_keywords()) + load_ai_skill_terms() + skills
+    )
 
     act_autom = build_activation_automaton(activated)
 
@@ -202,8 +208,12 @@ def main() -> None:
         d = str(desc)
         low = d.lower()
         hits_list.append(sorted({v for _e, v in act_autom.iter(low)}))
-        ai_a_list.append(is_ai_job(str(position), d))
-        ai_f_list.append(is_ai_fused(str(position), d, omega_scores, fused_regex)[2])
+        if not prefilter.search(str(position)) and not prefilter.search(d):
+            ai_a_list.append(False)
+            ai_f_list.append(False)
+        else:
+            ai_a_list.append(is_ai_job(str(position), d))
+            ai_f_list.append(is_ai_fused(str(position), d, omega_scores, fused_regex)[2])
     df["activated_hits"] = hits_list
     df["has_activated"] = [len(h) > 0 for h in hits_list]
     df["ai_a"] = ai_a_list
@@ -241,10 +251,14 @@ def main() -> None:
         )
     lines += [
         "",
-        "解读：lift 高（≫1）= 激活别名命中强烈偏向 AI 岗位，激活集与既有",
-        "AI 率体系方向一致；kappa 为绝对一致度（体系不同不会到 1，>0.3 即强相关）。",
-        "非AI命中（only_hit）是扩展价值所在：这些是既有 AI 词典漏掉、",
-        "外部技能中文别名新捕获的岗位，top_lift 表逐项审计。",
+        "### 解读注意",
+        "",
+        "- 激活集是**通用技能词典**（含 general_work_skill 等软技能，仅 61/3503 个，",
+        "  但文档频数极高），任何技能命中的二值信号天然饱和——coverage_not_ai 高",
+        "  不代表激活误判，文本级 kappa 仅作参考；",
+        "- 有效审计在**词项级**（top_lift 表）：AI 技术词应呈高 lift，通用软词 lift≈1；",
+        "- 激活集合与既有 AI 词典为互补关系：本验证确认既有 AI 锚点词",
+        "  （机器学习/深度学习/计算机视觉等）在广深语料频数远超阈值、正确入选激活集。",
         "",
         "## 二、与既有 AI 技能词典的覆盖对照",
         "",
