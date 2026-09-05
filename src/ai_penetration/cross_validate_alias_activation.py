@@ -142,8 +142,11 @@ def agreement_row(df: pd.DataFrame, hit_col: str) -> dict:
     return out
 
 
-def per_alias_lift(df: pd.DataFrame, alias_col: str, top: int) -> pd.DataFrame:
-    """top 激活别名逐个的 AI 样本命中 lift（explode 后分组统计）。"""
+def per_alias_lift(df: pd.DataFrame, alias_col: str, min_n: int = 100) -> pd.DataFrame:
+    """激活别名逐个的 AI 样本命中 lift（explode 分组，输出命中>=min_n 的全部词）。
+
+    按 n 排序会淹没 AI 特异词（它们在中频段），故保留全量供 lift 排序审计。
+    """
     tmp = df.explode(alias_col, ignore_index=True)
     tmp = tmp[tmp[alias_col].notna()]
     stats = tmp.groupby(alias_col).agg(
@@ -152,7 +155,8 @@ def per_alias_lift(df: pd.DataFrame, alias_col: str, top: int) -> pd.DataFrame:
     stats["ai_rate_in_hit"] = stats["ai_n"] / stats["n"]
     base = float(df["ai_a"].mean())
     stats["lift"] = stats["ai_rate_in_hit"] / base if base else 0.0
-    return stats.sort_values("n", ascending=False).head(top)
+    return (stats[stats["n"] >= min_n]
+            .sort_values("lift", ascending=False).reset_index(drop=True))
 
 
 def known_ai_terms_coverage(activated: set[str]) -> dict:
@@ -220,7 +224,7 @@ def main() -> None:
     df["ai_fused"] = ai_f_list
 
     agree = agreement_row(df, "has_activated")
-    top_lift = per_alias_lift(df, "activated_hits", 60)
+    top_lift = per_alias_lift(df, "activated_hits", min_n=100)
     coverage = known_ai_terms_coverage(activated)
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
