@@ -35,6 +35,31 @@ ALIAS_CSV = "02_完整双语候选词典/skill_alias_bilingual_complete_candidat
 EXPECTED_CONCEPTS = 22683
 EXPECTED_ALIASES = 153804
 
+# 交接包 QC 登记的 CSV SHA-256（2026-09-06 实测一致），入库前自校验
+EXPECTED_SHA256 = {
+    "concept": "581622ca36ac3f97aca20a2a3a1a60348cce958a8570ce0236afc4a0f7ae0f59",
+    "alias": "0fe2c0a3e9731b6cbc48829959367357fc34e0258557f4e7c4757c87d784a2b8",
+}
+
+
+def verify_csv_sha256(path: Path, expected: str) -> bool:
+    """校验 CSV 文件 SHA-256 与交接包登记值一致。
+
+    Args:
+        path: 待校验文件。
+        expected: 期望的十六进制摘要（小写）。
+
+    Returns:
+        一致返回 True。
+    """
+    from hashlib import sha256
+
+    h = sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest() == expected
+
 
 def _connect():
     """连接 eps 库。"""
@@ -109,6 +134,8 @@ def main() -> None:
                         default=r"D:\PythonProjects\exchange")
     parser.add_argument("--force", action="store_true",
                         help="已完整导入时也强制 DROP 重建（默认拒绝，防止误重跑覆盖 ai_dict）")
+    parser.add_argument("--skip-hash", action="store_true",
+                        help="跳过交接包 CSV SHA-256 自校验（仅当词典有受控更新时使用）")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -124,6 +151,14 @@ def main() -> None:
     if not concept_csv.exists() or not alias_csv.exists():
         logger.error("词典文件不存在: %s / %s", concept_csv, alias_csv)
         return
+    if not args.skip_hash:
+        for path, key, label in ((concept_csv, "concept", "概念表"),
+                                 (alias_csv, "alias", "别名表")):
+            if not verify_csv_sha256(path, EXPECTED_SHA256[key]):
+                logger.error("%s SHA-256 与交接包登记不符: %s——词典可能被改动，"
+                             "确认后加 --skip-hash 或更新 EXPECTED_SHA256", label, path.name)
+                raise SystemExit(2)
+        logger.info("交接包 CSV SHA-256 自校验通过")
 
     conn = _connect()
     try:
