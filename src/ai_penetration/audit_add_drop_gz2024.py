@@ -42,9 +42,9 @@ ADD_PER_STRATUM = 60
 
 
 def _concepts_of(desc: str, automaton, ascii_flags, omega_c: dict, names: dict,
-                 k: int = 3) -> str:
+                 homograph: dict | None = None, k: int = 3) -> str:
     """描述命中概念中 ω 前 k 的 "名称:ω" 串。"""
-    cs = extract_concepts(desc.lower(), automaton, ascii_flags)
+    cs = extract_concepts(desc.lower(), automaton, ascii_flags, homograph)
     top = sorted(((omega_c[c], c) for c in cs if c in omega_c), reverse=True)[:k]
     return " | ".join(f"{names.get(c, '?')}={w:.2f}" for w, c in top)
 
@@ -60,7 +60,7 @@ def main() -> None:
     setup_logging(paths.log_dir / "audit_add_drop.log")
 
     atier = build_atier_index()
-    automaton, ascii_flags, _anchors = atier
+    automaton, ascii_flags, _anchors, homograph = atier
     skills_old = load_merged_skills(include_llm=True)
     regex_old = build_skill_regex(skills_old)
     conn = psycopg2.connect(**eps_conn_params())
@@ -93,28 +93,34 @@ def main() -> None:
 
     recs_add: list[dict] = []
     recs_drop: list[dict] = []
-    n_add = n_drop = 0
+    n_add = n_drop = n_add_dual = 0
     rng = random.Random(20260906)
     for pos, d in sample:
         a = is_ai_job(pos, d)
         sk = extract_skills_fast(d, regex_old)
         scored = [omega_old[s] for s in sk if s in omega_old]
         b_old = bool(scored) and sum(scored) / len(scored) >= 0.15 and max(scored) >= 0.5
-        cs = extract_concepts(d.lower(), automaton, ascii_flags)
+        cs = extract_concepts(d.lower(), automaton, ascii_flags, homograph)
         scored_c = [omega_c[c] for c in cs if c in omega_c]
         b_new = bool(scored_c) and sum(scored_c) / len(scored_c) >= 0.15 and max(scored_c) >= 0.5
-        f_old, f_new = a or b_old, a or b_new
+        b_dual = bool(scored_c) and sum(scored_c) / len(scored_c) >= 0.15 \
+            and sum(1 for w in scored_c if w >= 0.5) >= 2
+        f_old, f_new, f_dual = a or b_old, a or b_new, a or b_dual
+        if f_dual and not f_old:
+            n_add_dual += 1
         rec = None
         if f_new and not f_old:
             n_add += 1
             rec = {"kind": "add", "position": pos[:50],
-                   "a_ai": bool(a),
-                   "top_concepts": _concepts_of(d, automaton, ascii_flags, omega_c, names),
+                   "a_ai": bool(a), "kept_by_dual": bool(f_dual),
+                   "top_concepts": _concepts_of(d, automaton, ascii_flags,
+                                                omega_c, names, homograph),
                    "desc_head": d[:230].replace("\n", " ")}
         elif f_old and not f_new:
             n_drop += 1
             rec = {"kind": "drop", "position": pos[:50], "a_ai": bool(a),
-                   "top_concepts": _concepts_of(d, automaton, ascii_flags, omega_c, names),
+                   "top_concepts": _concepts_of(d, automaton, ascii_flags,
+                                                omega_c, names, homograph),
                    "old_top": " | ".join(f"{s}={w:.2f}" for s, w in
                                          sorted(((s, omega_old[s]) for s in sk if s in omega_old),
                                                 key=lambda x: -x[1])[:3]),
@@ -146,7 +152,8 @@ def main() -> None:
     out = paths.report_dir / f"audit_add_drop_{stamp}.csv"
     export.to_csv(out, index=False, encoding="utf-8-sig")
     total = len(sample)
-    print(f"样本 {total} 行: add={n_add}({n_add/total:.3%}) drop={n_drop}({n_drop/total:.3%}) "
+    print(f"样本 {total} 行: add={n_add}({n_add/total:.3%}) "
+          f"add_dual={n_add_dual}({n_add_dual/total:.3%}) drop={n_drop}({n_drop/total:.3%}) "
           f"导出 {len(export)} 条 -> {out.name}")
     logger.info("prior old=(%.2f,%.1f) n=%d | concept=(%.2f,%.1f) n=%d",
                 a_o, b_o, len(omega_old), a_c, b_c, len(omega_c))
