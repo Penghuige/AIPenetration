@@ -38,7 +38,13 @@ from config.paths import get_project_paths
 from .ai_scoring import is_ai_job
 from .common import eps_conn_params, setup_logging
 from .load_guangdong import GD_SHARDS
-from .skill_ai_anchor import AI_ANCHOR_SKILLS, build_skill_regex, extract_skills_fast, load_merged_skills
+from .skill_ai_anchor import (
+    AI_ANCHOR_SKILLS,
+    _AMBIGUOUS_AI_TERMS,
+    build_skill_regex,
+    extract_skills_fast,
+    load_merged_skills,
+)
 
 logger = logging.getLogger("ai_penetration.compare_atier")
 
@@ -50,12 +56,14 @@ _ASCII_RE = re.compile(r"^[\x00-\x7f]+$")
 
 # ------------------------------------------------------------- A 级词表构建
 
-def build_atier_index() -> tuple[ahocorasick.Automaton, dict[str, str], set[str]]:
+def build_atier_index() -> tuple[ahocorasick.Automaton, dict[str, bool], set[str], dict[str, re.Pattern]]:
     """从 ai_dict 构建 A 级概念识别索引。
 
     Returns:
-        (alias 自动机[小写键->skill_id], alias->is_ascii 标记,
-         锚点概念 skill_id 集合)。
+        (alias 自动机[小写键->(skill_id, alias)], alias->is_ascii 标记,
+         锚点概念 skill_id 集合, 同形概念 skill_id->AI语境正则)。
+        同形概念：别名恰为"深度学习/强化学习"等口语同形词的概念，
+        命中后须正文存在 AI 语境才保留（复用现行 _AMBIGUOUS_AI_TERMS 纪律）。
     """
     conn = psycopg2.connect(**eps_conn_params())
     try:
@@ -87,6 +95,13 @@ def build_atier_index() -> tuple[ahocorasick.Automaton, dict[str, str], set[str]
         logger.info("锚点概念 %d 个；A 级词典缺失锚点词: %s", len(anchor_ids), missing or "无")
     finally:
         conn.close()
+    # 同形概念：激活别名恰为口语同形词（深度学习/强化学习）的概念，
+    # 命中后须正文出现 AI 语境才保留（现行词表管线的既有纪律迁移）
+    homograph: dict[str, re.Pattern] = {}
+    for term, ai_ctx in _AMBIGUOUS_AI_TERMS.items():
+        for alias, sid in pairs:
+            if alias == term:
+                homograph[sid] = ai_ctx
     automaton = ahocorasick.Automaton()
     ascii_flags: dict[str, bool] = {}
     n = 0
@@ -97,13 +112,26 @@ def build_atier_index() -> tuple[ahocorasick.Automaton, dict[str, str], set[str]
         automaton.add_word(key, (sid, alias))
         n += 1
     automaton.make_automaton()
-    logger.info("A 级概念索引: %d 别名键, 锚点概念 %d 个", n, len(anchor_ids))
-    return automaton, ascii_flags, anchor_ids
+    logger.info("A 级概念索引: %d 别名键, 锚点概念 %d 个, 同形概念 %d 个",
+                n, len(anchor_ids), len(homograph))
+    return automaton, ascii_flags, anchor_ids, homograph
 
 
 def extract_concepts(text_lower: str, automaton: ahocorasick.Automaton,
-                     ascii_flags: dict[str, bool]) -> set[str]:
-    """A 级概念抽取：Aho 命中 + ASCII 词边界校验（对齐现有英文边界惯例）。"""
+                     ascii_flags: dict[str, bool],
+                     homograph: dict[str, re.Pattern] | None = None) -> set[str]:
+    """A 级概念抽取：Aho 命中 + ASCII 词边界校验 + 同形词 AI 语境验证。
+
+    Args:
+        text_lower: 小写化但**保留空白**的描述文本（去空白规范化会把
+            "客户开发、深度…学习" 跨词粘连成词造成假命中，审计已证实）。
+        automaton: build_atier_index 的自动机。
+        ascii_flags: 纯 ASCII 别名需词边界校验。
+        homograph: 同形概念 id -> AI 语境正则；无 AI 语境则丢弃该概念。
+
+    Returns:
+        命中的概念 skill_id 集合。
+    """
     sids: set[str] = set()
     for end, (sid, alias) in automaton.iter(text_lower):
         key = alias.lower()
@@ -114,6 +142,10 @@ def extract_concepts(text_lower: str, automaton: ahocorasick.Automaton,
             if before.isalnum() or after.isalnum():
                 continue
         sids.add(sid)
+    if homograph:
+        for sid, ai_ctx in homograph.items():
+            if sid in sids and not ai_ctx.search(text_lower):
+                sids.discard(sid)
     return sids
 
 
@@ -129,7 +161,7 @@ def collect_counts(sample_rows: list[tuple[str, str]], atier: tuple,
     Returns:
         (old_counts, concept_counts)，均为 {item: (n_jobs, n_anchor_jobs)}。
     """
-    automaton, ascii_flags, anchor_ids = atier
+    automaton, ascii_flags, anchor_ids, homograph = atier
     old_anchor = set(AI_ANCHOR_SKILLS)
     o_n: Counter = Counter()
     o_a: Counter = Counter()
@@ -144,7 +176,7 @@ def collect_counts(sample_rows: list[tuple[str, str]], atier: tuple,
         if sk & old_anchor:
             for s in sk:
                 o_a[s] += 1
-        cs = extract_concepts(desc.lower(), automaton, ascii_flags)
+        cs = extract_concepts(desc.lower(), automaton, ascii_flags, homograph)
         for c in cs:
             c_n[c] += 1
         if cs & anchor_ids:
@@ -242,9 +274,10 @@ def scan_slice(shard: str, lo: int, hi: int, omega_c: dict) -> dict:
     params = eps_conn_params()
     conn = psycopg2.connect(**params)
     out = {
-        "total": 0, "a": 0, "b_old": 0, "b_ctier": 0,
-        "fused_old": 0, "fused_ctier": 0,
+        "total": 0, "a": 0, "b_old": 0, "b_ctier": 0, "b_dual": 0,
+        "fused_old": 0, "fused_ctier": 0, "fused_dual": 0,
         "add_examples": [], "drop_examples": [], "add_n": 0, "drop_n": 0,
+        "add_dual_n": 0, "drop_dual_n": 0,
     }
     try:
         with conn.cursor() as setup:
@@ -262,7 +295,7 @@ def scan_slice(shard: str, lo: int, hi: int, omega_c: dict) -> dict:
         cur.execute(sql, (int(lo), int(hi), str(YEAR)))
         omega_old = _WORKER["omega_old"]
         regex_old = _WORKER["regex_old"]
-        automaton, ascii_flags, _aid = _WORKER["atier"]
+        automaton, ascii_flags, _aid, homograph = _WORKER["atier"]
         while True:
             batch = cur.fetchmany(50000)
             if not batch:
@@ -276,23 +309,31 @@ def scan_slice(shard: str, lo: int, hi: int, omega_c: dict) -> dict:
                 scored = [omega_old[s] for s in sk if s in omega_old]
                 b_old = bool(scored) and sum(scored) / len(scored) >= 0.15 \
                     and max(scored) >= 0.5
-                cs = extract_concepts(d.lower(), automaton, ascii_flags)
+                cs = extract_concepts(d.lower(), automaton, ascii_flags, homograph)
                 scored_c = [omega_c[c] for c in cs if c in omega_c]
                 b_c = bool(scored_c) and sum(scored_c) / len(scored_c) >= 0.15 \
                     and max(scored_c) >= 0.5
-                f_old, f_c = a or b_old, a or b_c
+                # 修正规则：B-only 判定要求 >=2 个概念 omega>=0.5（抑制
+                # "销售/实施岗单概念语境提及"击穿，审计证实的主要误报源）
+                b_d = bool(scored_c) and sum(scored_c) / len(scored_c) >= 0.15 \
+                    and sum(1 for w in scored_c if w >= 0.5) >= 2
+                f_old, f_c, f_d = a or b_old, a or b_c, a or b_d
                 out["a"] += a
                 out["b_old"] += b_old
                 out["b_ctier"] += b_c
+                out["b_dual"] += b_d
                 out["fused_old"] += f_old
                 out["fused_ctier"] += f_c
+                out["fused_dual"] += f_d
+                if f_d and not f_old:
+                    out["add_dual_n"] += 1
                 if f_c and not f_old:
                     out["add_n"] += 1
                     if len(out["add_examples"]) < 120 and rng.random() < 0.05:
                         top = sorted(scored_c, reverse=True)[:3]
                         out["add_examples"].append(
                             {"city": shard, "position": p[:40], "top_omega": [round(t, 3) for t in top],
-                             "n_concepts": len(cs)})
+                             "n_concepts": len(cs), "kept_by_dual": f_d})
                 elif f_old and not f_c:
                     out["drop_n"] += 1
                     if len(out["drop_examples"]) < 120 and rng.random() < 0.05:
@@ -399,9 +440,12 @@ def main() -> None:
         "A率": round(agg["a"] / total, 6),
         "旧B率(自建词表·平滑)": round(agg["b_old"] / total, 6),
         "新B率(A级概念·平滑)": round(agg["b_ctier"] / total, 6),
+        "B率修正(双概念门槛)": round(agg["b_dual"] / total, 6),
         "旧fused(平滑)": round(agg["fused_old"] / total, 6),
-        "新fused(平滑)": round(agg["fused_ctier"] / total, 6),
-        "新增判定(add)": agg["add_n"], "掉出判定(drop)": agg["drop_n"],
+        "新fused(单概念)": round(agg["fused_ctier"] / total, 6),
+        "新fused(双概念修正)": round(agg["fused_dual"] / total, 6),
+        "新增判定(add)": agg["add_n"], "新增判定(add·双概念)": agg["add_dual_n"],
+        "掉出判定(drop)": agg["drop_n"],
     }
     ex_path = paths.report_dir / f"compare_atier_examples_{stamp}.csv"
     pd.DataFrame(examples["add"] + examples["drop"]).assign(
@@ -417,6 +461,9 @@ def main() -> None:
            f"- min_count={args.min_count}；ω 平滑式 (n_a+α)/(n+α+β)（指南 §14.2）",
            f"- 概念词表：A 级激活别名→22,683 概念；锚点概念 {len(atier[2])} 个",
            "- 两侧同式估计同式平滑，A 判定/锚点/阈值完全一致，差异归因词典内容",
+           "- 修正规则（人工审计后加入）：概念层同形词 AI 语境验证 + 匹配保留"
+           "空白（消除跨词粘连假命中）+ 双概念门槛（B-only 需 >=2 概念 ω>=0.5，"
+           "抑制产品语境单概念击穿）",
            "- 现行面板（快照 ω，无平滑）参考值：广深 2024 A 0.6222% / B 0.4155% / fused 0.7037%",
            f"- 变更示例：`{ex_path.name}`", ""]
     report = paths.report_dir / f"compare_atier_gz2024_{stamp}.md"
