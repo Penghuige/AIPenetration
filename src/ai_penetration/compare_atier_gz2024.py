@@ -53,6 +53,14 @@ CITIES = ("广州市", "深圳市")
 
 _ASCII_RE = re.compile(r"^[\x00-\x7f]+$")
 
+# 商业职能岗位名（审计证实：产品语境"提到≠从事"误报集中在这些岗名——
+# 其 B-only 判定需 >=2 个强概念；技术岗名单概念放行，避免误伤
+# "视觉算法工程师"等真岗）。"运营"不列入：运营开发/运营算法多为真技术岗。
+BIZ_POSITION_RE = re.compile(
+    r"销售|售前|售后|客服|商务|市场|BD|客户经理|销售代表|销售总监|"
+    r"助理|编辑|记者|储备|行政|人事|前台"
+)
+
 
 # ------------------------------------------------------------- A 级词表构建
 
@@ -313,10 +321,12 @@ def scan_slice(shard: str, lo: int, hi: int, omega_c: dict) -> dict:
                 scored_c = [omega_c[c] for c in cs if c in omega_c]
                 b_c = bool(scored_c) and sum(scored_c) / len(scored_c) >= 0.15 \
                     and max(scored_c) >= 0.5
-                # 修正规则：B-only 判定要求 >=2 个概念 omega>=0.5（抑制
-                # "销售/实施岗单概念语境提及"击穿，审计证实的主要误报源）
+                # 修正规则（审计驱动）：商业职能岗名的 B-only 判定要求
+                # >=2 个概念 omega>=0.5；技术岗名维持单概念（避免误伤）
+                n_strong = sum(1 for w in scored_c if w >= 0.5)
                 b_d = bool(scored_c) and sum(scored_c) / len(scored_c) >= 0.15 \
-                    and sum(1 for w in scored_c if w >= 0.5) >= 2
+                    and (n_strong >= 2
+                         or (n_strong >= 1 and not BIZ_POSITION_RE.search(p)))
                 f_old, f_c, f_d = a or b_old, a or b_c, a or b_d
                 out["a"] += a
                 out["b_old"] += b_old

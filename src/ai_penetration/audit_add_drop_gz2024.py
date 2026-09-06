@@ -24,6 +24,7 @@ from config.paths import get_project_paths
 from .ai_scoring import is_ai_job
 from .common import eps_conn_params, setup_logging
 from .compare_atier_gz2024 import (
+    BIZ_POSITION_RE,
     build_atier_index,
     collect_counts,
     smooth_omega,
@@ -103,8 +104,10 @@ def main() -> None:
         cs = extract_concepts(d.lower(), automaton, ascii_flags, homograph)
         scored_c = [omega_c[c] for c in cs if c in omega_c]
         b_new = bool(scored_c) and sum(scored_c) / len(scored_c) >= 0.15 and max(scored_c) >= 0.5
+        n_strong = sum(1 for w in scored_c if w >= 0.5)
         b_dual = bool(scored_c) and sum(scored_c) / len(scored_c) >= 0.15 \
-            and sum(1 for w in scored_c if w >= 0.5) >= 2
+            and (n_strong >= 2
+                 or (n_strong >= 1 and not BIZ_POSITION_RE.search(pos)))
         f_old, f_new, f_dual = a or b_old, a or b_new, a or b_dual
         if f_dual and not f_old:
             n_add_dual += 1
