@@ -1,20 +1,22 @@
-"""A 级冻结词典概念识别 vs 自建词表——广深 2024 AI 率对比面板。
+"""A 级冻结词典概念识别 vs 自建词表——广深 2024 AI 率对比面板（平滑版）。
 
-目的：量化「用刚冻结的外部 A 级词典（激活别名→概念）做技能识别」与
-现行自建词表（6,872 词 + ω 快照）在 fused AI 率上的差异。除技能识别层
-与 ω 来源外，A 判定、锚点集合、B 阈值（avg>=0.15 & max>=0.5）全部一致，
-差异可归因于词典方法本身。
+目的：公平对比「用 A 级词典（激活别名→概念）做技能识别」与现行自建词表
+在 fused AI 率上的差异。两套词表在**同一抽样**上用**同一公式**
+P(锚点|s) 估频数，并做**同一 Beta-Binomial 经验贝叶斯收缩**（指南 §14.2：
+先验由 n>=5 技能的极大似然拟合，不收敛回退 Jeffreys）——消除首轮对比中
+"低频概念 ω 抽样极端值 × max 阈值"造成的假阳性与覆盖缺口不对等问题。
+A 判定、锚点词集、B 阈值（avg>=0.15 & max>=0.5）两侧一致。
 
 流程：
-1. ω 估计（同一抽样）：TABLESAMPLE 抽广深 2024，分别用两套词表抽取技能/
-   概念集合，按简化式 P(锚点|s) 估 ω（min_count=20）。
-2. 全量判定（ctid 8 路并行）：每行同时算 a_ai（不变）、b_old、b_atier、
-   fused_old、fused_atier，聚合计数并记录判定变更示例。
-3. 报告：两法率对比 + 变更方向分解 + 示例明细 CSV。eps 全程只读。
+1. TABLESAMPLE 抽广深 2024（默认 5%≈90 万行），单遍提取两套技能/概念
+   集合，统计 (n_s, n_anchor) 频数。
+2. 每套词表 fit Beta 先验（MLE）→ 平滑 ω=(n_a+α)/(n+α+β)，min_count=5。
+3. ctid 8 路并行全量判定：每行算 a、b_old、b_ctier 及两版 fused，
+   聚合 + 记录判定变更示例。eps 全程只读。
 
 使用示例::
 
-    python -X utf8 -m src.ai_penetration.compare_atier_gz2024 --sample-pct 0.5
+    python -X utf8 -m src.ai_penetration.compare_atier_gz2024
 """
 from __future__ import annotations
 
@@ -27,18 +29,14 @@ from collections import Counter
 from datetime import datetime
 
 import ahocorasick
+import numpy as np
 import pandas as pd
 import psycopg2
 
 from config.paths import get_project_paths
 
 from .ai_scoring import is_ai_job
-from .common import (
-    DEFAULT_OMEGA_SNAPSHOT,
-    eps_conn_params,
-    resolve_artifact_path,
-    setup_logging,
-)
+from .common import eps_conn_params, setup_logging
 from .load_guangdong import GD_SHARDS
 from .skill_ai_anchor import AI_ANCHOR_SKILLS, build_skill_regex, extract_skills_fast, load_merged_skills
 
@@ -119,32 +117,105 @@ def extract_concepts(text_lower: str, automaton: ahocorasick.Automaton,
     return sids
 
 
-def estimate_omega_concepts(sample_rows: list[tuple[str, str]],
-                            atier: tuple) -> tuple[dict, int]:
-    """在抽样上估 A 级概念的 ω（简化式 P(锚点|概念)，min_count=20）。
-
-    旧词表对照组直接用现行 ω 快照（阶段2 worker 加载），无需在此重估。
+def collect_counts(sample_rows: list[tuple[str, str]], atier: tuple,
+                   regex_old: re.Pattern) -> tuple[dict, dict]:
+    """单遍抽样提取两套词表的技能/概念集合，统计 (n_s, n_anchor) 频数。
 
     Args:
         sample_rows: (position, description) 抽样。
         atier: build_atier_index 输出。
+        regex_old: 自建词表合并正则。
 
     Returns:
-        ({skill_id: omega}, 参与统计的概念总数)。
+        (old_counts, concept_counts)，均为 {item: (n_jobs, n_anchor_jobs)}。
     """
     automaton, ascii_flags, anchor_ids = atier
-    c_skills: Counter = Counter()
-    c_anchor: Counter = Counter()
-    for _pos, desc in sample_rows:
+    old_anchor = set(AI_ANCHOR_SKILLS)
+    o_n: Counter = Counter()
+    o_a: Counter = Counter()
+    c_n: Counter = Counter()
+    c_a: Counter = Counter()
+    for i, (_pos, desc) in enumerate(sample_rows):
+        if i % 100000 == 0:
+            logger.info("ω 频数统计进度 %d/%d", i, len(sample_rows))
+        sk = extract_skills_fast(desc, regex_old)
+        for s in sk:
+            o_n[s] += 1
+        if sk & old_anchor:
+            for s in sk:
+                o_a[s] += 1
         cs = extract_concepts(desc.lower(), automaton, ascii_flags)
         for c in cs:
-            c_skills[c] += 1
+            c_n[c] += 1
         if cs & anchor_ids:
             for c in cs:
-                c_anchor[c] += 1
-    omega_c = {c: c_anchor[c] / n for c, n in c_skills.items()
-               if n >= 20 and c_anchor.get(c, 0) > 0}
-    return omega_c, len(c_skills)
+                c_a[c] += 1
+    old_counts = {s: (n, o_a.get(s, 0)) for s, n in o_n.items()}
+    concept_counts = {c: (n, c_a.get(c, 0)) for c, n in c_n.items()}
+    return old_counts, concept_counts
+
+
+def beta_binomial_fit(counts: dict[str, tuple[int, int]], min_fit_n: int = 5,
+                      ) -> tuple[float, float]:
+    """Beta-Binomial 先验 (α, β) 的极大似然拟合（指南 §14.2）。
+
+    仅用 n>=min_fit_n 的技能拟合；scipy 缺失或不收敛回退 Jeffreys (0.5, 0.5)。
+
+    Args:
+        counts: {item: (n_jobs, n_anchor_jobs)}。
+        min_fit_n: 参与拟合的技能最低频数。
+
+    Returns:
+        (alpha, beta) 先验参数。
+    """
+    try:
+        from scipy.optimize import minimize
+        from scipy.special import betaln
+    except ImportError:
+        logger.warning("scipy 不可用，回退 Jeffreys 先验")
+        return 0.5, 0.5
+    obs = [(n, a) for n, a in counts.values() if n >= min_fit_n]
+    if len(obs) < 50:
+        return 0.5, 0.5
+    ns = np.asarray([o[0] for o in obs], dtype=float)
+    na = np.asarray([o[1] for o in obs], dtype=float)
+
+    def neg_loglik(x: np.ndarray) -> float:
+        alpha, beta = np.exp(x)
+        return -(betaln(na + alpha, ns - na + beta).sum()
+                 - betaln(alpha, beta) * len(obs))
+
+    res = minimize(neg_loglik, x0=np.array([np.log(0.3), np.log(10.0)]),
+                   method="Nelder-Mead", options={"maxiter": 2000, "xatol": 1e-4,
+                                                  "fatol": 1e-3})
+    if not res.success and not np.isfinite(res.fun):
+        logger.warning("Beta-BB 先验拟合失败，回退 Jeffreys")
+        return 0.5, 0.5
+    alpha, beta = np.exp(res.x)
+    if not (1e-4 <= alpha <= 1e4 and 1e-4 <= beta <= 1e4):
+        return 0.5, 0.5
+    return float(alpha), float(beta)
+
+
+def smooth_omega(counts: dict[str, tuple[int, int]], alpha: float, beta: float,
+                 min_count: int = 5) -> dict[str, float]:
+    """Beta-Binomial 后验均值收缩：ω = (n_a + α) / (n + α + β)。
+
+    Args:
+        counts: {item: (n_jobs, n_anchor_jobs)}。
+        alpha, beta: 先验参数。
+        min_count: 低于该频数的 item 不给权重（指南 C 级底线 5）。
+
+    Returns:
+        {item: omega_smoothed}（n>=min_count 全部入表；低 ω 项保留，
+        它们拉低岗位均值正是现行管线抑制"堆砌通用技能模板岗"的机制）。
+    """
+    out: dict[str, float] = {}
+    for item, (n, na) in counts.items():
+        if n < min_count:
+            continue
+        out[item] = (na + alpha) / (n + alpha + beta)
+    return out
 
 
 # ------------------------------------------------------------- 全量判定
@@ -152,9 +223,8 @@ def estimate_omega_concepts(sample_rows: list[tuple[str, str]],
 _WORKER: dict = {}
 
 
-def _init_worker(omega_old_path: str) -> None:
-    _WORKER["omega_old"] = json.loads(
-        resolve_artifact_path(omega_old_path, artifact="ωsAI 快照").read_text(encoding="utf-8"))
+def _init_worker(omega_old: dict) -> None:
+    _WORKER["omega_old"] = omega_old
     _WORKER["regex_old"] = build_skill_regex(load_merged_skills(include_llm=True))
     _WORKER["atier"] = build_atier_index()
 
@@ -240,38 +310,52 @@ def scan_slice(shard: str, lo: int, hi: int, omega_c: dict) -> dict:
 
 def main() -> None:
     """对比入口：抽样估 ω -> 并行全量判定 -> 报告。"""
-    parser = argparse.ArgumentParser(description="A 级词典 vs 自建词表 AI 率对比（广深 2024）")
-    parser.add_argument("--sample-pct", type=float, default=0.5)
+    parser = argparse.ArgumentParser(description="A 级词典 vs 自建词表 AI 率对比（广深 2024，平滑版）")
+    parser.add_argument("--sample-pct", type=float, default=5.0,
+                        help="ω 估计抽样比例（默认 5%%≈90 万行 2024）")
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--slices", type=int, default=4)
-    parser.add_argument("--omega-file", type=str, default=DEFAULT_OMEGA_SNAPSHOT)
+    parser.add_argument("--min-count", type=int, default=5,
+                        help="入表技能最低频数（指南 C 级底线）")
     args = parser.parse_args()
 
     paths = get_project_paths()
     setup_logging(paths.log_dir / "compare_atier_gz2024.log")
 
-    # ---- 阶段1：抽样估 ω（A 级概念版）；旧版对照直接用现行 ω 快照
+    # ---- 阶段1：大样本同式估计 + 同式平滑（两套词表对等）
     atier = build_atier_index()
+    skills_old = load_merged_skills(include_llm=True)
+    regex_old = build_skill_regex(skills_old)
     params = eps_conn_params()
     conn = psycopg2.connect(**params)
     sample: list[tuple[str, str]] = []
     try:
         for city in CITIES:
             shard = GD_SHARDS[city]
-            cur = conn.cursor()
+            cur = conn.cursor(f"cmp_sample_{shard}")
+            cur.itersize = 100000
             cur.execute(
                 f"SELECT position, job_description FROM public.{shard} "
                 f"TABLESAMPLE SYSTEM ({args.sample_pct}) "
                 "WHERE substr(publish_time,1,4)=%s "
                 "  AND job_description IS NOT NULL AND job_description != ''",
                 (str(YEAR),))
-            sample.extend((str(p or ""), str(d)) for p, d in cur.fetchall())
+            while True:
+                batch = cur.fetchmany(100000)
+                if not batch:
+                    break
+                sample.extend((str(p or ""), str(d)) for p, d in batch)
             cur.close()
     finally:
         conn.close()
     logger.info("ω 估计抽样: %d 行", len(sample))
-    omega_c, n_c = estimate_omega_concepts(sample, atier)
-    logger.info("概念技能 %d 个有 ω(>=20 且与锚点共现)", n_c)
+    old_counts, concept_counts = collect_counts(sample, atier, regex_old)
+    a_o, b_o = beta_binomial_fit(old_counts)
+    a_c, b_c_prior = beta_binomial_fit(concept_counts)
+    omega_old = smooth_omega(old_counts, a_o, b_o, args.min_count)
+    omega_c = smooth_omega(concept_counts, a_c, b_c_prior, args.min_count)
+    logger.info("平滑完成: 旧词表 prior=(%.3f,%.1f) 入表 %d；概念 prior=(%.3f,%.1f) 入表 %d",
+                a_o, b_o, len(omega_old), a_c, b_c_prior, len(omega_c))
 
     # ---- 阶段2：全量并行判定
     tasks: list[tuple[str, int, int]] = []
@@ -296,7 +380,7 @@ def main() -> None:
     examples: dict[str, list] = {"add": [], "drop": []}
     with ProcessPoolExecutor(max_workers=args.workers,
                              initializer=_init_worker,
-                             initargs=(args.omega_file,)) as pool:
+                             initargs=(omega_old,)) as pool:
         futs = [pool.submit(scan_slice, shard, lo, hi, omega_c)
                 for shard, lo, hi in tasks]
         for fut in futs:
@@ -313,10 +397,10 @@ def main() -> None:
     rows = {
         "年份": YEAR, "总岗位": total,
         "A率": round(agg["a"] / total, 6),
-        "旧B率(自建词表+快照)": round(agg["b_old"] / total, 6),
-        "新B率(A级概念+新估ω)": round(agg["b_ctier"] / total, 6),
-        "旧fused": round(agg["fused_old"] / total, 6),
-        "新fused": round(agg["fused_ctier"] / total, 6),
+        "旧B率(自建词表·平滑)": round(agg["b_old"] / total, 6),
+        "新B率(A级概念·平滑)": round(agg["b_ctier"] / total, 6),
+        "旧fused(平滑)": round(agg["fused_old"] / total, 6),
+        "新fused(平滑)": round(agg["fused_ctier"] / total, 6),
         "新增判定(add)": agg["add_n"], "掉出判定(drop)": agg["drop_n"],
     }
     ex_path = paths.report_dir / f"compare_atier_examples_{stamp}.csv"
@@ -326,9 +410,14 @@ def main() -> None:
     md = ["# A 级词典 vs 自建词表：广深 2024 AI 率对比", "",
           "| 指标 | 值 |", "|---|---|"]
     md += [f"| {k} | {v} |" for k, v in rows.items()]
-    md += ["", f"- ω 估计样本：{len(sample):,} 行（TABLESAMPLE {args.sample_pct}%，2024）",
+    md += ["",
+           f"- ω 估计样本：{len(sample):,} 行（TABLESAMPLE {args.sample_pct}%，2024 广深）",
+           f"- Beta-BB 先验：旧词表 α={a_o:.3f}, β={b_o:.1f}（入表 {len(omega_old)}）；"
+           f"概念表 α={a_c:.3f}, β={b_c_prior:.1f}（入表 {len(omega_c)}）",
+           f"- min_count={args.min_count}；ω 平滑式 (n_a+α)/(n+α+β)（指南 §14.2）",
            f"- 概念词表：A 级激活别名→22,683 概念；锚点概念 {len(atier[2])} 个",
-           "- 两法判定阈值/锚点/A 方法完全一致，差异归因词典识别层",
+           "- 两侧同式估计同式平滑，A 判定/锚点/阈值完全一致，差异归因词典内容",
+           "- 现行面板（快照 ω，无平滑）参考值：广深 2024 A 0.6222% / B 0.4155% / fused 0.7037%",
            f"- 变更示例：`{ex_path.name}`", ""]
     report = paths.report_dir / f"compare_atier_gz2024_{stamp}.md"
     report.write_text("\n".join(md), encoding="utf-8")
