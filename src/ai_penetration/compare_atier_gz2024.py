@@ -407,6 +407,13 @@ def main() -> None:
     omega_c = smooth_omega(concept_counts, a_c, b_c_prior, args.min_count)
     logger.info("平滑完成: 旧词表 prior=(%.3f,%.1f) 入表 %d；概念 prior=(%.3f,%.1f) 入表 %d",
                 a_o, b_o, len(omega_old), a_c, b_c_prior, len(omega_c))
+    # ω 表落盘（版本纪律 §4：估计产物可追溯，诊断可复用）
+    stamp_w = datetime.now().strftime("%Y%m%d_%H%M%S")
+    paths.report_dir.mkdir(parents=True, exist_ok=True)
+    (paths.report_dir / f"omega_smooth_legacy_{stamp_w}.json").write_text(
+        json.dumps(omega_old, ensure_ascii=False), encoding="utf-8")
+    (paths.report_dir / f"omega_smooth_atier_{stamp_w}.json").write_text(
+        json.dumps(omega_c, ensure_ascii=False), encoding="utf-8")
 
     # ---- 阶段2：全量并行判定
     tasks: list[tuple[str, int, int]] = []
