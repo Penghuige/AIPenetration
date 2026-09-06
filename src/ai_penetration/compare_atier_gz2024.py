@@ -67,16 +67,26 @@ def build_atier_index() -> tuple[ahocorasick.Automaton, dict[str, str], set[str]
             WHERE is_active='1'
         """)
         pairs = cur.fetchall()
-        # 锚点概念：canonical_zh/en 命中 8 锚点词
-        anchors_lower = {a for a in AI_ANCHOR_SKILLS}
-        cur.execute("""
-            SELECT skill_id, coalesce(canonical_zh,''), lower(coalesce(canonical_en,''))
-            FROM ai_dict.skill_concepts
-        """)
+        # 锚点概念（alias 口径，与现行词表锚点对齐）：8 锚点词作为
+        # canonical 或激活别名出现的概念（如"神经网络"canonical 非该词但别名有）；
+        # A 级词典完全没有的锚点词（如"强化学习"）登记告警——不静默吞掉
+        anchors = list(AI_ANCHOR_SKILLS)
         anchor_ids: set[str] = set()
-        for sid, zh, en in cur.fetchall():
-            if zh in anchors_lower or en in {a.lower() for a in anchors_lower}:
-                anchor_ids.add(sid)
+        cur.execute("""
+            SELECT skill_id, coalesce(canonical_zh,'') FROM ai_dict.skill_concepts
+            WHERE coalesce(canonical_zh,'') = ANY(%s)
+        """, (anchors,))
+        by_canon = cur.fetchall()
+        anchor_ids |= {r[0] for r in by_canon}
+        cur.execute("""
+            SELECT DISTINCT skill_id, alias FROM ai_dict.skill_aliases
+            WHERE alias = ANY(%s) AND is_active='1'
+        """, (anchors,))
+        by_alias = cur.fetchall()
+        anchor_ids |= {r[0] for r in by_alias}
+        covered = {r[1] for r in by_canon} | {r[1] for r in by_alias}
+        missing = sorted(set(anchors) - covered)
+        logger.info("锚点概念 %d 个；A 级词典缺失锚点词: %s", len(anchor_ids), missing or "无")
     finally:
         conn.close()
     automaton = ahocorasick.Automaton()
