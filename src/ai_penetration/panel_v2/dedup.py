@@ -52,7 +52,8 @@ from ..text_clean import match_from_raw, normalize_position, text_hash
 
 logger = logging.getLogger("ai_penetration.panel_v2.dedup")
 
-MASTER_VERSION = "main_v2a_20260907"
+# b 版：规则1 跨城 rid 去重 + 组首锚定 30 天桶（链式语义超披露线修正）
+MASTER_VERSION = "main_v2a_20260907b"
 TABLE_STAGE = "dedup_stage_gzsz"
 TABLE_SORTED = "dedup_sorted_gzsz"
 TABLE_MASTER = "job_master_gzsz"
@@ -366,38 +367,66 @@ def build_master() -> tuple[int, int]:
             out = _master_stats(cur)
             conn.close()
             return out
-    cur.execute(f"DROP TABLE IF EXISTS public.{TABLE_SORTED}")
-    # 段一：join ent 聚合映射（min 消除一 rid 多司冲突并计数），NULL→哨兵
-    cur.execute(f"""
-        CREATE UNLOGGED TABLE public.{TABLE_SORTED} AS
-        SELECT s.rid, s.plat, s.city, s.yr, s.day, s.posh, s.thash, s.dlen, s.comp,
-               coalesce(e.company_id, 'UNK:' || s.rid) AS company_id,
-               (e.company_id IS NULL) AS company_unmatched
-        FROM public.{TABLE_STAGE} s
-        LEFT JOIN (SELECT recruit_id, min(company_id) AS company_id
-                   FROM public.{TABLE_ENTMAP} GROUP BY recruit_id) e
-               ON e.recruit_id = s.rid
-    """)
-    cur.execute(f"CREATE INDEX ON public.{TABLE_SORTED} (company_id, posh, city, thash, yr, day, rid)")
+    cur.execute("SELECT to_regclass('public." + TABLE_SORTED + "')")
+    sorted_exists = cur.fetchone()[0] is not None
+    if sorted_exists:
+        # 旧版 sorted 缺 rule1_dups 列（跨城重复未处理）→ 强制重建
+        cur.execute("SELECT count(*) FROM information_schema.columns "
+                    "WHERE table_name=%s AND column_name='rule1_dups'",
+                    (TABLE_SORTED,))
+        if cur.fetchone()[0] == 0:
+            logger.info("sorted 表为旧版（无 rule1_dups），DROP 重建")
+            cur.execute(f"DROP TABLE public.{TABLE_SORTED}")
+            sorted_exists = False
+    if not sorted_exists:
+        # 段一：规则1（§6.2.1.1 平台+编号唯一记录，跨城重复折叠并计数）
+        # + join ent 聚合映射（min 消一 rid 多司），NULL→哨兵
+        cur.execute(f"""
+            CREATE UNLOGGED TABLE public.{TABLE_SORTED} AS
+            WITH joined AS (
+                SELECT s.rid, s.plat, s.city, s.yr, s.day, s.posh, s.thash,
+                       s.dlen, s.comp,
+                       coalesce(e.company_id, 'UNK:' || s.rid) AS company_id,
+                       (e.company_id IS NULL) AS company_unmatched
+                FROM public.{TABLE_STAGE} s
+                LEFT JOIN (SELECT recruit_id, min(company_id) AS company_id
+                           FROM public.{TABLE_ENTMAP} GROUP BY recruit_id) e
+                       ON e.recruit_id = s.rid
+            ), rid_rank AS (
+                SELECT *,
+                       row_number() OVER (PARTITION BY plat, rid
+                                          ORDER BY city, day, thash) AS rn_rid,
+                       count(*) OVER (PARTITION BY plat, rid) - 1 AS rule1_dups
+                FROM joined
+            )
+            SELECT rid, plat, city, yr, day, posh, thash, dlen, comp,
+                   company_id, company_unmatched, rule1_dups
+            FROM rid_rank WHERE rn_rid = 1
+        """)
+        cur.execute(f"CREATE INDEX ON public.{TABLE_SORTED} (company_id, posh, city, thash, yr, day, rid)")
     conn.commit()
-    # 段一·五：链式分段物化（ROWS 帧确定性，评审必改3），master/map 共享
+    # 段一·五：30 天分组 = 组首锚定均匀桶（每桶跨度≤30，满足 §6.2.1.2
+    # "两两≤30" 的确定性规则；审计修正：链式传递语义对长链组过松，2.65%
+    # 超披露线。桶规则对"恰跨 30 天边界的序列"可能多切一刀，保守方向，
+    # 规则本身记录于 duplicate_version 可追溯）。day<0 坏日期每行独立成组。
     TABLE_SEG = TABLE_SORTED.replace("sorted", "seg")
     cur.execute(f"DROP TABLE IF EXISTS public.{TABLE_SEG}")
     cur.execute(f"""
         CREATE UNLOGGED TABLE public.{TABLE_SEG} AS
-        SELECT *,
-               sum(CASE WHEN prev_day IS NULL OR day < 0 OR prev_day < 0
-                        OR day - prev_day > 30 THEN 1 ELSE 0 END)
-                   OVER (PARTITION BY company_id, posh, city, thash, yr
-                         ORDER BY day, rid
-                         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS seg
+        SELECT *, (company_id || ':' || posh || ':' || city || ':' || thash || ':'
+                   || yr || ':' || seg_bucket) AS seg
         FROM (
-            SELECT *, lag(day) OVER (
-                PARTITION BY company_id, posh, city, thash, yr
-                ORDER BY day, rid
-                ROWS BETWEEN 1 PRECEDING AND 1 PRECEDING) AS prev_day
+            SELECT *,
+                   CASE WHEN day < 0
+                        THEN 999999 + row_number() OVER (
+                             PARTITION BY company_id, posh, city, thash, yr
+                             ORDER BY rid)                    -- 坏日期独立成组
+                        ELSE (day - first_value(day) OVER (
+                             PARTITION BY company_id, posh, city, thash, yr
+                             ORDER BY day, rid))::int / 31    -- 组首锚定 30 天桶
+                   END AS seg_bucket
             FROM public.{TABLE_SORTED}
-        ) x
+        ) a
     """)
     cur.execute(f"CREATE INDEX ON public.{TABLE_SEG} (company_id, posh, city, thash, yr, seg)")
     conn.commit()
@@ -425,6 +454,7 @@ def build_master() -> tuple[int, int]:
                     ELSE 'exact_hash_group' END AS duplicate_reason,
                gmin AS earliest_day, gmax AS latest_day,
                company_unmatched,
+               rule1_dups,
                '{MASTER_VERSION}' AS duplicate_version
         FROM ranked WHERE pick = 1
     """)
@@ -459,21 +489,24 @@ def verify_invariants() -> None:
     """守恒与确定性验收（评审必改6/7）；失败 raise。"""
     conn = _results_conn()
     cur = conn.cursor()
+    # 守恒含规则1折叠：sum(collapsed) + sum(rule1_dups) = stage
     cur.execute(f"""
         SELECT (SELECT count(*) FROM public.{TABLE_STAGE}),
                (SELECT count(*) FROM public.{TABLE_MASTER}),
                (SELECT sum(records_collapsed) FROM public.{TABLE_MASTER}),
+               (SELECT coalesce(sum(rule1_dups),0) FROM public.{TABLE_MASTER}),
                (SELECT count(*) - count(DISTINCT duplicate_group_id) FROM public.{TABLE_MASTER}),
                (SELECT count(*) FROM (
                    SELECT plat, job_id_raw FROM public.{TABLE_MASTER}
                    GROUP BY 1,2 HAVING count(*)>1) z),
                (SELECT count(*) FROM public.{TABLE_STAGE} WHERE yr = 0)
     """)
-    stage, master, collapsed, dup_groups, rid_dups, bad_years = cur.fetchone()
+    stage, master, collapsed, rule1, dup_groups, rid_dups, bad_years = cur.fetchone()
     conn.close()
     problems = []
-    if stage != collapsed:
-        problems.append(f"守恒失败: stage {stage} != sum(collapsed) {collapsed}")
+    if stage != collapsed + rule1:
+        problems.append(f"守恒失败: stage {stage} != collapsed {collapsed} "
+                        f"+ rule1_dups {rule1}")
     if dup_groups != 0:
         problems.append(f"{dup_groups} 组出现多 canonical")
     if rid_dups != 0:
