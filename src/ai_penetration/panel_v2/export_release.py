@@ -120,8 +120,8 @@ def main() -> None:
         with _pq.ParquetWriter(score_single, schema,
                                compression="zstd") as w:
             for f in files:
-                for tbl in _pq.ParquetFile(f).iter_batches(batch_size=2_000_000):
-                    w.write_table(tbl)
+                for rb in _pq.ParquetFile(f).iter_batches(batch_size=2_000_000):
+                    w.write_table(_pa.Table.from_batches([rb]))
         logger.info("job_ai_score 合并 %d 单元 -> 单文件", len(files))
     specs = [
         ("skill_concept_v1.parquet", "skill_id", "ai_dict.skill_concepts"),
