@@ -347,13 +347,14 @@ def _arrow_types(name: str) -> list:
 
 
 def _table_to_csv_buf(path):
-    """parquet 分片转 CSV BytesIO（COPY 输入）。"""
+    """parquet 分片转 CSV BytesIO（COPY 输入，无表头）。"""
     import io
     import pyarrow.csv as pcsv
     import pyarrow.parquet as pq
     tbl = pq.read_table(path)
     buf = io.BytesIO()
-    pcsv.write_csv(tbl, buf)
+    pcsv.write_csv(tbl, buf, write_options=pcsv.WriteOptions(
+        include_header=False))
     buf.seek(0)
     return buf
 
