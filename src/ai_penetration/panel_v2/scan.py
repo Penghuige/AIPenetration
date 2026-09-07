@@ -50,20 +50,55 @@ def _results_conn():
 
 
 def export_platform_map(out_dir: Path) -> dict[str, int]:
-    """platform 字符串 → pass1 编码映射（从 stage 1% 采样重建，确定性）。
+    """platform 字符串 → pass1 编码：raw↔stage 按 rid 采样 join 重建。
 
-    pass1 的编码由固定 dict 顺序生成且已落进 stage/master；本映射仅做
-    字符串→编码反查（每 platform 在 stage 中编码唯一，min 为防御）。
+    pass1 编码已固化在 stage.plat；eps 只读侧采样 join 学回字符串→编码
+    （每平台取多数投票；pass1 全局 dict 一致故映射唯一）。
     """
     path = out_dir / "platform_map.json"
     if path.exists():
         return json.loads(path.read_text(encoding="utf-8"))
-    conn = _results_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT platform, min(plat::int) FROM public."
-                "dedup_stage_gzsz TABLESAMPLE SYSTEM (1) GROUP BY 1")
-    pmap = {str(p): int(c) for p, c in cur.fetchall()}
-    conn.close()
+    import psycopg2 as _p
+    votes: dict[str, dict[int, int]] = {}
+    eps = _p.connect(**eps_conn_params())
+    res = _results_conn()
+    icur = res.cursor()
+    icur.execute("SET maintenance_work_mem = '1GB'")
+    icur.execute("CREATE INDEX IF NOT EXISTS idx_stage_rid "
+                 "ON public.dedup_stage_gzsz (rid)")
+    res.commit()
+    res.close()
+    res = _results_conn()
+    try:
+        for _, shard, _cid in SHARDS:
+            jcur = eps.cursor()
+            jcur.execute(
+                f"SELECT platform, recruit_id FROM public.{shard} "
+                "TABLESAMPLE SYSTEM (0.02) LIMIT 40000")
+            pairs = jcur.fetchall()
+            rid_to_plat: dict[str, int] = {}
+            rcur = res.cursor()
+            ids = [r for _p_, r in pairs]
+            for i in range(0, len(ids), 1000):
+                chunk = ids[i:i + 1000]
+                rcur.execute(
+                    "SELECT rid, plat FROM public.dedup_stage_gzsz "
+                    "WHERE rid = ANY(%s)", (chunk,))
+                for rid_, plat_ in rcur.fetchall():
+                    rid_to_plat[str(rid_)] = int(plat_)
+            for plat_str, rid_ in pairs:
+                code = rid_to_plat.get(str(rid_))
+                if code is not None:
+                    votes.setdefault((plat_str or "").strip(), {})
+                    votes[(plat_str or "").strip()][code] = \
+                        votes[(plat_str or "").strip()].get(code, 0) + 1
+    finally:
+        eps.close()
+        res.close()
+    pmap = {plat: max(codes, key=codes.get)
+            for plat, codes in votes.items() if plat}
+    if len(pmap) < 8:
+        raise SystemExit(f"platform 映射采样异常（仅 {len(pmap)} 种），中止")
     (out_dir / "platform_map.json").write_text(
         json.dumps(pmap), encoding="utf-8")
     logger.info("platform 映射: %d 种", len(pmap))
@@ -218,6 +253,7 @@ def scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str) -> dict
         for d in ("parts_flags", "parts_long", "parts_firm"):
             (out / d).mkdir(parents=True, exist_ok=True)
         pmap = _WORKER["pmap"]
+        unknown_plat = 0
         while True:
             batch = cur.fetchmany(50000)
             if not batch:
@@ -226,9 +262,11 @@ def scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str) -> dict
                 n_rows += 1
                 plat = pmap.get((platform or "").strip())
                 if plat is None:
-                    raise SystemExit(
-                        f"未知 platform 无法映射编码: {platform!r}（"
-                        "platform_map 采样未覆盖，需全量重建映射）")
+                    unknown_plat += 1
+                    if unknown_plat > 2000:
+                        raise SystemExit(
+                            f"未知 platform 超上限（{platform!r}…），映射覆盖异常")
+                    continue  # 未知平台不参与键计算（正常应为 0 或长尾几种）
                 k = _h63(f"{plat}:{city_id}:{rid}")
                 idx = int(np.searchsorted(keys, k))
                 if idx >= keys.size or int(keys[idx]) != k:
@@ -261,7 +299,7 @@ def scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str) -> dict
     finally:
         conn.close()
     stat = {"task": task, "rows": n_rows, "canonical": n_canon,
-            "skill_pairs": n_pairs}
+            "skill_pairs": n_pairs, "unknown_platform": unknown_plat}
     tmp = out / f".{task}.done.tmp"
     tmp.write_text(json.dumps(stat), encoding="utf-8")
     tmp.rename(done)
