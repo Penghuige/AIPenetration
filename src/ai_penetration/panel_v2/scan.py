@@ -260,13 +260,11 @@ def scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str) -> dict
                 break
             for rid, platform, desc in batch:
                 n_rows += 1
-                plat = pmap.get((platform or "").strip())
-                if plat is None:
+                # 与 pass1 完全一致的 fallback：未知/拼接平台串 → 255
+                pkey = (platform or "").strip()
+                if pkey not in pmap:
                     unknown_plat += 1
-                    if unknown_plat > 2000:
-                        raise SystemExit(
-                            f"未知 platform 超上限（{platform!r}…），映射覆盖异常")
-                    continue  # 未知平台不参与键计算（正常应为 0 或长尾几种）
+                plat = pmap.get(pkey, 255)
                 k = _h63(f"{plat}:{city_id}:{rid}")
                 idx = int(np.searchsorted(keys, k))
                 if idx >= keys.size or int(keys[idx]) != k:
