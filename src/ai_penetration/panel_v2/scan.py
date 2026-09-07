@@ -78,7 +78,7 @@ def export_master(out_dir: Path) -> None:
     assert not np.any(k_sorted[1:] == k_sorted[:-1]), "canonical key 哈希碰撞"
     npy_dir.mkdir(parents=True, exist_ok=True)
     tmp = out_dir / "_master_tmp"
-    tmp.mkdir(exist=True, exist_ok=True)
+    tmp.mkdir(parents=True, exist_ok=True)
     for name, arr in (("key", k_sorted), ("job_id", job_id[order]),
                       ("year", year[order]), ("company", company[order])):
         p = tmp / f"{name}.npy"
