@@ -49,60 +49,6 @@ def _results_conn():
     return _p.connect(**rp)
 
 
-def export_platform_map(out_dir: Path) -> dict[str, int]:
-    """platform 字符串 → pass1 编码：raw↔stage 按 rid 采样 join 重建。
-
-    pass1 编码已固化在 stage.plat；eps 只读侧采样 join 学回字符串→编码
-    （每平台取多数投票；pass1 全局 dict 一致故映射唯一）。
-    """
-    path = out_dir / "platform_map.json"
-    if path.exists():
-        return json.loads(path.read_text(encoding="utf-8"))
-    import psycopg2 as _p
-    votes: dict[str, dict[int, int]] = {}
-    eps = _p.connect(**eps_conn_params())
-    res = _results_conn()
-    icur = res.cursor()
-    icur.execute("SET maintenance_work_mem = '1GB'")
-    icur.execute("CREATE INDEX IF NOT EXISTS idx_stage_rid "
-                 "ON public.dedup_stage_gzsz (rid)")
-    res.commit()
-    res.close()
-    res = _results_conn()
-    try:
-        for _, shard, _cid in SHARDS:
-            jcur = eps.cursor()
-            jcur.execute(
-                f"SELECT platform, recruit_id FROM public.{shard} "
-                "TABLESAMPLE SYSTEM (0.02) LIMIT 40000")
-            pairs = jcur.fetchall()
-            rid_to_plat: dict[str, int] = {}
-            rcur = res.cursor()
-            ids = [r for _p_, r in pairs]
-            for i in range(0, len(ids), 1000):
-                chunk = ids[i:i + 1000]
-                rcur.execute(
-                    "SELECT rid, plat FROM public.dedup_stage_gzsz "
-                    "WHERE rid = ANY(%s)", (chunk,))
-                for rid_, plat_ in rcur.fetchall():
-                    rid_to_plat[str(rid_)] = int(plat_)
-            for plat_str, rid_ in pairs:
-                code = rid_to_plat.get(str(rid_))
-                if code is not None:
-                    votes.setdefault((plat_str or "").strip(), {})
-                    votes[(plat_str or "").strip()][code] = \
-                        votes[(plat_str or "").strip()].get(code, 0) + 1
-    finally:
-        eps.close()
-        res.close()
-    pmap = {plat: max(codes, key=codes.get)
-            for plat, codes in votes.items() if plat}
-    if len(pmap) < 8:
-        raise SystemExit(f"platform 映射采样异常（仅 {len(pmap)} 种），中止")
-    (out_dir / "platform_map.json").write_text(
-        json.dumps(pmap), encoding="utf-8")
-    logger.info("platform 映射: %d 种", len(pmap))
-    return pmap
 
 
 def export_master(out_dir: Path) -> None:
@@ -128,8 +74,11 @@ def export_master(out_dir: Path) -> None:
     year = np.empty(n, np.int32)
     company = np.empty(n, np.int32)
     comps: dict[str, int] = {}
-    for i, (rid, plat, jid, city, y, comp) in enumerate(rows):
-        key[i] = _h63(f"{plat}:{city}:{rid}")
+    # key = h63(rid)：master 的 rid 全局唯一（实证 0 重复组），跨切片/跨平台
+    # 的重复命中由 worker hit_seen + PG 端 DISTINCT ON 仲裁（rid 复合平台编码
+    # 会因映射覆盖缺口产生漏命中，2026-09-07 实证 9867 例，已弃用）
+    for i, (rid, _plat, jid, _city, y, comp) in enumerate(rows):
+        key[i] = _h63(str(rid))
         job_id[i] = int(jid)
         year[i] = int(y)
         company[i] = comps.setdefault(str(comp), len(comps))
@@ -169,11 +118,9 @@ def build_skill_vocab(out_dir: Path) -> None:
 
 
 def _init_worker(npy_dir: str) -> None:
-    """worker：mmap master + platform 映射 + 词表一致性断言（B3）。"""
+    """worker：mmap master + 词表一致性断言（B3）。"""
     _WORKER["m"] = {n: np.load(Path(npy_dir) / f"{n}.npy", mmap_mode="r")
                     for n in ("key", "job_id", "year", "company")}
-    _WORKER["pmap"] = json.loads(
-        (Path(npy_dir).parent / "platform_map.json").read_text(encoding="utf-8"))
     from ..skill_ai_anchor import load_merged_skills
     from .lexicon import _load_atier_aliases, build_union_lexicon
     aliases = _load_atier_aliases()
@@ -246,7 +193,7 @@ def scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str) -> dict
         cur = conn.cursor(f"pass2_{task}")
         cur.itersize = 50000
         cur.execute(
-            f"SELECT recruit_id, platform, job_description FROM public.{shard} "
+            f"SELECT recruit_id, job_description FROM public.{shard} "
             "WHERE ctid >= '(%s,0)'::tid AND ctid < '(%s,0)'::tid "
             "  AND job_description IS NOT NULL AND job_description != '' "
             "  AND position IS NOT NULL AND position != '' "
@@ -254,20 +201,13 @@ def scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str) -> dict
             (int(lo), int(hi)))
         for d in ("parts_flags", "parts_long", "parts_firm"):
             (out / d).mkdir(parents=True, exist_ok=True)
-        pmap = _WORKER["pmap"]
-        unknown_plat = 0
         while True:
             batch = cur.fetchmany(50000)
             if not batch:
                 break
-            for rid, platform, desc in batch:
+            for rid, desc in batch:
                 n_rows += 1
-                # 与 pass1 完全一致的 fallback：未知/拼接平台串 → 255
-                pkey = (platform or "").strip()
-                if pkey not in pmap:
-                    unknown_plat += 1
-                plat = pmap.get(pkey, 255)
-                k = _h63(f"{plat}:{city_id}:{rid}")
+                k = _h63(str(rid))
                 idx = int(np.searchsorted(keys, k))
                 if idx >= keys.size or int(keys[idx]) != k:
                     continue
@@ -303,8 +243,7 @@ def scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str) -> dict
     finally:
         conn.close()
     stat = {"task": task, "rows": n_rows, "canonical": n_canon,
-            "skill_pairs": n_pairs, "unknown_platform": unknown_plat,
-            "dup_hits": dup_hits}
+            "skill_pairs": n_pairs, "dup_hits": dup_hits}
     tmp = out / f".{task}.done.tmp"
     tmp.write_text(json.dumps(stat), encoding="utf-8")
     tmp.rename(done)
@@ -329,29 +268,95 @@ def _plan(slices: int) -> list[tuple]:
 
 
 def merge_parts(out_dir: Path, rel_dir: Path) -> None:
-    """子批分区合并为 §18 单文件，并对跨切片重复命中做 canonical 唯一化。
+    """parts 经结果库 PG 去重（DISTINCT ON）后流式转 parquet。
 
-    raw 同 (plat,city,rid) 真重复行（实测 24.3 万对，§6.2.1.1 同一编号
-    多条发布）可能落在不同 ctid 切片、worker 本地 seen 无法消解——
-    合并期按 job_id keep-first 去重（同一 canonical 的识别内容等价）。
+    2026-09-07 教训：2 亿行 pandas concat+drop_duplicates 内存洪峰疑似
+    压垮同机 PG（UNLOGGED 表被重启清空）——大表 dedup 是 PG 的本职，
+    Python 端只做流式 CSV→parquet 转换。跨切片重复命中（rid 在 raw 有
+    真重复行）由 DISTINCT ON keep-first 仲裁（同 canonical 识别等价）。
     """
-    import pandas as pd
+    import pyarrow as pa
+    import pyarrow.csv as pcsv
     import pyarrow.parquet as pq
     rel_dir.mkdir(parents=True, exist_ok=True)
-    specs = (("job_anchor_flag", "parts_flags", ["job_id"]),
-             ("job_skill_long", "parts_long", ["job_id", "skill_code"]),
-             ("job_firm", "parts_firm", ["job_id"]))
-    for name, sub, dedup_cols in specs:
+    specs = (
+        ("job_anchor_flag", "parts_flags",
+         "job_id int8, year int, anchor_main smallint, anchor_cn_paper smallint,"
+         " anchor_babina smallint, groups_main_bits int",
+         "job_id"),
+        ("job_skill_long", "parts_long",
+         "job_id int8, year int, skill_code int",
+         "job_id, skill_code"),
+        ("job_firm", "parts_firm", "job_id int8, year int, company_code int",
+         "job_id"),
+    )
+    conn = _results_conn()
+    conn.autocommit = False
+    cur = conn.cursor()
+    cur.execute("SET maintenance_work_mem = '2GB'")
+    cur.execute("SET work_mem = '1GB'")
+    for name, sub, cols, dedup_key in specs:
+        stg = f"_{name}_stg"
+        fin = f"_{name}_fin"
+        cur.execute(f"DROP TABLE IF EXISTS public.{stg} CASCADE")
+        cur.execute(f"DROP TABLE IF EXISTS public.{fin} CASCADE")
+        cur.execute(f"CREATE TABLE public.{stg} ({cols})")
         files = sorted((out_dir / sub).glob("*.parquet"))
         assert files, f"{sub} 无分片"
-        df = pd.concat(
-            [pq.read_table(f).to_pandas() for f in files],
-            ignore_index=True)
-        before = len(df)
-        df = df.drop_duplicates(dedup_cols, keep="first").reset_index(drop=True)
-        df.to_parquet(rel_dir / f"{name}.parquet", index=False)
-        logger.info("合并 %s: %d 分片 %d -> %d 行", name, len(files),
-                    before, len(df))
+        for f in files:
+            bio = _table_to_csv_buf(f)
+            cur.copy_expert(
+                f"COPY public.{stg} FROM STDIN WITH (FORMAT csv)", bio)
+        conn.commit()
+        cur.execute(f"CREATE TABLE public.{fin} AS SELECT DISTINCT ON ({dedup_key}) *"
+                    f" FROM public.{stg} ORDER BY {dedup_key}, job_id")
+        conn.commit()
+        cur.execute(f"SELECT count(*) FROM public.{stg}")
+        before = cur.fetchone()[0]
+        cur.execute(f"SELECT count(*) FROM public.{fin}")
+        after = cur.fetchone()[0]
+        # PG COPY 出 CSV → pyarrow 流式转 parquet（内存 O(row group)）
+        csv_tmp = out_dir / f"{name}.csv"
+        with csv_tmp.open("w", encoding="utf-8", newline="") as fh:
+            cur.copy_expert(
+                f"COPY public.{fin} TO STDOUT WITH (FORMAT csv, HEADER true)",
+                fh)
+        tbl = pcsv.read_csv(
+            csv_tmp,
+            read_options=pcsv.ReadOptions(block_size=1 << 24),
+            convert_options=pcsv.ConvertOptions(
+                column_types={c: t for c, t in zip(
+                    [x.split()[0] for x in cols.split(", ")],
+                    _arrow_types(name))}))
+        pq.write_table(tbl, rel_dir / f"{name}.parquet", compression="zstd")
+        csv_tmp.unlink(missing_ok=True)
+        cur.execute(f"DROP TABLE public.{stg}")
+        cur.execute(f"DROP TABLE public.{fin}")
+        conn.commit()
+        logger.info("PG 去重合并 %s: %d -> %d 行", name, before, after)
+    conn.close()
+
+
+def _arrow_types(name: str) -> list:
+    import pyarrow as pa
+    if name == "job_anchor_flag":
+        return [pa.int64(), pa.int32(), pa.int16(), pa.int16(), pa.int16(),
+                pa.int16()]
+    if name == "job_skill_long":
+        return [pa.int64(), pa.int32(), pa.int32()]
+    return [pa.int64(), pa.int32(), pa.int32()]
+
+
+def _table_to_csv_buf(path):
+    """parquet 分片转 CSV BytesIO（COPY 输入）。"""
+    import io
+    import pyarrow.csv as pcsv
+    import pyarrow.parquet as pq
+    tbl = pq.read_table(path)
+    buf = io.BytesIO()
+    pcsv.write_csv(tbl, buf)
+    buf.seek(0)
+    return buf
 
 
 def main() -> None:
@@ -366,7 +371,6 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     t0 = datetime.now()
 
-    export_platform_map(out_dir)
     export_master(out_dir)
     build_skill_vocab(out_dir)
     npy_dir = str(out_dir / "master_npy")
