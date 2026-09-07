@@ -332,12 +332,40 @@ def copy_stage(metas: list[dict], resume: bool) -> int:
     return total
 
 
+def _master_stats(cur) -> tuple[int, int]:
+    """统计与审计指标（master 已存在时的轻量路径）。"""
+    cur.execute(f"SELECT count(*), sum(records_collapsed), sum(company_unmatched::int),"
+                f" sum(CASE WHEN latest_day - earliest_day > 30 AND records_collapsed > 1"
+                f"         THEN records_collapsed ELSE 0 END),"
+                f" count(*) FILTER (WHERE latest_day - earliest_day > 30 AND records_collapsed > 1)"
+                f" FROM public.{TABLE_MASTER}")
+    n_master, sum_collapsed, unmatched, chain_over, chain_groups = cur.fetchone()
+    cur.execute(f"SELECT count(*) FROM public.{TABLE_STAGE}")
+    n_stage = cur.fetchone()[0]
+    logger.info("master=%d stage=%d unmatched_company=%d 链跨度>30天组=%d(行%d)",
+                n_master, n_stage, unmatched, chain_groups, chain_over)
+    return n_master, n_stage
+
+
 def build_master() -> tuple[int, int]:
-    """两段式：join 物化 sorted → 窗口分组 canonical → master + 附表 + 审计。"""
+    """两段式：join 物化 sorted → 窗口分组 canonical → master + 附表 + 审计。
+
+    幂等（断点纪律）：master 已存在且带本次版本标记时，跳过全部 DDL
+    （sorted/seg/master 的窗口计算耗时 1-2h），仅重算统计。
+    """
     conn = _results_conn()
     conn.autocommit = False
     cur = conn.cursor()
     cur.execute("SET work_mem = '1GB'")
+    cur.execute("SELECT to_regclass('public." + TABLE_MASTER + "')")
+    if cur.fetchone()[0] is not None:
+        cur.execute(f"SELECT count(*) FROM public.{TABLE_MASTER} "
+                    f"WHERE duplicate_version = '{MASTER_VERSION}'")
+        if cur.fetchone()[0] > 0:
+            logger.info("master 已存在（%s），跳过重建，仅出统计", MASTER_VERSION)
+            out = _master_stats(cur)
+            conn.close()
+            return out
     cur.execute(f"DROP TABLE IF EXISTS public.{TABLE_SORTED}")
     # 段一：join ent 聚合映射（min 消除一 rid 多司冲突并计数），NULL→哨兵
     cur.execute(f"""
@@ -421,19 +449,10 @@ def build_master() -> tuple[int, int]:
     cur.execute(f"CREATE INDEX ON public.{TABLE_GROUPMAP} (duplicate_group_id)")
     cur.execute(f"CREATE INDEX ON public.{TABLE_MASTER} (job_id_raw)")
     conn.commit()
-    cur.execute(f"SELECT count(*), sum(records_collapsed), sum(company_unmatched::int),"
-                f" sum(CASE WHEN latest_day - earliest_day > 30 AND records_collapsed > 1"
-                f"         THEN records_collapsed ELSE 0 END),"
-                f" count(*) FILTER (WHEN latest_day - earliest_day > 30 AND records_collapsed > 1)"
-                f" FROM public.{TABLE_MASTER}")
-    n_master, sum_collapsed, unmatched, chain_over, chain_groups = cur.fetchone()
-    cur.execute(f"SELECT count(*) FROM public.{TABLE_STAGE}")
-    n_stage = cur.fetchone()[0]
+    out = _master_stats(cur)
     conn.commit()
     conn.close()
-    logger.info("master=%d stage=%d unmatched_company=%d 链跨度>30天组=%d(行%d)",
-                n_master, n_stage, unmatched, chain_groups, chain_over)
-    return n_master, n_stage
+    return out
 
 
 def verify_invariants() -> None:
