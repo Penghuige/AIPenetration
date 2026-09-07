@@ -14,13 +14,13 @@ def test_fit_finds_low_prior_for_sparse_signal():
     n = np.concatenate([np.full(300, 50.0), np.full(20, 500.0)])
     c = np.concatenate([np.zeros(300), np.full(20, 350.0)])
     a, b, status = beta_binomial_fit_unit(n, c)
-    assert status in ("fitted", "jeffreys")
+    assert status.startswith(("fitted", "jeffreys"))
     assert a / (a + b) < 0.5  # 先验均值接近全局低频共现水平
 
 
 def test_fit_fallback_on_tiny_unit():
     a, b, status = beta_binomial_fit_unit(np.array([5.0, 6.0]), np.array([1.0, 2.0]))
-    assert (a, b, status) == (0.5, 0.5, "jeffreys")
+    assert (a, b) == (0.5, 0.5) and status == "jeffreys:few_skills"
 
 
 def test_relevance_keeps_raw_and_smoothed(tmp_path):
@@ -39,7 +39,7 @@ def test_relevance_keeps_raw_and_smoothed(tmp_path):
               & (rel.year == 2014)].iloc[0]
     assert row.ai_rate_raw == 0.8
     assert row.ai_rate_smoothed <= 0.8          # 收缩方向
-    assert row.smoothing_status in ("fitted", "jeffreys")
+    assert row.smoothing_status.startswith(("fitted", "jeffreys"))
     assert set(rel.columns) >= {"alpha", "beta", "rare_lt10", "confidence_tier",
                                 "ai_rate_raw", "ai_rate_smoothed",
                                 "smoothing_status"}
