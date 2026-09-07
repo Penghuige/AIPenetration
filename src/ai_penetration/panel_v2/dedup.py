@@ -352,32 +352,39 @@ def build_master() -> tuple[int, int]:
     """)
     cur.execute(f"CREATE INDEX ON public.{TABLE_SORTED} (company_id, posh, city, thash, yr, day, rid)")
     conn.commit()
-    # 段二：确定性链式分段（ROWS 帧，评审必改3）+ canonical（§6.2.2 顺序）
+    # 段一·五：链式分段物化（ROWS 帧确定性，评审必改3），master/map 共享
+    TABLE_SEG = TABLE_SORTED.replace("sorted", "seg")
+    cur.execute(f"DROP TABLE IF EXISTS public.{TABLE_SEG}")
+    cur.execute(f"""
+        CREATE UNLOGGED TABLE public.{TABLE_SEG} AS
+        SELECT *,
+               sum(CASE WHEN prev_day IS NULL OR day < 0 OR prev_day < 0
+                        OR day - prev_day > 30 THEN 1 ELSE 0 END)
+                   OVER (PARTITION BY company_id, posh, city, thash, yr
+                         ORDER BY day, rid
+                         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS seg
+        FROM (
+            SELECT *, lag(day) OVER (
+                PARTITION BY company_id, posh, city, thash, yr
+                ORDER BY day, rid
+                ROWS BETWEEN 1 PRECEDING AND 1 PRECEDING) AS prev_day
+            FROM public.{TABLE_SORTED}
+        ) x
+    """)
+    cur.execute(f"CREATE INDEX ON public.{TABLE_SEG} (company_id, posh, city, thash, yr, seg)")
+    conn.commit()
+    # 段二：canonical（§6.2.2 顺序：完整度→最长→最早→rid 字典序）
     cur.execute(f"DROP TABLE IF EXISTS public.{TABLE_MASTER}")
     cur.execute(f"""
         CREATE TABLE public.{TABLE_MASTER} AS
-        WITH chained AS (
+        WITH ranked AS (
             SELECT *,
-                   sum(CASE WHEN prev_day IS NULL OR day < 0 OR prev_day < 0
-                            OR day - prev_day > 30 THEN 1 ELSE 0 END)
-                       OVER (PARTITION BY company_id, posh, city, thash, yr
-                             ORDER BY day, rid
-                             ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS seg
-            FROM (
-                SELECT *, lag(day) OVER (
-                    PARTITION BY company_id, posh, city, thash, yr
-                    ORDER BY day, rid
-                    ROWS BETWEEN 1 PRECEDING AND 1 PRECEDING) AS prev_day
-                FROM public.{TABLE_SORTED}
-            ) x
-        ), ranked AS (
-            SELECT *,
-                   count(*)     OVER w AS grp_n,
-                   min(day)     OVER w AS gmin,
-                   max(day)     OVER w AS gmax,
+                   count(*) OVER w AS grp_n,
+                   min(day) OVER w AS gmin,
+                   max(day) OVER w AS gmax,
                    row_number() OVER (PARTITION BY company_id, posh, city, thash, yr, seg
                                       ORDER BY comp DESC, dlen DESC, day ASC, rid ASC) AS pick
-            FROM chained
+            FROM public.{TABLE_SEG}
             WINDOW w AS (PARTITION BY company_id, posh, city, thash, yr, seg)
         )
         SELECT row_number() OVER (ORDER BY company_id, yr, thash, rid) AS job_id,
@@ -400,23 +407,19 @@ def build_master() -> tuple[int, int]:
         SELECT (company_id || ':' || posh || ':' || city || ':' || thash || ':'
                 || yr || ':' || seg) AS duplicate_group_id,
                plat, rid AS job_id_raw, day, comp, dlen
-        FROM public.{TABLE_SORTED} s
+        FROM public.{TABLE_SEG}
     """)
-    cur.execute(f"""
-        CREATE TABLE public.{TABLE_MASTER + "_pc"} AS
-        SELECT duplicate_group_id, count(DISTINCT plat) AS platform_count
-        FROM public.{TABLE_GROUPMAP} GROUP BY 1
-    """)
+    cur.execute("CREATE TABLE public.job_master_pc AS "
+                "SELECT duplicate_group_id, count(DISTINCT plat) AS platform_count "
+                "FROM public." + TABLE_GROUPMAP + " GROUP BY 1")
     cur.execute(f"ALTER TABLE public.{TABLE_MASTER} "
                 "ADD COLUMN platform_count int")
-    cur.execute(f"""
-        UPDATE public.{TABLE_MASTER} m
-        SET platform_count = p.platform_count
-        FROM public.{TABLE_MASTER + "_pc"} p
-        WHERE m.duplicate_group_id = p.duplicate_group_id
-    """)
-    cur.execute(f"DROP TABLE public.{TABLE_MASTER + '_pc'}")
+    cur.execute(f"UPDATE public.{TABLE_MASTER} m SET platform_count = p.platform_count "
+                "FROM public.job_master_pc p "
+                "WHERE m.duplicate_group_id = p.duplicate_group_id")
+    cur.execute("DROP TABLE public.job_master_pc")
     cur.execute(f"CREATE INDEX ON public.{TABLE_GROUPMAP} (duplicate_group_id)")
+    cur.execute(f"CREATE INDEX ON public.{TABLE_MASTER} (job_id_raw)")
     conn.commit()
     cur.execute(f"SELECT count(*), sum(records_collapsed), sum(company_unmatched::int),"
                 f" sum(CASE WHEN latest_day - earliest_day > 30 AND records_collapsed > 1"
