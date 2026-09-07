@@ -88,7 +88,7 @@ def _job_loo_scores(pair_job, pair_skill, pair_yidx, pair_comp, anchored,
     key = ((pair_skill.astype(np.int64) * n_comp + pair_comp) << 4) | pair_yidx
     order = np.argsort(key, kind="stable")
     k_uniq, starts = np.unique(key[order], return_index=True)
-    n_sf = np.diff(np.append(starts, len(k_uniq)))
+    n_sf = np.diff(np.append(starts, len(key)))  # 哨兵=总 pair 数（非 uniq 数）
     anchored_sorted = anchored[order]
     starts_of = np.repeat(np.arange(len(k_uniq)), n_sf)
     c_sf = np.bincount(starts_of, weights=anchored_sorted.astype(np.float64),
