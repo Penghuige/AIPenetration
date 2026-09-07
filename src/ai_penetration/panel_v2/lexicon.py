@@ -44,6 +44,7 @@ class UnionLexicon:
     automaton: ahocorasick.Automaton = field(default=None)  # type: ignore[assignment]
     ascii_keys: frozenset[str] = frozenset()
     homograph: dict[str, re.Pattern] = field(default_factory=dict)
+    keys_map: dict[str, str] = field(default_factory=dict)  # match键→skill_id
     n_atier: int = 0
     n_legacy: int = 0
     n_concepts: int = 0
@@ -141,8 +142,8 @@ def build_union_lexicon(
                 n_atier, n_legacy, len(overlap), len(keys), len(homograph))
     return UnionLexicon(
         automaton=automaton, ascii_keys=ascii_keys, homograph=homograph,
-        n_atier=n_atier, n_legacy=n_legacy, n_concepts=len(keys),
-        overlap_terms=tuple(overlap),
+        keys_map=keys, n_atier=n_atier, n_legacy=n_legacy,
+        n_concepts=len(keys), overlap_terms=tuple(overlap),
     )
 
 
