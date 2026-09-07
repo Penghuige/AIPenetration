@@ -1,0 +1,46 @@
+# 面板 v2 主管线配置（指南 §19.2；口径变更须同步 docs/panel_v2_设计.md）
+panel_version: v2a
+dictionary_version: bilingual_a_frozen_v1.1+legacy_union_v1
+
+scope:
+  cities: [广州市, 深圳市]      # v2a 先广深；全国由用户排窗后扩
+  years: [2014, 2025]          # eps 实际可得止于 2024，运行期自动 clamp 并记录
+
+lexicon:
+  atier: true                  # A 级冻结概念（ai_dict，110,970 激活别名 → 22,683 概念）
+  legacy_terms: true           # 自建技术词并入（pytorch/tensorflow/halcon 等 A 级盲区）
+  legacy_namespace: "legacy:"  # 合成 skill_id 前缀，不污染 uuid 空间
+
+dedup:                         # 指南 §6.2 岗位去重主规则
+  unique_key: [platform, recruit_id]
+  group_by: [company, position_normalized, city, desc_hash]
+  group_max_gap_days: 30
+  cross_platform_merge: false  # 跨平台默认不合并（§6.2.0 字典语料与主样本分离）
+
+cooccurrence:                  # §13–§14
+  anchors: [main, cn_paper, babina]
+  windows: [annual, pooled, roll3_centered]
+  boundary_windows: {start: [2014, 2015], end: [2024, 2025]}
+  keep_all_skills: true        # §13.4 低频不删除，只打 rare 标记
+  rare_flags: [10, 20, 50]
+  smoothing:
+    per_unit: [anchor_version, window_type]   # §14.2 逐单元拟合
+    min_fit_n: 5
+    fallback: jeffreys
+
+job_score:                     # §15–§16
+  aggregation: simple_mean_dedup_skills
+  score_types: [raw, smoothed]
+  primary_score: aijob_main_annual_raw_005    # §16.4 主标识
+  thresholds: [0.05, 0.10, 0.15]
+  strict_greater: true
+  zero_skill_rule: {keep_row: true, score: missing, flags: 0, override: zero_skill_override}
+  require_coverage_one: true   # §15.3 score_skill_coverage<1 阻断
+
+robustness:                    # §14.3 企业留一（主锚点、三窗口、原始率）
+  leave_one_firm: {enabled: true, anchors: [main], score_type: raw}
+
+release:                       # §17.6/§18
+  quality_gate_fail_blocks: true
+  outputs_dir: output/release/panel_v2
+  metadata_fields: 12
