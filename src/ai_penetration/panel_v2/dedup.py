@@ -290,11 +290,12 @@ def copy_ent_map() -> None:
 
 
 def copy_stage(metas: list[dict], resume: bool) -> int:
-    """窄行分片文本 COPY 进 UNLOGGED stage。"""
+    """窄行分片文本 COPY 进 stage（常规 WAL 表，重启可恢复——UNLOGGED
+    在 2026-09-07 PG 意外重启中清空全管线，教训记录）。"""
     conn = _results_conn()
     cur = conn.cursor()
     cur.execute(f"""
-        CREATE UNLOGGED TABLE IF NOT EXISTS public.{TABLE_STAGE} (
+        CREATE TABLE IF NOT EXISTS public.{TABLE_STAGE} (
             rid text NOT NULL, plat smallint, city smallint, yr int,
             day int, posh bigint, thash bigint, dlen int, comp smallint)""")
     cur.execute(f"SELECT count(*) FROM public.{TABLE_STAGE}")
@@ -358,6 +359,7 @@ def build_master() -> tuple[int, int]:
     conn.autocommit = False
     cur = conn.cursor()
     cur.execute("SET work_mem = '1GB'")
+    cur.execute("SET maintenance_work_mem = '2GB'")
     cur.execute("SELECT to_regclass('public." + TABLE_MASTER + "')")
     if cur.fetchone()[0] is not None:
         cur.execute(f"SELECT count(*) FROM public.{TABLE_MASTER} "
@@ -370,19 +372,22 @@ def build_master() -> tuple[int, int]:
     cur.execute("SELECT to_regclass('public." + TABLE_SORTED + "')")
     sorted_exists = cur.fetchone()[0] is not None
     if sorted_exists:
-        # 旧版 sorted 缺 rule1_dups 列（跨城重复未处理）→ 强制重建
+        # 旧版缺 rule1_dups 列 或 表被 PG 重启清空（原 UNLOGGED 版本）→ 重建
         cur.execute("SELECT count(*) FROM information_schema.columns "
                     "WHERE table_name=%s AND column_name='rule1_dups'",
                     (TABLE_SORTED,))
-        if cur.fetchone()[0] == 0:
-            logger.info("sorted 表为旧版（无 rule1_dups），DROP 重建")
+        has_col = cur.fetchone()[0] > 0
+        cur.execute(f"SELECT EXISTS(SELECT 1 FROM public.{TABLE_SORTED} LIMIT 1)")
+        nonempty = cur.fetchone()[0]
+        if not has_col or not nonempty:
+            logger.info("sorted 表旧版/空（重启清空），DROP 重建")
             cur.execute(f"DROP TABLE public.{TABLE_SORTED}")
             sorted_exists = False
     if not sorted_exists:
         # 段一：规则1（§6.2.1.1 平台+编号唯一记录，跨城重复折叠并计数）
         # + join ent 聚合映射（min 消一 rid 多司），NULL→哨兵
         cur.execute(f"""
-            CREATE UNLOGGED TABLE public.{TABLE_SORTED} AS
+            CREATE TABLE public.{TABLE_SORTED} AS
             WITH joined AS (
                 SELECT s.rid, s.plat, s.city, s.yr, s.day, s.posh, s.thash,
                        s.dlen, s.comp,
@@ -412,7 +417,7 @@ def build_master() -> tuple[int, int]:
     TABLE_SEG = TABLE_SORTED.replace("sorted", "seg")
     cur.execute(f"DROP TABLE IF EXISTS public.{TABLE_SEG}")
     cur.execute(f"""
-        CREATE UNLOGGED TABLE public.{TABLE_SEG} AS
+        CREATE TABLE public.{TABLE_SEG} AS
         SELECT *, (company_id || ':' || posh || ':' || city || ':' || thash || ':'
                    || yr || ':' || seg_bucket) AS seg
         FROM (
