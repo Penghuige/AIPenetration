@@ -275,7 +275,6 @@ def merge_parts(out_dir: Path, rel_dir: Path) -> None:
     Python 端只做流式 CSV→parquet 转换。跨切片重复命中（rid 在 raw 有
     真重复行）由 DISTINCT ON keep-first 仲裁（同 canonical 识别等价）。
     """
-    import pyarrow as pa
     import pyarrow.csv as pcsv
     import pyarrow.parquet as pq
     rel_dir.mkdir(parents=True, exist_ok=True)
