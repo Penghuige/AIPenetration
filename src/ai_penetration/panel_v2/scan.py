@@ -49,15 +49,40 @@ def _results_conn():
     return _p.connect(**rp)
 
 
+def export_platform_map(out_dir: Path) -> dict[str, int]:
+    """platform 字符串 → pass1 编码映射（从 stage 1% 采样重建，确定性）。
+
+    pass1 的编码由固定 dict 顺序生成且已落进 stage/master；本映射仅做
+    字符串→编码反查（每 platform 在 stage 中编码唯一，min 为防御）。
+    """
+    path = out_dir / "platform_map.json"
+    if path.exists():
+        return json.loads(path.read_text(encoding="utf-8"))
+    conn = _results_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT platform, min(plat::int) FROM public."
+                "dedup_stage_gzsz TABLESAMPLE SYSTEM (1) GROUP BY 1")
+    pmap = {str(p): int(c) for p, c in cur.fetchall()}
+    conn.close()
+    (out_dir / "platform_map.json").write_text(
+        json.dumps(pmap), encoding="utf-8")
+    logger.info("platform 映射: %d 种", len(pmap))
+    return pmap
+
+
 def export_master(out_dir: Path) -> None:
-    """job_master → 4 个排序裸 .npy（mmap 真共享）。原子写（M9）。"""
+    """job_master → 4 个排序裸 .npy（mmap 真共享）。原子写（M9）。
+
+    过滤键 = h63("<plat_code>:<city_code>:<job_id_raw>")——与 stage 行双射
+    （rid-only 会把 rule1 折叠的重复行也计入，守恒实证超命中 275,304）。
+    """
     npy_dir = out_dir / "master_npy"
     if all((npy_dir / f"{n}.npy").exists()
            for n in ("key", "job_id", "year", "company")):
         return
     conn = _results_conn()
     cur = conn.cursor()
-    cur.execute("SELECT job_id_raw, job_id, city, year, company_id "
+    cur.execute("SELECT job_id_raw, plat, job_id, city, year, company_id "
                 "FROM public.job_master_gzsz")
     rows = cur.fetchall()
     conn.close()
@@ -68,8 +93,8 @@ def export_master(out_dir: Path) -> None:
     year = np.empty(n, np.int32)
     company = np.empty(n, np.int32)
     comps: dict[str, int] = {}
-    for i, (rid, jid, _c, y, comp) in enumerate(rows):
-        key[i] = _h63(str(rid))
+    for i, (rid, plat, jid, city, y, comp) in enumerate(rows):
+        key[i] = _h63(f"{plat}:{city}:{rid}")
         job_id[i] = int(jid)
         year[i] = int(y)
         company[i] = comps.setdefault(str(comp), len(comps))
@@ -109,9 +134,11 @@ def build_skill_vocab(out_dir: Path) -> None:
 
 
 def _init_worker(npy_dir: str) -> None:
-    """worker：mmap master + 从落盘词表反查一致性（B3）。"""
+    """worker：mmap master + platform 映射 + 词表一致性断言（B3）。"""
     _WORKER["m"] = {n: np.load(Path(npy_dir) / f"{n}.npy", mmap_mode="r")
                     for n in ("key", "job_id", "year", "company")}
+    _WORKER["pmap"] = json.loads(
+        (Path(npy_dir).parent / "platform_map.json").read_text(encoding="utf-8"))
     from ..skill_ai_anchor import load_merged_skills
     from .lexicon import _load_atier_aliases, build_union_lexicon
     aliases = _load_atier_aliases()
@@ -182,7 +209,7 @@ def scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str) -> dict
         cur = conn.cursor(f"pass2_{task}")
         cur.itersize = 50000
         cur.execute(
-            f"SELECT recruit_id, job_description FROM public.{shard} "
+            f"SELECT recruit_id, platform, job_description FROM public.{shard} "
             "WHERE ctid >= '(%s,0)'::tid AND ctid < '(%s,0)'::tid "
             "  AND job_description IS NOT NULL AND job_description != '' "
             "  AND position IS NOT NULL AND position != '' "
@@ -190,13 +217,19 @@ def scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str) -> dict
             (int(lo), int(hi)))
         for d in ("parts_flags", "parts_long", "parts_firm"):
             (out / d).mkdir(parents=True, exist_ok=True)
+        pmap = _WORKER["pmap"]
         while True:
             batch = cur.fetchmany(50000)
             if not batch:
                 break
-            for rid, desc in batch:
+            for rid, platform, desc in batch:
                 n_rows += 1
-                k = _h63(str(rid))
+                plat = pmap.get((platform or "").strip())
+                if plat is None:
+                    raise SystemExit(
+                        f"未知 platform 无法映射编码: {platform!r}（"
+                        "platform_map 采样未覆盖，需全量重建映射）")
+                k = _h63(f"{plat}:{city_id}:{rid}")
                 idx = int(np.searchsorted(keys, k))
                 if idx >= keys.size or int(keys[idx]) != k:
                     continue
@@ -280,6 +313,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     t0 = datetime.now()
 
+    export_platform_map(out_dir)
     export_master(out_dir)
     build_skill_vocab(out_dir)
     npy_dir = str(out_dir / "master_npy")
