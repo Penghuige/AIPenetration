@@ -57,7 +57,8 @@ def export_master(out_dir: Path) -> None:
         return
     conn = _results_conn()
     cur = conn.cursor()
-    cur.execute("SELECT rid, job_id, city, year, company_id FROM public.job_master_gzsz")
+    cur.execute("SELECT job_id_raw, job_id, city, year, company_id "
+                "FROM public.job_master_gzsz")
     rows = cur.fetchall()
     conn.close()
     n = len(rows)
