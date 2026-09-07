@@ -112,6 +112,9 @@ def main() -> None:
     # job_ai_score 以 18 单元 dataset 产出（B1 内存纪律），发布前流式合并
     score_dir = rel / "job_ai_score"
     score_single = rel / "job_ai_score.parquet"
+    # 幂等判断用真实规模（上次崩溃可能留残缺文件；4.5 亿行不可能小于 100MB）
+    if score_single.exists() and score_single.stat().st_size < 100 * 1024 * 1024:
+        score_single.unlink()
     if score_dir.is_dir() and not score_single.exists():
         import pyarrow.parquet as _pq
         import pyarrow as _pa
