@@ -394,7 +394,6 @@ def main() -> None:
     merge_parts(out_dir, paths.output_dir / "release" / "panel_v2")
     # 守恒终判：合并去重后的 flag 行数必须等于 master（Σcanonical 允许多计
     # 跨切片重复命中，由 merge keep-first 归一）
-    import pandas as pd
     import pyarrow.parquet as pq
     n_flag = pq.ParquetFile(
         paths.output_dir / "release" / "panel_v2"
