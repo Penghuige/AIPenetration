@@ -494,13 +494,13 @@ def verify_invariants() -> None:
     """守恒与确定性验收（评审必改6/7）；失败 raise。"""
     conn = _results_conn()
     cur = conn.cursor()
-    # 守恒在 sorted 层交叉（恒等式，master 侧 canonical 行不携带全部折叠数）：
-    #   stage = sorted行数 + Σsorted.rule1_dups
-    #   Σmaster.records_collapsed = sorted行数
+    # 守恒核对完全走常规表（不依赖 sorted/seg 中间态，master 幂等跳过后
+    # 依然可验证）：groupmap 行恒等于 sorted 应有行数（规则1去重后）
+    #   stage - groupmap = 规则1折叠行数（记录并阈值监控）
+    #   Σmaster.records_collapsed = groupmap 行数（分桶守恒）
     cur.execute(f"""
         SELECT (SELECT count(*) FROM public.{TABLE_STAGE}),
-               (SELECT count(*) FROM public.{TABLE_SORTED}),
-               (SELECT coalesce(sum(rule1_dups),0) FROM public.{TABLE_SORTED}),
+               (SELECT count(*) FROM public.{TABLE_GROUPMAP}),
                (SELECT count(*) FROM public.{TABLE_MASTER}),
                (SELECT sum(records_collapsed) FROM public.{TABLE_MASTER}),
                (SELECT count(*) - count(DISTINCT duplicate_group_id) FROM public.{TABLE_MASTER}),
@@ -509,15 +509,19 @@ def verify_invariants() -> None:
                    GROUP BY 1,2 HAVING count(*)>1) z),
                (SELECT count(*) FROM public.{TABLE_STAGE} WHERE yr = 0)
     """)
-    (stage, sorted_n, rule1_sum, master, collapsed,
+    (stage, map_n, master, collapsed,
      dup_groups, rid_dups, bad_years) = cur.fetchone()
     conn.close()
-    problems = []
-    if stage != sorted_n + rule1_sum:
-        problems.append(f"规则1守恒失败: stage {stage} != sorted {sorted_n} "
-                        f"+ rule1 {rule1_sum}")
-    if collapsed != sorted_n:
-        problems.append(f"分桶守恒失败: Σcollapsed {collapsed} != sorted {sorted_n}")
+    rule1_sum = stage - map_n
+    if rule1_sum < 0:
+        problems = [f"groupmap {map_n} > stage {stage}（不可能状态）"]
+    else:
+        problems = []
+    if collapsed != map_n:
+        problems.append(f"分桶守恒失败: Σcollapsed {collapsed} != groupmap {map_n}")
+    if rule1_sum > stage * 0.02:
+        problems.append(f"规则1折叠 {rule1_sum} 超 stage 2%（rid 重复异常）")
+    logger.info("规则1折叠行数（stage-groupmap）: %d", rule1_sum)
     if dup_groups != 0:
         problems.append(f"{dup_groups} 组出现多 canonical")
     if rid_dups != 0:
