@@ -329,19 +329,29 @@ def _plan(slices: int) -> list[tuple]:
 
 
 def merge_parts(out_dir: Path, rel_dir: Path) -> None:
-    """子批分区合并为 §18 单文件（流式写，避免全表内存）。"""
+    """子批分区合并为 §18 单文件，并对跨切片重复命中做 canonical 唯一化。
+
+    raw 同 (plat,city,rid) 真重复行（实测 24.3 万对，§6.2.1.1 同一编号
+    多条发布）可能落在不同 ctid 切片、worker 本地 seen 无法消解——
+    合并期按 job_id keep-first 去重（同一 canonical 的识别内容等价）。
+    """
+    import pandas as pd
     import pyarrow.parquet as pq
     rel_dir.mkdir(parents=True, exist_ok=True)
-    for name, sub in (("job_anchor_flag", "parts_flags"),
-                      ("job_skill_long", "parts_long"),
-                      ("job_firm", "parts_firm")):
+    specs = (("job_anchor_flag", "parts_flags", ["job_id"]),
+             ("job_skill_long", "parts_long", ["job_id", "skill_code"]),
+             ("job_firm", "parts_firm", ["job_id"]))
+    for name, sub, dedup_cols in specs:
         files = sorted((out_dir / sub).glob("*.parquet"))
         assert files, f"{sub} 无分片"
-        schema = pq.read_schema(files[0])
-        with pq.ParquetWriter(rel_dir / f"{name}.parquet", schema) as w:
-            for f in files:
-                w.write_table(pq.read_table(f))
-        logger.info("合并 %s: %d 分片", name, len(files))
+        df = pd.concat(
+            [pq.read_table(f).to_pandas() for f in files],
+            ignore_index=True)
+        before = len(df)
+        df = df.drop_duplicates(dedup_cols, keep="first").reset_index(drop=True)
+        df.to_parquet(rel_dir / f"{name}.parquet", index=False)
+        logger.info("合并 %s: %d 分片 %d -> %d 行", name, len(files),
+                    before, len(df))
 
 
 def main() -> None:
@@ -380,12 +390,23 @@ def main() -> None:
     n_master = cur.fetchone()[0]
     conn.close()
     canon = sum(s["canonical"] for s in stats)
-    if canon != n_master:
-        raise SystemExit(f"守恒失败: pass2 canonical {canon} != master {n_master}")
+    dup_hits = sum(s.get("dup_hits", 0) for s in stats)
     merge_parts(out_dir, paths.output_dir / "release" / "panel_v2")
+    # 守恒终判：合并去重后的 flag 行数必须等于 master（Σcanonical 允许多计
+    # 跨切片重复命中，由 merge keep-first 归一）
+    import pandas as pd
+    import pyarrow.parquet as pq
+    n_flag = pq.ParquetFile(
+        paths.output_dir / "release" / "panel_v2"
+        / "job_anchor_flag.parquet").metadata.num_rows
+    if n_flag != n_master:
+        raise SystemExit(
+            f"守恒失败: 合并后 flag {n_flag} != master {n_master}"
+            f"（Σcanonical={canon} 本地去重 {dup_hits}）")
     dur = (datetime.now() - t0).total_seconds() / 3600
-    print(f"pass2 完成: canonical={canon:,} pairs={sum(s['skill_pairs'] for s in stats):,}"
-          f" 用时 {dur:.2f}h，守恒核验通过 ✓")
+    print(f"pass2 完成: canonical={canon:,}(dup hits {dup_hits:,}) "
+          f"pairs={sum(s['skill_pairs'] for s in stats):,} "
+          f"flag={n_flag:,} 用时 {dur:.2f}h，守恒核验通过 ✓")
 
 
 if __name__ == "__main__":
