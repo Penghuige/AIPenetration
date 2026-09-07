@@ -52,7 +52,9 @@ def _dense_weights(rel: pd.DataFrame, years: np.ndarray, n_skill: int):
     out: dict[tuple[str, str], np.ndarray] = {}
     for ver in VERSIONS:
         for st in ("raw", "smoothed"):
-            mat = np.zeros((cols, n_skill), np.float64)
+            # NaN 填充：真缺失（连接/版本错误）在得分层可检出（B2，§15.3.2
+            # 禁止静默置 0）；合法 w=0.0 由 counts 全技能保留写入覆盖
+            mat = np.full((cols, n_skill), np.nan)
             sub = rel[rel.anchor_version == ver]
             col = np.empty(len(sub), np.int64)
             win_idx = sub.window_type.to_numpy()
@@ -187,8 +189,13 @@ def run(rel_dir: Path, bench: bool = False) -> None:
         flags.year.to_numpy(np.int32) - ymin
     matched = np.bincount(j_of, minlength=len(jobs)).astype(np.int32)
 
-    score_frames = []
+    # B1：每个 (ver,win,scoretype) 单元即算即落盘（dataset 分区），
+    # 不累积 18 个全量帧；B2：weighted/coverage 由 isfinite 实测。
+    assert n_y <= 16, "留一 triple 键打包假设 yidx<16（M1 防扩年后静默错配）"
+    score_dir = rel_dir / "job_ai_score"
+    score_dir.mkdir(parents=True, exist_ok=True)
     cls = pd.DataFrame({"job_id": jobs, "year": job_year + ymin})
+    n_jobs = len(jobs)
     for ver in VERSIONS:
         for win in WINDOWS:
             for st in ("raw", "smoothed"):
@@ -196,24 +203,30 @@ def run(rel_dir: Path, bench: bool = False) -> None:
                                  for y in range(n_y)])[job_year[j_of]] \
                     if win != "pooled" else np.full(len(j_of), n_y)
                 w = dense[(ver, st)][unit, s_of]
-                sw = np.bincount(j_of, weights=w, minlength=len(jobs))
-                cov = np.divide(sw, matched, out=np.full(len(jobs), np.nan),
-                                where=matched > 0)
-                bad = (matched > 0) & ~np.isclose(
-                    np.bincount(j_of, weights=np.isfinite(w), minlength=len(jobs)),
-                    matched)
-                assert not bad.any(), f"§15.3 coverage<1 阻断（{ver}/{win}/{st}）"
-                score_frames.append(pd.DataFrame({
-                    "job_id": jobs, "anchor_version": ver, "window_type": win,
-                    "score_type": st, "ai_score": cov,
-                    "matched_skill_count": matched,
-                    "weighted_skill_count": matched, "score_skill_coverage":
-                    np.where(matched > 0, 1.0, 0.0),
-                    "score_eligible": (matched > 0).astype(np.int8),
-                }))
+                finite = np.isfinite(w)
+                sw = np.bincount(j_of, weights=np.where(finite, w, 0.0),
+                                 minlength=n_jobs)
+                weighted = np.bincount(j_of[finite], minlength=n_jobs)
+                bad = (matched > 0) & (weighted != matched)
+                assert not bad.any(), \
+                    f"§15.3.2 阻断：{ver}/{win}/{st} 有 {int(bad.sum())} 岗位技能权重缺失"
+                cov = np.divide(sw, weighted, out=np.full(n_jobs, np.nan),
+                                where=weighted > 0)
+                pq.write_table(
+                    pa.Table.from_pandas(pd.DataFrame({
+                        "job_id": jobs, "anchor_version": ver, "window_type": win,
+                        "score_type": st, "ai_score": cov,
+                        "matched_skill_count": matched,
+                        "weighted_skill_count": weighted.astype(np.int32),
+                        "score_skill_coverage": np.divide(
+                            weighted, matched, out=np.zeros(n_jobs),
+                            where=matched > 0),
+                        "score_eligible": (matched > 0).astype(np.int8),
+                    })),
+                    score_dir / f"{ver}_{win}_{st}.parquet")
                 cname = f"aijob_{ver}_{win}_{st}"
                 for thr in THRESHOLDS:
-                    cls[f"{cname}_{'005' if thr==0.05 else ('010' if thr==0.1 else '015')}"] = \
+                    cls[f"{cname}_{'005' if thr == 0.05 else ('010' if thr == 0.1 else '015')}"] = \
                         (cov > thr).astype(np.int8)
     # §16.2 零技能岗位：标识归 0 + override（得分保持缺失）
     zero = matched == 0
@@ -253,9 +266,6 @@ def run(rel_dir: Path, bench: bool = False) -> None:
         loo_frame[f"loo_main_{win}_coverage"] = cov
 
     out = rel_dir
-    pq.write_table(pa.Table.from_pandas(
-        pd.concat(score_frames, ignore_index=True)),
-        out / "job_ai_score.parquet", compression="zstd")
     pq.write_table(pa.Table.from_pandas(cls), out / "job_ai_classification.parquet",
                    compression="zstd")
     pq.write_table(pa.Table.from_pandas(loo_frame),
@@ -263,7 +273,7 @@ def run(rel_dir: Path, bench: bool = False) -> None:
     prim = cls["aijob_main_annual_raw_005"]
     logger.info("scoring 完成: 岗位 %d，主标识 AI 率 %.4f%%，零技能 %.2f%%",
                 len(jobs), prim.mean() * 100, zero.mean() * 100)
-    print(f"job_ai_score 长表 {sum(len(f) for f in score_frames):,} 行；"
+    print(f"job_ai_score 已按 18 单元分区写入 {score_dir.name}/；"
           f"主口径 aijob_main_annual_raw_005 = {prim.mean():.4%}；"
           f"零技能岗位 {zero.mean():.2%}")
 

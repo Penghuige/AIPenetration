@@ -75,13 +75,19 @@ class UnionLexicon:
 
 
 def _load_atier_aliases() -> list[tuple[str, str]]:
-    """读 A 级激活别名 (alias, skill_id)，DISTINCT 归一。"""
+    """读 A 级激活别名 (alias, skill_id)。
+
+    确定性保证（B3 审计修复）：同一 alias 多 skill_id 时取 min(skill_id)，
+    按 alias 排序返回——first-wins 结果跨进程/跨重跑稳定（实证 36 个
+    碰撞键如 abap/ansible/cobol，若不定序会造成 skill_code 跨分片错位）。
+    """
     conn = psycopg2.connect(**eps_conn_params())
     try:
         cur = conn.cursor()
         cur.execute("""
-            SELECT DISTINCT alias, skill_id FROM ai_dict.skill_aliases
+            SELECT alias, min(skill_id) AS skill_id FROM ai_dict.skill_aliases
             WHERE is_active='1' AND alias IS NOT NULL AND length(trim(alias))>=2
+            GROUP BY alias ORDER BY alias
         """)
         return [(r[0], r[1]) for r in cur.fetchall()]
     finally:

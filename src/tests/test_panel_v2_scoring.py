@@ -91,7 +91,8 @@ def _fixture(tmp_path):
 def test_scoring_end_to_end(tmp_path):
     run(_fixture(tmp_path))
     cls = pd.read_parquet(tmp_path / "job_ai_classification.parquet")
-    score = pd.read_parquet(tmp_path / "job_ai_score.parquet")
+    import pyarrow.parquet as pq
+    score = pq.read_table(tmp_path / "job_ai_score").to_pandas()
     # job1: 含 skill0 rate=1 → 得分 0.5(两技能均值) → >0.05 标识 1
     r = cls[cls.job_id == 1].iloc[0]
     assert r.aijob_main_annual_raw_005 == 1
@@ -103,12 +104,12 @@ def test_scoring_end_to_end(tmp_path):
     assert np.isnan(s5.ai_score.iloc[0])
     # 得分表行数 = 5 jobs × 9 单元 × 2 类型
     assert len(score) == 5 * 9 * 2
-    # coverage 恒 1（有技能岗位）
+    # coverage 恒 1（有技能岗位，weighted 实测非硬编码）
     assert (score[score.matched_skill_count > 0]
             .score_skill_coverage == 1.0).all()
     loo = pd.read_parquet(tmp_path / "job_ai_score_loo.parquet")
     # job3(company0,skill0,2015) 与 job1(company0,2014,skill0)：
-    # annual 2015 n_{s,f,y}=0/1 → 留一分母 0 → 得分缺失（有权重技能=skill1 rate0）
+    # annual 2015 n_{s,f,y}=1/1 → 留一分母 0 → skill0 无留一权重 → 得分缺失
     l3 = loo[loo.job_id == 3].iloc[0]
-    assert np.isnan(l3.loo_main_annual_raw)  # skill0 无留一权重，其余仅 skill1?
+    assert np.isnan(l3.loo_main_annual_raw)
     assert l3.loo_main_annual_coverage >= 0.0

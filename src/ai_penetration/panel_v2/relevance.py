@@ -19,7 +19,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import psycopg2
+import psycopg2  # noqa: F401  (eps 只读：tier 查询)
 
 from config.paths import get_project_paths
 
@@ -32,22 +32,24 @@ MIN_RATE_N = 1      # 全部技能都算共现率（§13.4 不删除）
 
 
 def beta_binomial_fit_unit(n: np.ndarray, c: np.ndarray) -> tuple[float, float, str]:
-    """单单元 Beta-Binomial 先验 MLE（边际似然）。失败回退 Jeffreys。
+    """单单元 Beta-Binomial 先验 MLE（边际似然）。
 
     Args:
         n: 技能分母（仅 n>=MIN_FIT_N 参与）。
         c: 技能分子。
 
     Returns:
-        (alpha, beta, status)，status ∈ {fitted, jeffreys}。
+        (alpha, beta, status)，status 区分回退原因（§14.2.5）：
+        fitted / jeffreys:no_scipy / jeffreys:few_skills /
+        jeffreys:not_converged / jeffreys:unstable / jeffreys:error。
     """
     try:
         from scipy.optimize import minimize
         from scipy.special import betaln
     except ImportError:
-        return 0.5, 0.5, "jeffreys"
+        return 0.5, 0.5, "jeffreys:no_scipy"
     if n.size < 50:
-        return 0.5, 0.5, "jeffreys"
+        return 0.5, 0.5, "jeffreys:few_skills"
 
     def nll(x: np.ndarray) -> float:
         a, b = np.exp(x)
@@ -57,12 +59,14 @@ def beta_binomial_fit_unit(n: np.ndarray, c: np.ndarray) -> tuple[float, float, 
         res = minimize(nll, x0=np.array([np.log(0.3), np.log(8.0)]),
                        method="Nelder-Mead",
                        options={"maxiter": 2000, "xatol": 1e-4, "fatol": 1e-3})
+        if not res.success:  # §14.2.4 优化不收敛回退
+            return 0.5, 0.5, "jeffreys:not_converged"
         a, b = np.exp(res.x)
         if not (1e-4 <= a <= 1e4 and 1e-4 <= b <= 1e4):
-            return 0.5, 0.5, "jeffreys"
+            return 0.5, 0.5, "jeffreys:unstable"
         return float(a), float(b), "fitted"
     except Exception:  # noqa: BLE001
-        return 0.5, 0.5, "jeffreys"
+        return 0.5, 0.5, "jeffreys:error"
 
 
 def _load_tier_map(vocab_path: Path) -> np.ndarray:
@@ -119,14 +123,27 @@ def compute_relevance(counts: pd.DataFrame, tier_map: np.ndarray) -> pd.DataFram
     return rel
 
 
+def decode_skill_ids(rel: pd.DataFrame, vocab_path: Path) -> pd.DataFrame:
+    """skill_code → skill_id 解码（I4：发布件内部自含可解释）。"""
+    import json
+    vocab = json.loads(vocab_path.read_text(encoding="utf-8"))
+    code_to_sid = {c: s for s, c in vocab.items()}
+    rel = rel.drop(columns=["skill_id"], errors="ignore").copy()
+    rel.insert(1, "skill_id",
+               pd.Series(code_to_sid).reindex(rel.skill_code).to_numpy())
+    return rel
+
+
 def main() -> None:
     argparse.ArgumentParser(description="panel_v2 §14 共现率与平滑").parse_args()
     paths = get_project_paths()
     setup_logging(paths.log_dir / "panel_v2_relevance.log")
     rel_dir = paths.output_dir / "release" / "panel_v2"
     counts = pd.read_parquet(rel_dir / "skill_ai_counts.parquet")
-    tier_map = _load_tier_map(paths.output_dir / "panel_v2" / "pass2" / "skill_vocab.json")
-    rel = compute_relevance(counts, tier_map)
+    pass2 = paths.output_dir / "panel_v2" / "pass2"
+    tier_map = _load_tier_map(pass2 / "skill_vocab.json")
+    rel = decode_skill_ids(compute_relevance(counts, tier_map),
+                           pass2 / "skill_vocab.json")
     rel.to_parquet(rel_dir / "skill_ai_relevance.parquet", index=False)
     st = rel.groupby("smoothing_status").size().to_dict()
     logger.info("skill_ai_relevance: %d 行，拟合状态 %s", len(rel), st)
