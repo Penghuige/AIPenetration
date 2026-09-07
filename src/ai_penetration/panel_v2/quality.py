@@ -109,15 +109,19 @@ def gate_checks(rel: Path) -> tuple[list[str], dict]:
         wsize = (r3.window_end - r3.window_start + 1).value_counts()
         if set(wsize.index) - {2, 3}:
             fails.append("roll3 窗口尺寸异常")
-    # 8 coverage 实测（dataset 分块，B1）
+    # 8 coverage 实测（dataset 逐文件，B1：单文件一单元，pandas 列裁剪）
     cov_min, score_lo, score_hi, n_cov_bad = 1.0, 0.0, 1.0, 0
-    for batch in _iter_batches(pq.ParquetDataset(rel / "job_ai_score")):
-        elig = batch[batch["matched_skill_count"] > 0].to_pandas()
+    ds = pq.ParquetDataset(rel / "job_ai_score")
+    for frag in ds.fragments:
+        df = frag.to_table(columns=[
+            "matched_skill_count", "weighted_skill_count",
+            "score_skill_coverage", "ai_score"]).to_pandas()
+        elig = df[df.matched_skill_count > 0]
         if elig.empty:
             continue
         n_cov_bad += int((elig.weighted_skill_count != elig.matched_skill_count).sum())
         cov_min = min(cov_min, float(elig.score_skill_coverage.min()))
-        s = batch["ai_score"].to_pandas().dropna()
+        s = df.ai_score.dropna()
         if len(s):
             score_lo, score_hi = min(score_lo, float(s.min())), max(score_hi, float(s.max()))
     if n_cov_bad:
@@ -155,12 +159,6 @@ def gate_checks(rel: Path) -> tuple[list[str], dict]:
     return fails, stats
 
 
-def _iter_batches(ds):
-    """流式遍历 dataset 批次（B1：不整表加载 9 亿行得分）。"""
-    for frag in ds.fragments:
-        tbl = frag.to_table(columns=["matched_skill_count", "weighted_skill_count",
-                                      "score_skill_coverage", "ai_score"])
-        yield tbl
 
 
 def warning_checks(rel: Path) -> tuple[list[str], dict]:
