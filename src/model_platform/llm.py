@@ -39,6 +39,7 @@ class LLMClient(Protocol):
         max_output_tokens: int | None = None,
         reasoning_effort: str | None = None,
         temperature: float | None = None,
+        extra_payload: dict[str, Any] | None = None,
     ) -> str:
         """生成文本。"""
 
@@ -51,6 +52,7 @@ class LLMClient(Protocol):
         max_output_tokens: int | None = None,
         reasoning_effort: str | None = None,
         temperature: float | None = None,
+        extra_payload: dict[str, Any] | None = None,
     ) -> dict[str, Any] | list[Any]:
         """生成并解析 JSON。"""
 
@@ -138,6 +140,7 @@ class OpenAICompatClient:
         max_output_tokens: int | None = None,
         reasoning_effort: str | None = None,
         temperature: float | None = None,
+        extra_payload: dict[str, Any] | None = None,
     ) -> str:
         """生成一段文本回复。
 
@@ -148,6 +151,8 @@ class OpenAICompatClient:
             max_output_tokens: 最大输出 token 数。
             reasoning_effort: 推理努力程度；轻量实现忽略。
             temperature: 采样温度。
+            extra_payload: 追加到请求体的额外字段（如
+                ``{"chat_template_kwargs": {"enable_thinking": false}}``）。
 
         Returns:
             助手回复文本。
@@ -166,6 +171,8 @@ class OpenAICompatClient:
             payload["max_tokens"] = int(max_output_tokens)
         if temperature is not None:
             payload["temperature"] = float(temperature)
+        if extra_payload:
+            payload.update(extra_payload)
         response = self._post_chat(payload)
         try:
             return str(response["choices"][0]["message"]["content"] or "")
@@ -181,6 +188,7 @@ class OpenAICompatClient:
         max_output_tokens: int | None = None,
         reasoning_effort: str | None = None,
         temperature: float | None = None,
+        extra_payload: dict[str, Any] | None = None,
     ) -> dict[str, Any] | list[Any]:
         """生成并解析 JSON 回复。
 
@@ -194,6 +202,7 @@ class OpenAICompatClient:
             max_output_tokens=max_output_tokens,
             reasoning_effort=reasoning_effort,
             temperature=temperature,
+            extra_payload=extra_payload,
         )
         parsed = extract_json_from_response(text)
         if parsed is None:
