@@ -109,6 +109,20 @@ def main() -> None:
         raise SystemExit("发布目录已有本次结果（--force-release 覆盖，或改 run_id）")
 
     export_dictionaries(rel)
+    # job_ai_score 以 18 单元 dataset 产出（B1 内存纪律），发布前流式合并
+    score_dir = rel / "job_ai_score"
+    score_single = rel / "job_ai_score.parquet"
+    if score_dir.is_dir() and not score_single.exists():
+        import pyarrow.parquet as _pq
+        import pyarrow as _pa
+        files = sorted(score_dir.glob("*.parquet"))
+        schema = _pq.read_schema(files[0])
+        with _pq.ParquetWriter(score_single, schema,
+                               compression="zstd") as w:
+            for f in files:
+                for tbl in _pq.ParquetFile(f).iter_batches(batch_size=2_000_000):
+                    w.write_table(tbl)
+        logger.info("job_ai_score 合并 %d 单元 -> 单文件", len(files))
     specs = [
         ("skill_concept_v1.parquet", "skill_id", "ai_dict.skill_concepts"),
         ("skill_alias_v1.parquet", "alias_id", "ai_dict.skill_aliases(active)"),
