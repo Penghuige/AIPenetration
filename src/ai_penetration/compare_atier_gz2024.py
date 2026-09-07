@@ -53,6 +53,11 @@ CITIES = ("广州市", "深圳市")
 
 _ASCII_RE = re.compile(r"^[\x00-\x7f]+$")
 
+
+def _is_ascii_alnum(ch: str) -> bool:
+    """ASCII 字母数字判定（中文返回 False——边界规则只挡英文粘连）。"""
+    return ("a" <= ch <= "z") or ("A" <= ch <= "Z") or ("0" <= ch <= "9")
+
 # 商业职能岗位名（审计证实：产品语境"提到≠从事"误报集中在这些岗名——
 # 其 B-only 判定需 >=2 个强概念；技术岗名单概念放行，避免误伤
 # "视觉算法工程师"等真岗）。"运营"不列入：运营开发/运营算法多为真技术岗。
@@ -147,7 +152,9 @@ def extract_concepts(text_lower: str, automaton: ahocorasick.Automaton,
             start = end - len(key) + 1
             before = text_lower[start - 1] if start > 0 else ""
             after = text_lower[end + 1] if end + 1 < len(text_lower) else ""
-            if before.isalnum() or after.isalnum():
+            # ASCII 字母数字边界（§12.6.4 语义）：中文不是 ASCII alnum，
+            # 早先用 isalnum() 会把中文语境中的英文别名系统性误排除（勘误）
+            if _is_ascii_alnum(before) or _is_ascii_alnum(after):
                 continue
         sids.add(sid)
     if homograph:
