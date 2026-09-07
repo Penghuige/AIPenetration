@@ -233,6 +233,8 @@ def scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str) -> dict
     keys = m["key"]
     conn = psycopg2.connect(**eps_conn_params())
     n_rows = n_canon = part = 0
+    dup_hits = 0
+    hit_seen: set[int] = set()  # raw 同 (plat,city,rid) 真重复行只识别一次（§6.2.1.1）
     flags_buf: list = []
     long_buf: list = []
     firm_buf: list = []
@@ -269,6 +271,10 @@ def scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str) -> dict
                 idx = int(np.searchsorted(keys, k))
                 if idx >= keys.size or int(keys[idx]) != k:
                     continue
+                if k in hit_seen:
+                    dup_hits += 1
+                    continue
+                hit_seen.add(k)
                 n_canon += 1
                 job_id = int(m["job_id"][idx])
                 yr = int(m["year"][idx])
@@ -297,7 +303,8 @@ def scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str) -> dict
     finally:
         conn.close()
     stat = {"task": task, "rows": n_rows, "canonical": n_canon,
-            "skill_pairs": n_pairs, "unknown_platform": unknown_plat}
+            "skill_pairs": n_pairs, "unknown_platform": unknown_plat,
+            "dup_hits": dup_hits}
     tmp = out / f".{task}.done.tmp"
     tmp.write_text(json.dumps(stat), encoding="utf-8")
     tmp.rename(done)
