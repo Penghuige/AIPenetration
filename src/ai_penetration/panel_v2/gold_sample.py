@@ -28,7 +28,6 @@ from ..ai_scoring import is_ai_job
 from ..common import (DEFAULT_OMEGA_SNAPSHOT, eps_conn_params,
                       resolve_artifact_path, setup_logging)
 from ..skill_ai_anchor import build_skill_regex, extract_skills_fast
-from ..text_clean import match_from_raw
 from .dedup import _h63
 
 logger = logging.getLogger("ai_penetration.panel_v2.gold")
