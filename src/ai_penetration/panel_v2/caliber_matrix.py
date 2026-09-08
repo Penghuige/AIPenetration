@@ -20,7 +20,6 @@ import logging
 from datetime import datetime
 
 import numpy as np
-import pandas as pd
 import psycopg2
 import pyarrow.parquet as pq
 
@@ -28,9 +27,7 @@ from config.paths import get_project_paths
 
 from ..common import DEFAULT_OMEGA_SNAPSHOT, eps_conn_params, resolve_artifact_path, setup_logging
 from ..ai_scoring import is_ai_job
-from ..load_guangdong import GD_SHARDS
 from ..skill_ai_anchor import build_skill_regex, extract_skills_fast, load_merged_skills
-from ..text_clean import match_from_raw
 from .dedup import _h63
 
 logger = logging.getLogger("ai_penetration.panel_v2.caliber")
@@ -47,7 +44,6 @@ def main() -> None:
     setup_logging(paths.log_dir / "caliber_matrix.log")
 
     keys = np.load(f"{MASTER_NPY}/key.npy", mmap_mode="r")
-    myear = np.load(f"{MASTER_NPY}/year.npy", mmap_mode="r")
     omega = json.loads(resolve_artifact_path(
         DEFAULT_OMEGA_SNAPSHOT, artifact="ωsAI 快照").read_text(encoding="utf-8"))
     regex = build_skill_regex(load_merged_skills(include_llm=True))
@@ -110,10 +106,10 @@ def main() -> None:
     d12 = rows[0][2] and (rows[1][2] / rows[0][2] - 1)
     d24 = rows[3][2] / max(rows[1][2], 1e-12)
     lines += ["",
-              f"- 去重/文本构成效应（cell1→cell2）：{d12:+.1%}",
-              f"- 判据+词表效应（cell2→cell4，同为严阈值口径倍率）：×{d24:.2f}",
-              f"- 阈值效应（cell4→cell3）：×{rows[2][2]/max(rows[3][2],1e-12):.2f}",
-              ""]
+              "- 去重/文本构成效应（cell1→cell2）：" + f"{d12:+.1%}",
+              "- 判据+词表效应（cell2→cell4 倍率）：" + f"×{d24:.2f}",
+              "- 阈值效应（cell4→cell3 倍率）："
+              + f"×{rows[2][2]/max(rows[3][2],1e-12):.2f}", ""]
     out = paths.report_dir / f"caliber_matrix_{stamp}.md"
     out.write_text("\n".join(lines), encoding="utf-8")
     print("\n".join(lines))
