@@ -53,7 +53,8 @@ from ..text_clean import match_from_raw, normalize_position, text_hash
 logger = logging.getLogger("ai_penetration.panel_v2.dedup")
 
 # b 版：规则1 跨城 rid 去重 + 组首锚定 30 天桶（链式语义超披露线修正）
-MASTER_VERSION = "main_v2a_20260907b"
+# c 版：2022 数据治理——描述有效长度 >=10 准入（blank 率 18.3% 污染修复）
+MASTER_VERSION = "main_v2a_20260908c"
 TABLE_STAGE = "dedup_stage_gzsz"
 TABLE_SORTED = "dedup_sorted_gzsz"
 TABLE_MASTER = "job_master_gzsz"
@@ -126,7 +127,8 @@ def _scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str,
             setup.execute("SET LOCAL work_mem = '256MB'")
             setup.execute("SET LOCAL max_parallel_workers_per_gather = 0")
         cond = ("WHERE ctid >= '(%s,0)'::tid AND ctid < '(%s,0)'::tid "
-                "AND job_description IS NOT NULL AND job_description != '' "
+                "AND job_description IS NOT NULL "
+                "AND length(trim(job_description)) >= 10 "
                 "AND position IS NOT NULL AND position != '' "
                 "AND recruit_id IS NOT NULL")
         params: tuple = (int(lo), int(hi))
@@ -135,6 +137,8 @@ def _scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str,
             params = params + (year_filter + "%",)
         cur = conn.cursor(f"dedup_{task}")
         cur.itersize = 50000
+        # 2022 数据治理：blank 描述率 18.3%（trim 后 <10 字符），" \n" 等
+        # 非空串漏过 !='' 过滤污染主样本——统一按有效长度 >=10 准入
         cur.execute(
             f"SELECT recruit_id, platform, position, publish_time, job_description, "
             f"education, work_type, experience, recruit_count, age_req "

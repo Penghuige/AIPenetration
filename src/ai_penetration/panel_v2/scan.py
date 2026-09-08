@@ -195,7 +195,8 @@ def scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str) -> dict
         cur.execute(
             f"SELECT recruit_id, job_description FROM public.{shard} "
             "WHERE ctid >= '(%s,0)'::tid AND ctid < '(%s,0)'::tid "
-            "  AND job_description IS NOT NULL AND job_description != '' "
+            "  AND job_description IS NOT NULL "
+            "  AND length(trim(job_description)) >= 10 "
             "  AND position IS NOT NULL AND position != '' "
             "  AND recruit_id IS NOT NULL",
             (int(lo), int(hi)))
