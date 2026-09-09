@@ -5,9 +5,10 @@
 - §15.3 coverage=1 硬断言（cnt>0 岗位 weighted==matched）；
 - §15.4 raw 与 smoothed 双得分，主可比用 raw；
 - §16.1 三阈值严格大于；§16.2 零技能岗位：保留记录、得分缺失、
-  三标识=0、zero_skill_override=1；§16.4 主标识（2026-09-09 金标准决策后）
-  = aijob_main_annual_raw_015（AI 岗位占比），_005 语义为「AI 技能暴露率」
-  （exposure share），禁止作为岗位占比引用（见 config/panel_v2.yaml 注释）；
+  三标识=0、zero_skill_override=1；§16.4/§2.4 **主标识 =
+  aijob_main_annual_raw_005（"AI 相关岗位"，指南原义）**；0.10/0.15 档
+  按指南用于 Babina 方法与阈值敏感性比较。"核心职责净 AI 岗占比"是
+  接收方金标准追加分析层，不反向改写主口径（沿革详见 docs/10 §五）。
 - §14.3 企业留一（仅 main、三窗口、原始率）：
   w^-f = (c_{s,t}-c_{s,f,t})/(n_{s,t}-n_{s,f,t})，分母≤0 该技能无留一权重
   （得分按有权重技能取均值，覆盖率仅描述，§15.3.5）。
@@ -272,13 +273,14 @@ def run(rel_dir: Path, bench: bool = False) -> None:
                    compression="zstd")
     pq.write_table(pa.Table.from_pandas(loo_frame),
                    out / "job_ai_score_loo.parquet", compression="zstd")
-    exp5 = cls["aijob_main_annual_raw_005"].mean()
-    prim = cls["aijob_main_annual_raw_015"].mean()
-    logger.info("scoring 完成: 岗位 %d，主指标(>0.15) %.4f%%，暴露率(>0.05) %.4f%%，"
-                "零技能 %.2f%%", len(jobs), prim * 100, exp5 * 100, zero.mean() * 100)
+    prim = cls["aijob_main_annual_raw_005"].mean()   # 指南 §2.4 主标识
+    sens15 = cls["aijob_main_annual_raw_015"].mean()  # §16 Babina/敏感性档
+    logger.info("scoring 完成: 岗位 %d，主标识 AI 相关岗位(>0.05) %.4f%%，"
+                "参考档(>0.15) %.4f%%，零技能 %.2f%%",
+                len(jobs), prim * 100, sens15 * 100, zero.mean() * 100)
     print(f"job_ai_score 已按 18 单元分区写入 {score_dir.name}/；"
-          f"主指标 aijob_main_annual_raw_015 = {prim:.4%}；"
-          f"暴露率 aijob_main_annual_raw_005 = {exp5:.4%}；零技能 {zero.mean():.2%}")
+          f"主标识 aijob_main_annual_raw_005 = {prim:.4%}；"
+          f"参考档 aijob_main_annual_raw_015 = {sens15:.4%}；零技能 {zero.mean():.2%}")
 
 
 def main() -> None:
