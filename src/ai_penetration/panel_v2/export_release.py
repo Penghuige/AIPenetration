@@ -55,7 +55,8 @@ def _config_hash() -> str:
 
 
 def _meta(p: Path, run_id: str, primary_key: str, source_files: str,
-          anchor_version: str = "-") -> None:
+          anchor_version: str = "-",
+          dictionary_version: str = "bilingual_a_frozen_v1.1+legacy_union_v1") -> None:
     import pyarrow.parquet as _pq
     if p.suffix == ".parquet":
         schema = str(_pq.read_schema(p))
@@ -69,7 +70,7 @@ def _meta(p: Path, run_id: str, primary_key: str, source_files: str,
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "row_count": n, "column_schema": schema, "primary_key": primary_key,
         "source_files": source_files,
-        "dictionary_version": "bilingual_a_frozen_v1.1+legacy_union_v1",
+        "dictionary_version": dictionary_version,
         "anchor_version": anchor_version,
         "config_hash": _config_hash(), "sha256": _sha(p),
     }
