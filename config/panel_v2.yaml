@@ -39,13 +39,16 @@ cooccurrence:                  # §13–§14
 job_score:                     # §15–§16
   aggregation: simple_mean_dedup_skills
   score_types: [raw, smoothed]
-  # 2026-09-09 金标准决策：主指标=0.15（首判依据 >0.30 带真值率 92%）。
-  # **前提已更新**：全量重判+0.15-0.30 带补测（232 条，verdict 重判版）显示
-  # (0.15,0.30] 带真值率仅 10%（占 015 全带 75%），015 加权真值率 ~30%，
-  # >0.30 带 87.5%。015 暂按"候选池"语义保留，分层决策 A/B/C 待用户裁决
-  # （docs/00 §九.0）；0.05 语义为「AI 技能暴露率」，禁作岗位占比引用。
-  primary_score: aijob_main_annual_raw_015
-  exposure_score: aijob_main_annual_raw_005
+  # 主指标语义沿革与终版（2026-09-10 按指南原预案复原，用户指示纠偏）：
+  #   指南 §2.4/§16.4 白纸黑字："主AI岗位标识：得分严格大于0.05"；
+  #   "主阈值为0.05；0.10和0.15用于与Babina方法及阈值敏感性比较"。
+  #   测量对象按指南=「AI 相关岗位」（相关度），此前 09-09 切 015、讨论切 030
+  #   均属把"净核心职责 AI 岗占比"（我方金标准的追加问题）错置到主口径上。
+  #   金标准结论（015 带核心职责真值 ~30-56%、>0.30 带 87.5-96.7%）降格为
+  #   **补充解释层**，不再反向定义主指标。
+  primary_score: aijob_main_annual_raw_005   # AI 相关岗位标识（指南原义）
+  sensitivity_scores: [aijob_main_annual_raw_010, aijob_main_annual_raw_015]  # Babina 对标
+  supplementary_highconf: aijob_main_annual_raw_015  # 金标准口径下的高纯子集另述
   thresholds: [0.05, 0.10, 0.15]
   strict_greater: true
   zero_skill_rule: {keep_row: true, score: missing, flags: 0, override: zero_skill_override}

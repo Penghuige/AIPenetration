@@ -96,6 +96,52 @@ def governance_frame(lex, taut: dict[str, list[str]],
         ["disposition", "tier", "term"], kind="stable").reset_index(drop=True)
 
 
+def grade_legacy_frame(legacy_keys: dict[str, str], df_freq: dict[str, int],
+                       cand_cooc: dict[str, float],
+                       first_year: dict[str, int]) -> pd.DataFrame:
+    """指南 §10.3.1 A/B/C/D 自动分级，仅对 legacy 键（A 级天然 A，全量参与）。
+
+    规则忠实度：
+    - B：df_unique_description ≥100；
+    - C（任一）：10≤df<100；df≥5 且候选主锚点共现率≥0.50；
+      df≥5 且"新出现的软件/模型/框架"——**确定性代理** first_year≥2019
+      （Qwen §10.3.3 语义判断的保守替代，QC 披露）；
+    - D：其余（不进正式匹配，保留候选库=skill_candidate_d 形态）。
+    注：v2d 的 taut 动作规则在本版撤销——指南 §10 的 D 级判定即"概念边界
+    不清"通道，同义反复仅作为**披露属性**（tautological 列）随表输出。
+
+    Args:
+        legacy_keys: match_key -> skill_id（legacy 层）。
+        df_freq: match_key -> 频率语料 distinct (platform,text) 计数。
+        cand_cooc: skill_id -> 主样本 pooled 原始共现率（候选口径）。
+        first_year: skill_id -> 主样本首个出现年份。
+
+    Returns:
+        DataFrame[term, skill_id, df_freq, cand_cooc, first_year,
+        tautological, grade]，grade ∈ {B, C, D}。
+    """
+    from .anchors import _COMPILED
+    pats = _COMPILED["main"]
+    rows = []
+    for key, sid in sorted(legacy_keys.items()):
+        df = int(df_freq.get(key, 0))
+        cooc = float(cand_cooc.get(sid, 0.0))
+        fy = int(first_year.get(sid, 9999))
+        is_taut = int(any(p.search(key) for _g, _t, _r, p in pats))
+        if df >= 100:
+            grade = "B"
+        elif df >= 10:
+            grade = "C"
+        elif df >= 5 and (cooc >= 0.50 or fy >= 2019):
+            grade = "C"
+        else:
+            grade = "D"
+        rows.append({"term": key, "skill_id": sid, "df_freq": df,
+                     "cand_cooc": round(cooc, 4), "first_year": fy,
+                     "tautological": is_taut, "grade": grade})
+    return pd.DataFrame(rows)
+
+
 def _pooled_freq(rel: Path) -> dict[str, int]:
     """从发布 counts（main×pooled）取 skill_id→n_skill（去重岗位频数）。"""
     counts = pq.read_table(rel / "skill_ai_counts.parquet",

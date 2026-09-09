@@ -1,10 +1,14 @@
-"""v2d 治理纯函数离线测试（注入词表，不连库）。"""
+"""v2d/v2e 治理纯函数离线测试（注入词表，不连库）。"""
 from __future__ import annotations
 
 import pandas as pd
 
 from src.ai_penetration.panel_v2.lexicon import LEGACY_PREFIX, build_union_lexicon
-from src.ai_penetration.panel_v2.lexicon_v2d import governance_frame, tautological_keys
+from src.ai_penetration.panel_v2.lexicon_v2d import (
+    governance_frame,
+    grade_legacy_frame,
+    tautological_keys,
+)
 
 _ALIASES = [
     ("机器学习", "uuid-ml"),        # 与 ML 锚点同形 → A级 taut
@@ -43,3 +47,26 @@ def test_governance_frame_dispositions():
     pd.testing.assert_frame_equal(frame, governance_frame(lex, taut, pooled))
     assert (frame.loc[frame.disposition == "removed_lowfreq",
                       "pooled_freq"] < 100).all()
+
+
+def test_grade_legacy_frame_guide_rules():
+    """§10.3.1 A/B/C/D 自动分级三分支（v2e 复原通道）。"""
+    keys = {"机器学习基础": LEGACY_PREFIX + "a", "pytorch": LEGACY_PREFIX + "b",
+            "midjourney": LEGACY_PREFIX + "c", "小工具x": LEGACY_PREFIX + "d",
+            "ai": LEGACY_PREFIX + "e"}
+    dfreq = {"机器学习基础": 500, "pytorch": 50, "midjourney": 7,
+             "小工具x": 50, "ai": 30000}
+    cooc = {keys[k]: v for k, v in
+            zip(keys, (0.9, 0.8, 0.55, 0.05, 1.0))}
+    fy = {keys[k]: v for k, v in zip(keys, (2016, 2016, 2023, 2015, 2014))}
+    g = grade_legacy_frame(keys, dfreq, cooc, fy)
+    d = dict(zip(g.term, g.grade))
+    assert d["机器学习基础"] == "B"          # df≥100
+    assert d["pytorch"] == "C"              # 10≤df<100
+    assert d["midjourney"] == "C"           # df≥5 且 cooc≥0.5 且新出现
+    assert d["小工具x"] == "C"               # 10≤df<100
+    assert d["ai"] == "B"                   # 原预案：频数即 B，taut 仅披露不行动
+    assert int(g.loc[g.term == "ai", "tautological"].iloc[0]) == 1
+    assert int(g.loc[g.term == "机器学习基础", "tautological"].iloc[0]) == 1
+    # 确定性
+    pd.testing.assert_frame_equal(g, grade_legacy_frame(keys, dfreq, cooc, fy))
