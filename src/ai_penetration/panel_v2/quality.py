@@ -227,9 +227,11 @@ def warning_checks(rel: Path) -> tuple[list[str], dict]:
     return warns, info
 
 
-def run() -> None:
+def run(rel: Path | None = None) -> None:
+    """质量门全流程（rel 默认 release/panel_v2；v2d 传 alt 目录）。"""
     paths = get_project_paths()
-    rel = paths.output_dir / "release" / "panel_v2"
+    if rel is None:
+        rel = paths.output_dir / "release" / "panel_v2"
     fails, stats = gate_checks(rel)
     warns, info = warning_checks(rel)
     stats_path = rel / "quality_stats.json"
