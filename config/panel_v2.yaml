@@ -31,7 +31,10 @@ cooccurrence:                  # §13–§14
 job_score:                     # §15–§16
   aggregation: simple_mean_dedup_skills
   score_types: [raw, smoothed]
-  primary_score: aijob_main_annual_raw_005    # §16.4 主标识
+  # 2026-09-09 金标准决策：主指标=0.15（>0.30 带真值率 92%，0.05-0.15 带仅 4%）；
+  # 0.05 保留但更名语义为「AI 技能暴露率」（exposure share），不得作为 AI 岗位占比引用。
+  primary_score: aijob_main_annual_raw_015
+  exposure_score: aijob_main_annual_raw_005
   thresholds: [0.05, 0.10, 0.15]
   strict_greater: true
   zero_skill_rule: {keep_row: true, score: missing, flags: 0, override: zero_skill_override}

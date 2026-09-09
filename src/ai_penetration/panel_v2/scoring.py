@@ -270,12 +270,13 @@ def run(rel_dir: Path, bench: bool = False) -> None:
                    compression="zstd")
     pq.write_table(pa.Table.from_pandas(loo_frame),
                    out / "job_ai_score_loo.parquet", compression="zstd")
-    prim = cls["aijob_main_annual_raw_005"]
-    logger.info("scoring 完成: 岗位 %d，主标识 AI 率 %.4f%%，零技能 %.2f%%",
-                len(jobs), prim.mean() * 100, zero.mean() * 100)
+    exp5 = cls["aijob_main_annual_raw_005"].mean()
+    prim = cls["aijob_main_annual_raw_015"].mean()
+    logger.info("scoring 完成: 岗位 %d，主指标(>0.15) %.4f%%，暴露率(>0.05) %.4f%%，"
+                "零技能 %.2f%%", len(jobs), prim * 100, exp5 * 100, zero.mean() * 100)
     print(f"job_ai_score 已按 18 单元分区写入 {score_dir.name}/；"
-          f"主口径 aijob_main_annual_raw_005 = {prim.mean():.4%}；"
-          f"零技能岗位 {zero.mean():.2%}")
+          f"主指标 aijob_main_annual_raw_015 = {prim:.4%}；"
+          f"暴露率 aijob_main_annual_raw_005 = {exp5:.4%}；零技能 {zero.mean():.2%}")
 
 
 def main() -> None:
