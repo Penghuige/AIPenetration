@@ -1,12 +1,15 @@
 """panel_v2 M4-b：§18 发布物组装（13 件 + legacy 处置表 + 同名 metadata.json）。
 
 把 counts/relevance/scoring 产物与词典、锚点表汇总到 release/panel_v2/，
-逐文件生成 §18.1 十二字段 metadata（含 sha256、run_id、config_hash）。
-默认拒绝覆盖已存在发布文件（--force-release 显式覆盖，§4 版本纪律）。
+逐文件生成 §18.1 metadata（指南清单 11 字段原文照单，"至少包含"语义；
+2026-09-09 审计修正：本仓旧述"12 字段"系笔误，config/docs 已同步 11）。
+--force-release 哨兵检查覆盖四件核心数据件（classification/score/flag/QC；
+审计 D10：旧版仅查 QC 一件，哨兵缺失时词典件会被静默替换）。
 
 legacy 处置表（skill_legacy_v1，2026-09-09 增补件）：§18 原十三件只含 A 级
-概念/别名与扫描命中的 legacy 词，不含自建 6,872 词在 union 构建中的完整去向
-（并入 A 级 539 / 合成概念 6,328 / 短词丢弃 5）。本件逐词记录 disposition，
+概念/别名，不含自建 6,872 词在 union 构建中的完整去向——合成独立概念
+6,328、同名并入 A 级 367、自建表内部归一重复 172、短词丢弃 5（"539 重叠"
+=367+172 两 disposition 之和，性质不同不可混称）。本件逐词记录 disposition，
 与 build_union_lexicon 计数强制对账，使发布包对 legacy 空间自含可审。
 
 用法::
@@ -175,7 +178,9 @@ def main() -> None:
     setup_logging(paths.log_dir / "panel_v2_export.log")
     rel = paths.output_dir / "release" / "panel_v2"
     rel.mkdir(parents=True, exist_ok=True)
-    if not args.force_release and (rel / "quality_control_report.md").exists():
+    sentinels = ("quality_control_report.md", "job_ai_classification.parquet",
+                 "job_ai_score.parquet", "job_anchor_flag.parquet")
+    if not args.force_release and any((rel / s).exists() for s in sentinels):
         raise SystemExit("发布目录已有本次结果（--force-release 覆盖，或改 run_id）")
 
     export_dictionaries(rel)

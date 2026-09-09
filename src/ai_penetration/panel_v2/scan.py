@@ -4,7 +4,13 @@
 output/panel_v2/pass2/。审计修复版（B1/B3/M9）：
 
 - master 导出为**裸 .npy + np.load(mmap_mode="r")**（npz 成员不真 mmap，
-  实证每 worker 会私载全量——已修正），按 key=blake2b-63(recruit_id) 排序。
+  实证每 worker 会私载全量——已修正），按 key=blake2b-63(recruit_id) 排序；
+  目录含 .stamp.json 版号戳（MASTER_VERSION+n），复用前校验。
+- 命中键最终定稿 **rid-only**（master rid 实证全局唯一）：同一 rid 的多份
+  raw 拷贝全部映射到同一 job_id，跨切片重复由 worker hit_seen 片内去重 +
+  merge 端 PG DISTINCT ON 仲裁；keep-first 的"多拷贝识别等价"假设由
+  merge_parts 冲突计数**实测披露**（flag/firm 逐 job 多值计数），全国重跑
+  预检须复核该计数（审计 D4）。
 - skill 词表由**主进程单点构建**并原子落盘（含 ORDER BY 的别名查询消除
   36 个实证碰撞键的跨 worker 分歧），worker 读文件 + 一致性断言。
 - 产物**按批落盘为 parquet dataset 分区**（flags/long/firm 三目录），
@@ -31,8 +37,8 @@ from config.paths import get_project_paths
 
 from ..common import eps_conn_params, setup_logging
 from ..text_clean import match_from_raw
-from .anchors import match_all_versions
-from .dedup import SHARDS, _blocks, _h63
+from .anchors import ANCHOR_RULES_VERSION, match_all_versions
+from .dedup import ADMISSION_WHERE, MASTER_VERSION, SHARDS, _blocks, _h63
 
 logger = logging.getLogger("ai_penetration.panel_v2.scan")
 
@@ -54,13 +60,21 @@ def _results_conn():
 def export_master(out_dir: Path) -> None:
     """job_master → 4 个排序裸 .npy（mmap 真共享）。原子写（M9）。
 
-    过滤键 = h63("<plat_code>:<city_code>:<job_id_raw>")——与 stage 行双射
-    （rid-only 会把 rule1 折叠的重复行也计入，守恒实证超命中 275,304）。
+    过滤键 = h63(job_id_raw)（**rid-only 定稿**，2026-09-08 三迭代结论：
+    复合键 (plat,city,rid) 因 pmap 采样对长尾平台编码覆盖缺口实证漏命中
+    9,867 例已弃用；master rid 全局唯一由下方碰撞断言保证）。
+    复用需过版号戳校验（审计 D2：三件存在≠同代）。
     """
     npy_dir = out_dir / "master_npy"
-    if all((npy_dir / f"{n}.npy").exists()
-           for n in ("key", "job_id", "year", "company")):
-        return
+    stamp = npy_dir / ".stamp.json"
+    names = ("key", "job_id", "year", "company")
+    if all((npy_dir / f"{n}.npy").exists() for n in names) and stamp.exists():
+        s = json.loads(stamp.read_text(encoding="utf-8"))
+        if s.get("version") == MASTER_VERSION:
+            logger.info("master npy 复用（%s，n=%d）", s["version"], s["n"])
+            return
+        logger.warning("master npy 版号不符（%s != %s），重建",
+                       s.get("version"), MASTER_VERSION)
     conn = _results_conn()
     cur = conn.cursor()
     cur.execute("SELECT job_id_raw, plat, job_id, city, year, company_id "
@@ -93,7 +107,8 @@ def export_master(out_dir: Path) -> None:
         p = tmp / f"{name}.npy"
         np.save(p, arr)
         p.rename(npy_dir / f"{name}.npy")   # 原子发布
-    (tmp / "done").write_text("ok")
+    stamp.write_text(json.dumps({"version": MASTER_VERSION, "n": n}),
+                     encoding="utf-8")
     (out_dir / "company_vocab.json").write_text(
         json.dumps(comps), encoding="utf-8")
     logger.info("master npy 导出: %d 条 / company %d", n, len(comps))
@@ -173,7 +188,17 @@ def scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str) -> dict
     task = f"{shard}_{lo}"
     done = out / f"{task}.done.json"
     if done.exists():
-        return json.loads(done.read_text(encoding="utf-8"))
+        stat = json.loads(done.read_text(encoding="utf-8"))
+        # 三校验（审计 D2：--slices 变化时同名任务范围不同，旧"完成"不可信）
+        if (stat.get("version") == MASTER_VERSION and stat.get("hi") == hi
+                and stat.get("rules") == ANCHOR_RULES_VERSION):
+            return stat
+        logger.warning("切片 %s 完成戳不符（%s/%s/%s），清分片重扫", task,
+                       stat.get("version"), stat.get("hi"), stat.get("rules"))
+        for d in ("parts_flags", "parts_long", "parts_firm"):
+            for stale in (out / d).glob(f"{task}_*.parquet"):
+                stale.unlink()  # 防旧分片混入 merge（重扫部分失败留残）
+        done.unlink()
     m = _WORKER["m"]
     lex = _WORKER["lex"]
     sid2code = _WORKER["sid_to_code"]
@@ -195,10 +220,7 @@ def scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str) -> dict
         cur.execute(
             f"SELECT recruit_id, job_description FROM public.{shard} "
             "WHERE ctid >= '(%s,0)'::tid AND ctid < '(%s,0)'::tid "
-            "  AND job_description IS NOT NULL "
-            "  AND length(trim(job_description)) >= 10 "
-            "  AND position IS NOT NULL AND position != '' "
-            "  AND recruit_id IS NOT NULL",
+            + ADMISSION_WHERE,  # 单源谓词（审计 D3：禁再手抄）
             (int(lo), int(hi)))
         for d in ("parts_flags", "parts_long", "parts_firm"):
             (out / d).mkdir(parents=True, exist_ok=True)
@@ -244,7 +266,9 @@ def scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str) -> dict
     finally:
         conn.close()
     stat = {"task": task, "rows": n_rows, "canonical": n_canon,
-            "skill_pairs": n_pairs, "dup_hits": dup_hits}
+            "skill_pairs": n_pairs, "dup_hits": dup_hits,
+            "version": MASTER_VERSION, "lo": int(lo), "hi": int(hi),
+            "rules": ANCHOR_RULES_VERSION}
     tmp = out / f".{task}.done.tmp"
     tmp.write_text(json.dumps(stat), encoding="utf-8")
     tmp.rename(done)
@@ -274,7 +298,9 @@ def merge_parts(out_dir: Path, rel_dir: Path) -> None:
     2026-09-07 教训：2 亿行 pandas concat+drop_duplicates 内存洪峰疑似
     压垮同机 PG（UNLOGGED 表被重启清空）——大表 dedup 是 PG 的本职，
     Python 端只做流式 CSV→parquet 转换。跨切片重复命中（rid 在 raw 有
-    真重复行）由 DISTINCT ON keep-first 仲裁（同 canonical 识别等价）。
+    真重复行）由 DISTINCT ON keep-first 仲裁；"同 canonical 识别等价"
+    是假设而非前提（审计 D4），此处逐 job 实测冲突数并披露（flag/firm
+    多值即冲突；long 表 keep-first 天然吸收集合差异，不可从此路测量）。
     """
     import pyarrow.csv as pcsv
     import pyarrow.parquet as pq
@@ -308,6 +334,24 @@ def merge_parts(out_dir: Path, rel_dir: Path) -> None:
             cur.copy_expert(
                 f"COPY public.{stg} FROM STDIN WITH (FORMAT csv)", bio)
         conn.commit()
+        # keep-first 等价假设实测（审计 D4）：同一 job_id 的多拷贝行若识别
+        # 结果不同，即存在"扫的描述≠定群描述"的真实分歧面
+        conflict = 0
+        if name == "job_anchor_flag":
+            cur.execute(
+                f"SELECT count(*) FROM (SELECT job_id FROM public.{stg} "
+                "GROUP BY job_id HAVING count(DISTINCT (year, anchor_main,"
+                " anchor_cn_paper, anchor_babina, groups_main_bits)) > 1) x")
+            conflict = cur.fetchone()[0]
+        elif name == "job_firm":
+            cur.execute(
+                f"SELECT count(*) FROM (SELECT job_id FROM public.{stg} "
+                f"GROUP BY job_id HAVING count(DISTINCT company_code) > 1) x")
+            conflict = cur.fetchone()[0]
+        if conflict:
+            logger.warning("keep-first 冲突披露 %s: %d 个 job 多拷贝识别不等价"
+                           "（受影响行由 ctid 序 keep-first 裁决，跨运行可翻转）",
+                           name, conflict)
         cur.execute(f"CREATE TABLE public.{fin} AS SELECT DISTINCT ON ({dedup_key}) *"
                     f" FROM public.{stg} ORDER BY {dedup_key}, job_id")
         conn.commit()
@@ -370,6 +414,8 @@ def main() -> None:
     setup_logging(paths.log_dir / "panel_v2_scan.log")
     out_dir = paths.output_dir / "panel_v2" / "pass2"
     out_dir.mkdir(parents=True, exist_ok=True)
+    logger.info("锚点规则版本: %s | 主样本版号: %s",
+                ANCHOR_RULES_VERSION, MASTER_VERSION)
     t0 = datetime.now()
 
     export_master(out_dir)

@@ -1,4 +1,9 @@
 # 面板 v2 主管线配置（指南 §19.2；口径变更须同步 docs/panel_v2_设计.md）
+# 定位声明（2026-09-09 审计）：本文件是**口径登记文档**（唯一权威参数清单），
+# 运行时代码**不读取**它（各模块用代码内常量/CLI 参数实现同值语义）；其内容
+# 经发布 metadata 的 config_hash 背书。新增参数或改语义时须同步三处：
+# 本文件、对应模块常量、设计文档。运行期真正生效的绑定在代码（如
+# dedup.ADMISSION_WHERE、scoring.THRESHOLDS）。
 panel_version: v2a
 dictionary_version: bilingual_a_frozen_v1.1+legacy_union_v1
 
@@ -15,12 +20,15 @@ dedup:                         # 指南 §6.2 岗位去重主规则
   unique_key: [platform, recruit_id]
   group_by: [company, position_normalized, city, desc_hash]
   group_max_gap_days: 30
-  cross_platform_merge: false  # 跨平台默认不合并（§6.2.0 字典语料与主样本分离）
+  # 审计更正：分组键=(company,岗位名,城市,文本hash,年,桶) **不含平台**，同企业
+  # 同文本跨平台帖进同一概念组（规则1 仅按 (platform,rid) 折叠原始行）；
+  # §6.2.0 的"分离"指词典频数语料与主样本分离，不适用于概念分组。
+  cross_platform_merge: true
 
 cooccurrence:                  # §13–§14
   anchors: [main, cn_paper, babina]
   windows: [annual, pooled, roll3_centered]
-  boundary_windows: {start: [2014, 2015], end: [2024, 2025]}
+  boundary_windows: {start: [2014, 2015], end: [2023, 2024]}  # 2026-09 审计更正：eps 无 2025，实际末两年窗 {2023,2024}（代码按可得年 clamp）
   keep_all_skills: true        # §13.4 低频不删除，只打 rare 标记
   rare_flags: [10, 20, 50]
   smoothing:
@@ -31,8 +39,11 @@ cooccurrence:                  # §13–§14
 job_score:                     # §15–§16
   aggregation: simple_mean_dedup_skills
   score_types: [raw, smoothed]
-  # 2026-09-09 金标准决策：主指标=0.15（>0.30 带真值率 92%，0.05-0.15 带仅 4%）；
-  # 0.05 保留但更名语义为「AI 技能暴露率」（exposure share），不得作为 AI 岗位占比引用。
+  # 2026-09-09 金标准决策：主指标=0.15（首判依据 >0.30 带真值率 92%）。
+  # **前提已更新**：全量重判+0.15-0.30 带补测（232 条，verdict 重判版）显示
+  # (0.15,0.30] 带真值率仅 10%（占 015 全带 75%），015 加权真值率 ~30%，
+  # >0.30 带 87.5%。015 暂按"候选池"语义保留，分层决策 A/B/C 待用户裁决
+  # （docs/00 §九.0）；0.05 语义为「AI 技能暴露率」，禁作岗位占比引用。
   primary_score: aijob_main_annual_raw_015
   exposure_score: aijob_main_annual_raw_005
   thresholds: [0.05, 0.10, 0.15]
@@ -46,4 +57,4 @@ robustness:                    # §14.3 企业留一（主锚点、三窗口、�
 release:                       # §17.6/§18
   quality_gate_fail_blocks: true
   outputs_dir: output/release/panel_v2
-  metadata_fields: 12
+  metadata_fields: 11   # 指南 §18.1 原单 11 项（"至少包含"）；旧述"12"系笔误（2026-09-09 审计修正）

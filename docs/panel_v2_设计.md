@@ -14,17 +14,20 @@
 | §13 | annual/pooled/roll3_centered 计数 + §13.6 顺序 + §13.7 不变量 | `panel_v2/counts.py` |
 | §14 | 9 组权重 raw + smoothed（逐 anchor×window×period 单元拟合 Beta-BB，n≥5，回退 Jeffreys，不覆盖 raw）+ §14.3 企业留一（主锚点） | `panel_v2/relevance.py` |
 | §15 | 岗位得分 = 去重技能权重简单平均；coverage=1 硬约束；raw+smoothed 双套 | `panel_v2/scoring.py` |
-| §16 | 三阈值严格大于；零技能岗位（缺失≠0、zero_skill_override）；主标识 `aijob_main_annual_raw_005` | `panel_v2/scoring.py` |
+| §16 | 三阈值严格大于；零技能岗位（缺失≠0、zero_skill_override）；现行主标识 `aijob_main_annual_raw_015`（2026-09-09 金标准决策；005=暴露率；分层决策 A/B/C 待重确认，见交接 §九.0） | `panel_v2/scoring.py` |
 | §17 | 自动化质量门（不强制金标准；§17.3–17.6 检查 + 转换矩阵） | `panel_v2/quality.py` |
-| §18 | 11 件 parquet + 同名 metadata.json + QC 报告 | `panel_v2/export_release.py` |
-| §19.1 | 脚本纪律：config 驱动、--dry-run/--resume/--run-id、拒绝覆盖、非零退出 | `panel_v2/run_gz.py` 编排 |
+| §18 | 十三件 + 增补件 skill_legacy_v1（共 14 数据件）+ 同名 metadata.json（11 字段）+ QC 报告 | `panel_v2/export_release.py` |
+| §19.1 | 脚本纪律：参数化、--dry-run/--bench/--resume/--run-id、哨兵拒绝覆盖、非零退出 | 各模块 `python -m` 入口（编排链见交接文档 §六；无 run_gz.py，旧述已删） |
 
 ## 2. 关键决策（已定）
 
 1. **主口径 = raw 得分**（§15.4 文献可比），平滑得分与三阈值、三锚点、三口径全部作为
-   替代/稳健性列保留；主 AI 岗位变量 = `aijob_main_annual_raw_005`（§16.4）。
+   替代/稳健性列保留；主 AI 岗位变量 = `aijob_main_annual_raw_015`（2026-09-09
+   金标准切换决策；`_005` 语义为 AI 技能暴露率，禁作岗位占比引用。
+   **重判更新**：0.15-0.30 带实测真值率仅 10%，015 全带 ~30%，>0.30 带 87.5%
+   ——主指标分层三选项待用户裁决，裁决前 015 按"候选池"语义使用）。
    注意：v1 的 is_ai_job（A 加权）与 B(0.15&max0.5) 均**不是**指南口径，
-   v2 数字预期与 v1 面板有系统性差异（阈值 0.05 vs 0.15、锚点集合不同）。
+   v2 数字预期与 v1 面板有系统性差异（阈值、判据词表不同；归因见口径矩阵）。
 2. **先广深后全国**：v2a 范围=广深 2014–2024（eps 无 2025，已在对照清单记录）；
    端到端+守恒核验通过后，扩全国由用户排窗。
 3. **union 技能空间**：A 级 22,683 概念为主键空间（skill_id uuid）；自建表
