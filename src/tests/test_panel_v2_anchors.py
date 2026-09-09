@@ -76,6 +76,31 @@ def test_version_split_image_vs_vision():
             _flag("计算机视觉", "babina")) == (1, 0, 1)
 
 
+# ---------- 20260909_b 修订回归（审计 D4/D5/语言字段） ----------
+
+def test_llm_full_phrase_plural_hits():
+    # 指南 §12.1 明列 "large language models"，旧规则复数被尾界阻断
+    assert _flag("熟悉large language models相关技术") == 1
+    assert _flag("large language model微调") == 1  # 单数不回退
+
+
+def test_transformer_trailing_boundary():
+    # 旧 trans_en 无尾界："transformer modeling"（非"模型"）误命中
+    assert _flag("transformer modeling经验") == 0
+    assert _flag("transformer modelling工作") == 0
+    assert _flag("transformer models部署") == 1     # 真复数仍命中
+
+
+def test_dictionary_language_derived_from_rule():
+    rows = anchor_dictionary_rows()
+    for r in rows:
+        if r["keyword"] in ("AI", "ML", "NLP", "LLM"):
+            assert r["language"] == "en", r  # 全大写缩写曾误标 zh
+        if r["matching_rule"] == "trans_zh":
+            assert r["language"] == "zh", r  # Transformer模型 曾误标 en
+    assert all(r["language"] in ("zh", "en") for r in rows)
+
+
 def test_dictionary_rows_shape():
     rows = anchor_dictionary_rows()
     by_ver = {}

@@ -1,7 +1,17 @@
 """panel_v2 M4-a：自动化质量门（指南 §17.3–§17.6）与统计报告。
 
-§17.6 十项阻断检查任一失败 → raise（停止发布）；六类警告项与 §17.4/§17.5
-统计进入 quality_control_report.md（警告不阻断，全部入报）。
+§17.6 十项阻断检查任一失败 → raise（停止发布）；警告项与 §17.4/§17.5
+统计进入 quality_control_report.md（警告不阻断）。
+
+**警告六类覆盖披露（2026-09-09 审计修订）**——指南要求六类警告全部入报并
+附年份/行业/岗位/技能明细表，本实现覆盖情况如实如下：
+① 低频 0/1 原始权重（已实现，rare01_skills）；② 锚点口径差异（已实现，
+exposure_rate_by_anchor）；③ LLM/TRANS 增量（已实现，anchor_jobs）；
+④ 年份无技能比例（以 zero_skill_by_year 等价实现，行业维度缺失）；
+⑤ 歧义锚点×行业集中度（**未实现**：master 无行业字段，需数据源增强）；
+⑥ 年度断点（**未实现**：判据未定义，留交接方澄清）。
+明细表（逐岗位/逐技能清单）未生成——阻断级检查均在全量上验证，警告触发时
+的量级可由 quality_stats.json 反查。⑤⑥为正式偏离，随全国重跑申报。
 
 "原文跨度回填"（§17.6.3）在 v2a 记为 waived：词典匹配为确定性子串命中，
 证据可由 match 文本 + 词表重算（无 LLM 生成词），非缺失场景。
@@ -27,16 +37,19 @@ import pyarrow.parquet as pq
 from config.paths import get_project_paths
 
 from ..common import setup_logging
+from .anchors import ANCHOR_RULES_VERSION
 
 logger = logging.getLogger("ai_penetration.panel_v2.quality")
 
 
 def _sha_stats(df: pd.DataFrame, cols: list[str]) -> str:
+    """全列校验和（20260909 修订：旧实现每列只哈希前 16MiB，22.96M 行表
+    后 ~27% 不参与重跑一致性比较——若改动恰在尾部则门静默通过）。"""
     h = hashlib.sha256()
     h.update(str(len(df)).encode())
     for c in cols:
         if c in df.columns:
-            h.update(np.asarray(df[c]).tobytes()[:1 << 24])
+            h.update(np.ascontiguousarray(df[c]).tobytes())
     return h.hexdigest()[:16]
 
 
@@ -139,23 +152,27 @@ def gate_checks(rel: Path) -> tuple[list[str], dict]:
             int((cls[f"{base}_010"] <= cls[f"{base}_005"]).sum()) == len(cls)
         if not m:
             fails.append(f"阈值单调性破坏: {base}")
-    # 10 重跑一致性（统计落盘比对）
+    # 10 重跑一致性（统计落盘比对；含锚点规则版本戳，跨版本漂移属预期披露）
+    stats["anchor_rules_version"] = ANCHOR_RULES_VERSION
     stats["checksum_flags"] = _sha_stats(flags, ["anchor_main", "anchor_babina"])
     stats["checksum_counts"] = _sha_stats(
         counts.sort_values(["skill_code", "anchor_version", "window_type", "year"]),
         ["n_skill", "n_ai_cooccur"])
-    # I5：§16.4 版本转换矩阵（main 三窗口 raw_005 两两交叉表）
-    trio = pd.DataFrame({
-        "annual": cls["aijob_main_annual_raw_005"],
-        "pooled": cls["aijob_main_pooled_raw_005"],
-        "roll3": cls["aijob_main_roll3_centered_raw_005"],
-    })
-    trans = {}
-    for a, b in (("annual", "pooled"), ("annual", "roll3"), ("pooled", "roll3")):
-        trans[f"{a}x{b}"] = pd.crosstab(trio[a], trio[b]).to_dict()
-    (rel / "transition_matrix_main_raw005.json").write_text(
-        json.dumps(trans, ensure_ascii=False, indent=1), encoding="utf-8")
-    stats["transition_matrix"] = trans
+    # I5：§16.4 版本转换矩阵——暴露率(005)与主指标(015)各出三窗口交叉表
+    stats["transition_matrix"] = {}
+    for thr, fname in (("005", "exposure"), ("015", "primary")):
+        trio = pd.DataFrame({
+            "annual": cls[f"aijob_main_annual_raw_{thr}"],
+            "pooled": cls[f"aijob_main_pooled_raw_{thr}"],
+            "roll3": cls[f"aijob_main_roll3_centered_raw_{thr}"],
+        })
+        trans = {}
+        for a, b in (("annual", "pooled"), ("annual", "roll3"),
+                     ("pooled", "roll3")):
+            trans[f"{a}x{b}"] = pd.crosstab(trio[a], trio[b]).to_dict()
+        (rel / f"transition_matrix_main_raw{thr}.json").write_text(
+            json.dumps(trans, ensure_ascii=False, indent=1), encoding="utf-8")
+        stats[f"transition_matrix_{fname}"] = trans
     return fails, stats
 
 
@@ -178,13 +195,13 @@ def warning_checks(rel: Path) -> tuple[list[str], dict]:
     sm_s = pq.read_table(rel / "job_ai_score" / "main_annual_smoothed.parquet",
                          columns=["ai_score"])["ai_score"].to_pandas()
     info["corr_raw_smoothed"] = round(float(raw_s.corr(sm_s)), 4)
-    # 锚点版本 AI 率差异
+    # 锚点版本暴露率差异（>0.05 为暴露率口径；2026-09-09 决策后禁称"AI率"）
     rates = {}
     for ver in ("main", "cn_paper", "babina"):
         col = f"aijob_{ver}_annual_raw_005"
         if col in cls.columns:
             rates[ver] = round(float(cls[col].mean()), 5)
-    info["aijob_rate_by_anchor"] = rates
+    info["exposure_rate_by_anchor"] = rates
     if rates:
         lo, hi = min(rates.values()), max(rates.values())
         if lo > 0 and (hi - lo) / lo > 1.0:
@@ -202,8 +219,10 @@ def warning_checks(rel: Path) -> tuple[list[str], dict]:
     info["llm_transformer_anchor_jobs"] = len(inc)
     info["year_dist_jobs"] = flags.groupby("year").size().to_dict()
     info["pair_dist"] = longs.groupby("job_id").size().describe().round(2).to_dict()
-    # 主标识年度比例（§17.5.3）
-    info["aijob_main_annual_005_by_year"] = cls.groupby(
+    # §17.5.3 年度比例：主指标(015)与暴露率(005)并列
+    info["primary_015_by_year"] = cls.groupby(
+        "year")["aijob_main_annual_raw_015"].mean().round(5).to_dict()
+    info["exposure_005_by_year"] = cls.groupby(
         "year")["aijob_main_annual_raw_005"].mean().round(5).to_dict()
     return warns, info
 

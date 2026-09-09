@@ -1,27 +1,35 @@
 """panel_v2 M2：招聘广告去重主表构建（指南 §6.2.1 主规则，评审修正版）。
 
-数据事实（2026-09-07 实测+评审确认）：广深 recruit_id 平台内唯一；job↔ent
-join 覆盖高（抽样 100%，全量由不变量兜底）；ent.recruit_id 有重复（映射聚合
-取 min(company_id)，冲突计数入验收）。所有写入仅在结果库；eps 只读。
+数据事实（2026-09-07 实测+评审确认）：广深 recruit_id 平台内唯一（v2b 起
+规则1 跨城折叠兜底残余重复）；job↔ent join 覆盖高；ent.recruit_id 有重复
+（聚合取 min(company_id)，确定性选择；未命中数入披露并断言）。
+所有写入仅在结果库；eps 只读。
 
-流程（评审必改项全部落实）：
+流程（2026-09-09 审计修复版：断点版号绑定 + WAL 强制 + 谓词单源）：
 1. ``copy_ent_map``：ent (recruit_id, company_id) 流式导出结果库（无主键，
-   join 时 GROUP BY 聚合去重，冲突数入不变量）。
-2. ``pass1_scan``：ctid 切片（≤8 路，HDD 纪律）扫 job 表全行，Python 侧算
+   join 时 GROUP BY 聚合去重）。
+2. ``pass1_scan``：ctid 切片（≤8 路，HDD 纪律）扫 job 表全行（准入谓词
+   ``ADMISSION_WHERE`` 单源定义，scan 阶段复用防漂移），Python 侧算
    match 文本 hash、pos_norm_hash、日期、描述长度、**字段完整度**
    （education/work_type/experience/recruit_count/age_req 非空数——评审代理
    定义，§6.2.2.2 的可辩护实现）；年份/日期不可解析**不丢行**（yr=0/day=-1
-   隔离标记），定长 64B 窄行分片落盘（断点幂等）。
-3. ``copy_stage``：文本 COPY 进 UNLOGGED stage 表。
+   隔离标记）；rid 超 32 字节**硬失败**（防定长槽静默截断）；定长 64B 窄行
+   分片落盘，断点复用校验 MASTER_VERSION+切片范围。
+3. ``copy_stage``：文本 COPY 进常规 WAL stage 表（启动时强制
+   ``SET LOGGED``——`CREATE IF NOT EXISTS` 不改变既有表持久性，审计实证
+   2026-09-07 的"WAL 化修复"未生效）；.copied 标志带版号+行数，resume 时
+   三方对账 count(stage)==Σflags==Σmetas。
 4. ``build_master``：PG 侧两段式——stage LEFT JOIN 聚合后的 ent_map 物化
    sorted_stage（company 未命中→哨兵 'UNK:<rid>'，禁 NULL 共组，规则4）；
-   sorted_stage 上窗口（显式 ROWS 帧、ORDER BY (day,rid) 确定性）做 30 天
-   链式分段（规则5：year 入分区键天然不跨年）与 §6.2.2 canonical 选择，
-   物化 job_master_gzsz；另建 dup_group_map（§6.2.2 平台数/编号映射）、
-   跨年重复互标表、链跨度>30 天审计指标。
-5. ``verify_invariants``：sum(collapsed)=stage 行数、canonical=组数、
-   (plat,rid) 全量唯一、company 未命中计数入报、year=canonical 年份、
-   bad_year>0.1% 阻断、链跨度组占比披露。
+   组首锚定 30 天桶（规则5 修订版：链式传递语义 2.65% 超"两两≤30"披露线，
+   桶规则构造性保证组内两两≤30，year 入分区键天然不跨年）与 §6.2.2
+   canonical 选择，物化 job_master_gzsz；另建 dup_group_map（§6.2.2 平台
+   数/编号映射，仅含规则1 幸存行，被折叠行以聚合差值披露——指南"跨年互标"
+   与全量映射明细为已申报偏离）。
+5. ``verify_invariants``：count(stage)==Σmetas==Σflags、
+   Σ(collapsed)=groupmap 行数、(plat,rid) 全量唯一、plat=255==Σmeta
+   unknown_platform、long_rid==0、company 未命中披露、bad_year>0.1% 阻断、
+   组跨度>30 天=0 断言（桶规则推论）。
 
 §6.1.1 三态文本声明：raw 由 eps 原表永久保留替代，match 态可由
 text_clean.match_from_raw 重算，中间表只存 hash（设计文档 §决策 记录）。
@@ -65,6 +73,16 @@ _EPOCH_DAYS = 14610  # date(2010,1,1).toordinal()
 _YEAR_RE = re.compile(r"^\s*(\d{4})")
 _ISO_RE = re.compile(r"^\s*(\d{4})-(\d{2})-(\d{2})")
 BAD_YEAR_THRESHOLD = 0.001  # 年份不可解析阻断线（评审建议 0.1%）
+# 准入谓词**单源**（审计 D3：dedup/scan 两处手抄同文才碰巧互证，任一侧
+# 改动即失去闭环）。scan.py 必须 import 本常量，禁止再抄写。
+ADMISSION_WHERE = ("AND job_description IS NOT NULL "
+                   "AND length(trim(job_description)) >= 10 "
+                   "AND position IS NOT NULL AND position != '' "
+                   "AND recruit_id IS NOT NULL")
+# 平台字典采样种子（审计 D6：无 seed 时字典规模跨运行漂移，255 兜底组
+# 成员随之变化；固定采样保证跨运行一致）
+PLATFORM_SAMPLE_PCT = 0.05
+PLATFORM_SAMPLE_SEED = 42
 
 # 定长窄行（64B）：rid32 + plat/city + yr2 + day4 + posh8 + thash8 + dlen2 + comp1 + pad2
 ROW_DTYPE = np.dtype([
@@ -116,21 +134,25 @@ def _scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str,
     meta_path = Path(out_dir) / f"{task}.json"
     if out_path.exists() and meta_path.exists():
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        logger.info("切片 %s 断点复用（%d 行）", task, meta["rows"])
-        return meta
+        # 断点复用三校验（审计 D2：旧版仅凭文件存在性复用，--slices 改变
+        # 时同名任务范围不同会被静默截空；准入规则变更需重扫）
+        if (meta.get("version") == MASTER_VERSION and meta.get("lo") == lo
+                and meta.get("hi") == hi):
+            logger.info("切片 %s 断点复用（%d 行，版号一致）", task, meta["rows"])
+            return meta
+        logger.warning("切片 %s 断点版号/范围不符（meta=%s/%s-%s 现=%s/%s-%s），"
+                       "重扫", task, meta.get("version"), meta.get("lo"),
+                       meta.get("hi"), MASTER_VERSION, lo, hi)
     plats = _WORKER["platforms"]
     conn = psycopg2.connect(**eps_conn_params())
     buf = np.empty(100000, dtype=ROW_DTYPE)
-    n = total = bad_year = bad_day = unk_plat = 0
+    n = total = bad_year = bad_day = unk_plat = long_rid = 0
     try:
         with conn.cursor() as setup:
             setup.execute("SET LOCAL work_mem = '256MB'")
             setup.execute("SET LOCAL max_parallel_workers_per_gather = 0")
         cond = ("WHERE ctid >= '(%s,0)'::tid AND ctid < '(%s,0)'::tid "
-                "AND job_description IS NOT NULL "
-                "AND length(trim(job_description)) >= 10 "
-                "AND position IS NOT NULL AND position != '' "
-                "AND recruit_id IS NOT NULL")
+                + ADMISSION_WHERE)
         params: tuple = (int(lo), int(hi))
         if year_filter:
             cond += " AND publish_time LIKE %s"
@@ -168,7 +190,11 @@ def _scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str,
                         fh.write(buf.tobytes())
                         n = 0
                     r = buf[n]
-                    r["rid"] = str(rid)[:32].encode()
+                    srid = str(rid).encode("utf-8")
+                    if len(srid) > 32:  # 审计 D11：S32 超长为静默截断，
+                        long_rid += 1   # 两条 rid 可同键致规则1误折叠
+                        srid = srid[:32]
+                    r["rid"] = srid
                     r["plat"] = plats.get(pkey, 255)
                     r["city"] = city_id
                     r["yr"] = yr
@@ -185,7 +211,8 @@ def _scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str,
     finally:
         conn.close()
     meta = {"task": task, "rows": total, "bad_year": bad_year, "bad_day": bad_day,
-            "unknown_platform": unk_plat}
+            "unknown_platform": unk_plat, "long_rid": long_rid,
+            "version": MASTER_VERSION, "lo": int(lo), "hi": int(hi)}
     meta_path.write_text(json.dumps(meta), encoding="utf-8")  # meta 最后落=完整性标记
     logger.info("切片完成 %s: rows=%d bad_year=%d bad_day=%d", task, total,
                 bad_year, bad_day)
@@ -214,7 +241,8 @@ def _build_platform_dict() -> dict[str, int]:
     plats: dict[str, int] = {}
     for _, shard, _ in SHARDS:
         cur.execute(f"SELECT DISTINCT platform FROM public.{shard} "
-                    "TABLESAMPLE SYSTEM (0.05)")
+                    f"TABLESAMPLE SYSTEM ({PLATFORM_SAMPLE_PCT}) "
+                    f"REPEATABLE ({PLATFORM_SAMPLE_SEED})")  # 审计 D6：定种
         for (p,) in cur.fetchall():
             key = (p or "").strip()
             if key and key not in plats and len(plats) < 250:
@@ -293,32 +321,88 @@ def copy_ent_map() -> None:
         eps.close()
 
 
+def _ensure_logged(cur, table: str) -> None:
+    """强制常规 WAL 持久性（审计 D1：CREATE TABLE IF NOT EXISTS 不会把
+    已存在的 UNLOGGED 表转为 logged——2026-09-07 的"WAL 化修复"因此从未
+    生效）。仅在 relpersistence=='u' 时执行 SET LOGGED（logged→logged
+    会白付重写成本）。"""
+    cur.execute("SELECT relpersistence FROM pg_class WHERE relname = %s",
+                (table,))
+    row = cur.fetchone()
+    if row is not None and row[0] == "u":
+        logger.warning("表 %s 仍为 UNLOGGED（历史遗留），执行 SET LOGGED", table)
+        cur.execute(f"ALTER TABLE public.{table} SET LOGGED")
+
+
 def copy_stage(metas: list[dict], resume: bool) -> int:
-    """窄行分片文本 COPY 进 stage（常规 WAL 表，重启可恢复——UNLOGGED
-    在 2026-09-07 PG 意外重启中清空全管线，教训记录）。"""
+    """窄行分片文本 COPY 进 stage（常规 WAL 表 + 启动强制 SET LOGGED）。
+
+    断点纪律（审计 D2/D10 修订）：.copied 标志为 JSON{version,rows}；
+    resume+非空 stage 时先做 count==Σ有效标志 对账，不符即阻断（防
+    part-k 提交后崩溃产生前缀 stage）；stage 被重启清空时全部标志作废
+    重灌。结束时无条件断言 count(stage)==Σmetas（本模块绝对守恒锚）。
+    """
     conn = _results_conn()
     cur = conn.cursor()
     cur.execute(f"""
         CREATE TABLE IF NOT EXISTS public.{TABLE_STAGE} (
             rid text NOT NULL, plat smallint, city smallint, yr int,
             day int, posh bigint, thash bigint, dlen int, comp smallint)""")
+    _ensure_logged(cur, TABLE_STAGE)
     cur.execute(f"SELECT count(*) FROM public.{TABLE_STAGE}")
     existing = cur.fetchone()[0]
-    if existing and not resume:
-        cur.execute(f"TRUNCATE public.{TABLE_STAGE}")
+    parts = Path(metas[0]["file"]).parent
+    want_total = sum(int(m["rows"]) for m in metas)
+    verified: set[str] = set()
+    if not resume:
+        if existing:
+            cur.execute(f"TRUNCATE public.{TABLE_STAGE}")
         existing = 0
+    elif existing:
+        # resume+非空：标志三态——有效（版号+行数匹配 metas）/畸形（旧格式
+        # 或版号不符，来源不可辨→阻断）/缺失（视为未灌，允许补灌）。
+        # 有效标志求和必须 == count(stage)，否则 stage 含来历不明行→阻断；
+        # 崩溃于"提交后、写标志前"的少量重复由末尾绝对锚 stage==Σmetas 兜住。
+        flag_total = 0
+        malformed: list[str] = []
+        verified: set[str] = set()
+        for m in metas:
+            f = parts / f"{m['task']}.copied"
+            if not f.exists():
+                continue
+            try:
+                d = json.loads(f.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, ValueError):
+                malformed.append(m["task"])
+                continue
+            if d.get("version") != MASTER_VERSION \
+                    or int(d.get("rows", -1)) != int(m["rows"]):
+                malformed.append(m["task"])
+            else:
+                flag_total += int(d["rows"])
+                verified.add(m["task"])
+        if malformed or flag_total != existing:
+            conn.close()
+            raise SystemExit(
+                f"--resume 对账失败：畸形/混代标志={malformed[:5]}，"
+                f"Σ有效标志={flag_total} != stage={existing}。"
+                f"请去掉 --resume 全量重灌，或人工核查")
+        logger.info("stage resume 对账通过：%d 行 == Σ有效标志（%d/%d 片）",
+                    existing, len(verified), len(metas))
+    else:
+        # resume+空表（重启清空场景）：标志不可信，全部作废重灌
+        for m in metas:
+            f = parts / f"{m['task']}.copied"
+            if f.exists():
+                f.unlink()
+        logger.info("stage 为空，作废全部 .copied 标志重灌")
     conn.commit()
     conn.close()
-    if existing:
-        logger.info("stage 已有 %d 行（--resume），跳过 COPY", existing)
-        return existing
-    total = 0
-    parts = Path(metas[0]["file"]).parent
+    total = existing
     for m in metas:
         done_flag = parts / f"{m['task']}.copied"
-        if resume and done_flag.exists():
-            total += int(done_flag.read_text(encoding="utf-8"))
-            continue
+        if m["task"] in verified:
+            continue  # resume 对账已证明该片已在 stage 且行数/版号匹配
         arr = np.fromfile(m["file"], dtype=ROW_DTYPE)
         conn2 = _results_conn()
         cur2 = conn2.cursor()
@@ -332,9 +416,19 @@ def copy_stage(metas: list[dict], resume: bool) -> int:
         cur2.copy_expert(f"COPY public.{TABLE_STAGE} FROM STDIN WITH (FORMAT text)", bio)
         conn2.commit()
         conn2.close()
-        done_flag.write_text(str(len(arr)), encoding="utf-8")
+        done_flag.write_text(
+            json.dumps({"version": MASTER_VERSION, "rows": len(arr)}),
+            encoding="utf-8")
         total += len(arr)
         logger.info("已 COPY %s 累计 %d 行", m["task"], total)
+    # 绝对守恒锚：stage == Σmetas（审计 D10——原 verify 缺这一方）
+    conn3 = _results_conn()
+    cur3 = conn3.cursor()
+    cur3.execute(f"SELECT count(*) FROM public.{TABLE_STAGE}")
+    n_stage = cur3.fetchone()[0]
+    conn3.close()
+    if n_stage != want_total:
+        raise SystemExit(f"stage 守恒失败: count={n_stage} != Σmetas={want_total}")
     return total
 
 
@@ -364,6 +458,8 @@ def build_master() -> tuple[int, int]:
     cur = conn.cursor()
     cur.execute("SET work_mem = '1GB'")
     cur.execute("SET maintenance_work_mem = '2GB'")
+    _ensure_logged(cur, TABLE_SORTED)  # 历史 UNLOGGED 遗留防御（审计 D1）
+    _ensure_logged(cur, TABLE_SORTED.replace("sorted", "seg"))
     cur.execute("SELECT to_regclass('public." + TABLE_MASTER + "')")
     if cur.fetchone()[0] is not None:
         cur.execute(f"SELECT count(*) FROM public.{TABLE_MASTER} "
@@ -494,8 +590,8 @@ def build_master() -> tuple[int, int]:
     return out
 
 
-def verify_invariants() -> None:
-    """守恒与确定性验收（评审必改6/7）；失败 raise。"""
+def verify_invariants(metas: list[dict] | None = None) -> None:
+    """守恒与确定性验收（评审必改6/7 + 审计 D4/D6/D11 补强）；失败 raise。"""
     conn = _results_conn()
     cur = conn.cursor()
     # 守恒核对完全走常规表（不依赖 sorted/seg 中间态，master 幂等跳过后
@@ -511,16 +607,31 @@ def verify_invariants() -> None:
                (SELECT count(*) FROM (
                    SELECT plat, job_id_raw FROM public.{TABLE_MASTER}
                    GROUP BY 1,2 HAVING count(*)>1) z),
-               (SELECT count(*) FROM public.{TABLE_STAGE} WHERE yr = 0)
+               (SELECT count(*) FROM public.{TABLE_STAGE} WHERE yr = 0),
+               (SELECT count(*) FROM public.{TABLE_STAGE} WHERE plat = 255),
+               (SELECT count(*) FROM public.{TABLE_MASTER}
+                WHERE latest_day - earliest_day > 30 AND records_collapsed > 1)
     """)
-    (stage, map_n, master, collapsed,
-     dup_groups, rid_dups, bad_years) = cur.fetchone()
+    (stage, map_n, master, collapsed, dup_groups, rid_dups, bad_years,
+     unk_plat_stage, span_over_groups) = cur.fetchone()
     conn.close()
     rule1_sum = stage - map_n
+    problems: list[str] = []
     if rule1_sum < 0:
-        problems = [f"groupmap {map_n} > stage {stage}（不可能状态）"]
-    else:
-        problems = []
+        problems.append(f"groupmap {map_n} > stage {stage}（不可能状态）")
+    # 片内计数三方对账（审计 D6/D10/D11：unknown_platform/long_rid 原只
+    # log 不断言；组跨度必须 ≤30——组首锚定桶规则的构造性推论，违例=实现缺陷）
+    if metas:
+        unk_meta = sum(int(m.get("unknown_platform", 0)) for m in metas)
+        if unk_plat_stage != unk_meta:
+            problems.append(f"stage plat255={unk_plat_stage} != "
+                            f"Σmeta unknown_platform={unk_meta}")
+        long_rid = sum(int(m.get("long_rid", 0)) for m in metas)
+        if long_rid:
+            problems.append(f"{long_rid} 条 rid 超 32 字节被定长槽截断"
+                            f"（须清理源数据后重跑）")
+    if span_over_groups:
+        problems.append(f"{span_over_groups} 组跨度>30 天（桶规则违例，实现缺陷）")
     if collapsed != map_n:
         problems.append(f"分桶守恒失败: Σcollapsed {collapsed} != groupmap {map_n}")
     if rule1_sum > stage * 0.02:
@@ -577,7 +688,7 @@ def main() -> None:
         m["file"] = str(out_dir / f"{m['task']}.rows.bin")
     copy_stage(metas, resume=args.resume)
     n_master, n_stage = build_master()
-    verify_invariants()
+    verify_invariants(metas)
     dur = (datetime.now() - t0).total_seconds()
     print(f"M2 完成: stage={n_stage:,} → master={n_master:,} "
           f"去重比 {1 - n_master / max(n_stage, 1):.1%}，耗时 {dur/3600:.2f}h")

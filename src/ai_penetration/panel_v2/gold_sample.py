@@ -79,7 +79,9 @@ def main() -> None:
     for _, shard in ((0, "job_p0387"), (1, "job_p0389")):
         cur.execute(
             f"SELECT recruit_id, position, job_description FROM public.{shard} "
-            f"TABLESAMPLE SYSTEM ({args.sample_pct}) "
+            f"TABLESAMPLE SYSTEM ({args.sample_pct}) REPEATABLE (20260908) "
+            # 定种（2026-09-09 审计：rng 只固定内存内选择，DB 页样本需
+            # REPEATABLE 才可跨运行复现同一总体）
             f"WHERE substr(publish_time,1,4)='{args.year}' "
             "AND job_description IS NOT NULL AND length(trim(job_description))>=10 "
             "AND position IS NOT NULL AND position != '' AND recruit_id IS NOT NULL")

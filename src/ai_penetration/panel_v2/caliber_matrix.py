@@ -3,9 +3,14 @@
 同一抽样上同时计算四个口径（消除数据可得性差异）：
   cell1  v1 规则（A ∪ B: avgω≥0.15 且 maxω≥0.5，自建词表+ω 快照）× 全量广告（不去重）
   cell2  v1 规则 × master 去重文本（本模块实测）
-  cell3  v2 主指标 >0.05 × master（来自发布分类表）
-  cell4  v2 严格 >0.15 × master（同上）
+  cell3  v2 暴露率 >0.05 × master（来自发布分类表）
+  cell4  v2 主指标 >0.15 × master（同上）
 cell1→cell2 = 去重/文本构成贡献；cell2→cell4/3 = 判据阈值与词表贡献。
+
+采样纪律（2026-09-09 审计修订）：TABLESAMPLE 加 REPEATABLE 定种可复现；
+SYSTEM 按物理页抽样且同企业模板物理相邻，有效方差显著大于二项 SE，
+cell1/cell2 的分母是 2% 样本、cell3/cell4 是全量——混基数分解只在 2024
+单年成立，跨格外推须重跑多年并披露置信带（见输出报告自动附注）。
 
 eps 只读；输出 output/reports/caliber_matrix_<ts>.md/csv。
 
@@ -55,7 +60,7 @@ def main() -> None:
     for city, shard in (("广州市", "job_p0387"), ("深圳市", "job_p0389")):
         cur.execute(
             f"SELECT recruit_id, position, job_description FROM public.{shard} "
-            f"TABLESAMPLE SYSTEM ({args.sample_pct}) "
+            f"TABLESAMPLE SYSTEM ({args.sample_pct}) REPEATABLE (20260908) "
             "WHERE substr(publish_time,1,4)=%s "
             "  AND job_description IS NOT NULL AND length(trim(job_description))>=10 "
             "  AND position IS NOT NULL AND position != '' AND recruit_id IS NOT NULL",
@@ -109,7 +114,10 @@ def main() -> None:
               "- 去重/文本构成效应（cell1→cell2）：" + f"{d12:+.1%}",
               "- 判据+词表效应（cell2→cell4 倍率）：" + f"×{d24:.2f}",
               "- 阈值效应（cell4→cell3 倍率）："
-              + f"×{rows[2][2]/max(rows[3][2],1e-12):.2f}", ""]
+              + f"×{rows[2][2]/max(rows[3][2],1e-12):.2f}", "",
+              "- 附注：cell1/cell2 为页面抽样实测（同企业模板物理相邻，有效方差",
+              "  大于二项 SE，倍率小数位不代表精度）；cell3/cell4 为全量发布值，",
+              "  跨格分解仅在当年抽样近似成立；主指标=>0.15，>0.05 为暴露率。"]
     out = paths.report_dir / f"caliber_matrix_{stamp}.md"
     out.write_text("\n".join(lines), encoding="utf-8")
     print("\n".join(lines))

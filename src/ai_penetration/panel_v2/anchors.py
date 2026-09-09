@@ -16,7 +16,17 @@
 7. 岗位名称不进入任何锚点版本（§12.6.1）——本模块只对描述文本调用。
 
 产出：ai_anchor_dictionary_v1 记录（§12.4 字段）与岗位锚点标记
-（job_anchor_flag 的三列 + main 命中明细两列，§12.5）。
+（job_anchor_flag：三列 0/1 + main 命中组 bitmask）。
+**已知偏离（2026-09-09 审计确认，已向交接方申报）**：§12.6.7 要求持久化
+"命中词明细"列，本实现只落组级 bitmask，词级命中未跨扫描持久化；影响是词级
+歧义审计只能到组粒度复现。
+
+锚点规则版本 ``ANCHOR_RULES_VERSION``（扫描日志与 QC 报告落戳）：
+- ``20260908_a``：发布面板（v2ac）所用规则——LLM 全拼复数不可命中、
+  TRANS 英文无尾界、语言字段按"含小写字母即 en"误判全大写缩写。
+- ``20260909_b``（当前）：修订 LLM 复数（en_pl 规则）、TRANS 尾界+复数、
+  词典语言字段按规则类型派生。影响上界 ≤0.018% 岗位（LLM|TRANS 全组命中
+  4,214），发布数字不回算，自全国 392 城重跑起生效；跨版本对比须核对戳记。
 """
 from __future__ import annotations
 
@@ -24,9 +34,14 @@ import re
 import unicodedata
 from dataclasses import dataclass
 
-# (组标签, 关键词, 语言, 匹配规则类型)
-# 规则类型：zh=子串；en=短语(空格/连字符灵活)；abbr=ASCII边界缩写；
-#          trans_zh=Transformer+中文限定；trans_en=Transformer+英文限定词
+# 规则版本戳（20260909_b：LLM 复数 en_pl、TRANS 尾界、语言字段派生修正）
+ANCHOR_RULES_VERSION = "20260909_b"
+
+# (组标签, 关键词, 匹配规则类型)
+# 规则类型：zh=子串；en=短语(空格/连字符灵活,ASCII 边界)；
+#          en_pl=短语+可选复数 s（§12.1 "large language models"）；
+#          abbr=ASCII边界缩写；abbr_llms=缩写+可选 s；
+#          trans_zh=Transformer+中文限定；trans_en=Transformer+英文限定词(尾界+可选复数)
 _TERM_TABLE: list[tuple[str, str, str]] = [
     ("AI", "人工智能", "zh"),
     ("AI", "artificial intelligence", "en"),
@@ -43,7 +58,7 @@ _TERM_TABLE: list[tuple[str, str, str]] = [
     ("CIMAGE", "image recognition", "en"),
     ("LLM", "大语言模型", "zh"),
     ("LLM", "大型语言模型", "zh"),
-    ("LLM", "large language model", "en"),
+    ("LLM", "large language model", "en_pl"),
     ("LLM", "LLM", "abbr_llms"),
     ("TRANS", "Transformer模型", "trans_zh"),
     ("TRANS", "Transformer架构", "trans_zh"),
@@ -61,6 +76,11 @@ ANCHOR_VERSIONS: dict[str, tuple[str, ...]] = {
 # 歧义标记（§12.4 ambiguity_flag）：缩写词存在语境歧义，命中明细保留供审计
 _AMBIGUOUS_RULES = {"abbr", "abbr_llms"}
 
+# 语言字段按规则类型派生（20260909_b：旧式"含小写字母即en"把全大写缩写标成
+# zh、把 Transformer模型 这类中英混排规则标成 en，共 6/43 行错）
+_RULE_LANG = {"zh": "zh", "trans_zh": "zh", "en": "en", "en_pl": "en",
+              "abbr": "en", "abbr_llms": "en", "trans_en": "en"}
+
 
 def _phrase_pattern(term: str) -> str:
     """英文短语 → 空格/连字符灵活的正则片段。"""
@@ -74,6 +94,8 @@ def _compile_term(term: str, rule: str) -> re.Pattern:
         return re.compile(re.escape(low))
     if rule == "en":
         return re.compile(rf"(?<![a-z0-9]){_phrase_pattern(low)}(?![a-z0-9])")
+    if rule == "en_pl":  # 20260909_b：短语+可选复数（large language models）
+        return re.compile(rf"(?<![a-z0-9]){_phrase_pattern(low)}s?(?![a-z0-9])")
     if rule == "abbr":
         return re.compile(rf"(?<![a-z0-9]){re.escape(low)}(?![a-z0-9])")
     if rule == "abbr_llms":
@@ -81,8 +103,8 @@ def _compile_term(term: str, rule: str) -> re.Pattern:
     if rule == "trans_zh":  # transformer 与 模型/架构 组合，允许间隔
         tail = low.split("transformer", 1)[1]
         return re.compile(rf"(?<![a-z0-9])transformer[\s\-]*{re.escape(tail)}")
-    if rule == "trans_en":
-        return re.compile(rf"(?<![a-z0-9]){_phrase_pattern(low)}")
+    if rule == "trans_en":  # 20260909_b：补尾界防 modeling 误命中，容复数
+        return re.compile(rf"(?<![a-z0-9]){_phrase_pattern(low)}s?(?![a-z0-9])")
     raise ValueError(f"未知匹配规则: {rule}")
 
 
@@ -170,7 +192,7 @@ def anchor_dictionary_rows() -> list[dict]:
                 "anchor_group": grp,
                 "keyword": term,
                 "keyword_normalized": unicodedata.normalize("NFKC", term).lower(),
-                "language": "en" if re.search(r"[a-z]", term) else "zh",
+                "language": _RULE_LANG[rule],
                 "matching_rule": rule,
                 "ambiguity_flag": 1 if rule in _AMBIGUOUS_RULES else 0,
             })

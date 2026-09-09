@@ -56,7 +56,9 @@ def compute_counts(rel_dir: Path) -> pd.DataFrame:
     """§13.1–§13.3 全部计数 + §13.6 实现顺序。"""
     job_idx, skill, year, flags = load_inputs(rel_dir)
     # §13.6.9 计算前基线日志
-    logger.info("计数基线: 岗位=%d 岗位-技能行=%d 分组数(岗位×技能×年)=%d",
+    # 标签修正（2026-09-09 审计：unique([job_idx, year]) 是岗位×年组合数，
+    # 不是"岗位×技能×年"——键里根本没有 skill）
+    logger.info("计数基线: 岗位=%d 岗位-技能行=%d 岗位×年组合数=%d",
                 len(flags["main"]) if isinstance(flags, dict) else 0,
                 len(skill), len(np.unique(np.stack([job_idx, year]))))
     years = np.sort(np.unique(year))

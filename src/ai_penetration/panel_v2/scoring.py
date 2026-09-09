@@ -5,7 +5,9 @@
 - §15.3 coverage=1 硬断言（cnt>0 岗位 weighted==matched）；
 - §15.4 raw 与 smoothed 双得分，主可比用 raw；
 - §16.1 三阈值严格大于；§16.2 零技能岗位：保留记录、得分缺失、
-  三标识=0、zero_skill_override=1；§16.4 主标识 aijob_main_annual_raw_005；
+  三标识=0、zero_skill_override=1；§16.4 主标识（2026-09-09 金标准决策后）
+  = aijob_main_annual_raw_015（AI 岗位占比），_005 语义为「AI 技能暴露率」
+  （exposure share），禁止作为岗位占比引用（见 config/panel_v2.yaml 注释）；
 - §14.3 企业留一（仅 main、三窗口、原始率）：
   w^-f = (c_{s,t}-c_{s,f,t})/(n_{s,t}-n_{s,f,t})，分母≤0 该技能无留一权重
   （得分按有权重技能取均值，覆盖率仅描述，§15.3.5）。
