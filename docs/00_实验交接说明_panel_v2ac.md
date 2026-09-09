@@ -26,7 +26,7 @@
 
 ### 2.2 技能识别（union 词表）
 - **A 级冻结概念词典**（110,970 激活别名 → 22,683 概念，pyahocorasick 全别名匹配 + ASCII 词边界 + 同形词 AI 语境校验）
-- ∪ **自建技术词表**（6,872 词中未被 A 级别名覆盖者，合成 `legacy:<term>` 命名空间；补 ESCO/O*NET 缺失的 pytorch/tensorflow/opencv 等技术工具粒度）
+- ∪ **自建技术词表**（6,872 词 → 6,328 个未被 A 级别名覆盖者合成 `legacy:<term>` 独立概念，一词一概念；367 词并入同名 A 级概念、172 内部归一重复、5 短词——逐词去向见发布件 `skill_legacy_v1`；补 ESCO/O*NET 缺失的 pytorch/tensorflow/opencv 等技术工具粒度）
 - 岗位内技能去重，别名→概念归一后一词一权重
 
 ### 2.3 AI 锚点（三套，指南 §12 逐字）
@@ -93,11 +93,16 @@
 
 ## 五、产出物
 
-### 5.1 发布包（`output/release/panel_v2/`，§18 十三件 + 同名 `.metadata.json` 12 字段）
+### 5.1 发布包（`output/release/panel_v2/`，§18 十三件 + 增补件 + 同名 `.metadata.json` 12 字段）
 skill_concept_v1 / skill_alias_v1 / skill_candidate_d_v1 / ai_anchor_dictionary_v1.csv /
 job_anchor_flag(22.96M) / job_skill_long(2.03亿) / job_firm / skill_ai_counts(493k) /
 skill_ai_relevance(493k) / job_ai_score(4.13亿长表, 3.14GB) / job_ai_classification(宽表含54标识) /
 job_ai_score_loo / quality_control_report.md
+**增补 `skill_legacy_v1.parquet`**（2026-09-09，run_id `20260909_v2ac_p15`）：自建 6,872 词
+在 union 词表中的逐词处置表——合成独立概念 `legacy:<键>` 6,328、并入 A 级同名概念 367、
+自建表内部归一重复 172（如 Pytorch/pytorch/PyTorch 多写法同键，先写者占键）、短词丢弃 5；
+与构建日志计数强制对账（export_release.assert）。legacy 层不在 A 级
+concept/alias 两件中，评审据此件即可枚举全部 117,262 键空间。
 （治理前版本归档于 `panel_v2_pre_blankfix/`）
 
 ### 5.2 结果库（PostgreSQL `ai_pen_results`，与 eps 源库物理隔离）
