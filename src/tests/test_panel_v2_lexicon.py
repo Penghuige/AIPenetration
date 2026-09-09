@@ -1,6 +1,8 @@
 """union 词表与三态文本清洗的离线测试。"""
 from __future__ import annotations
 
+import pandas as pd
+
 from src.ai_penetration.panel_v2.anchors import normalize_desc
 from src.ai_penetration.panel_v2.lexicon import LEGACY_PREFIX, build_union_lexicon
 from src.ai_penetration.text_clean import (
@@ -54,6 +56,34 @@ def test_legacy_namespace_isolated_from_uuids():
     lex = _lex()
     hits = lex.extract(normalize_desc("使用halcon做视觉"))
     assert LEGACY_PREFIX + "halcon" in hits
+
+
+def test_legacy_disposition_frame_matches_build_counts():
+    """处置表逐词去向必须与 union 构建计数精确对账。"""
+    from src.ai_penetration.panel_v2.export_release import (
+        legacy_disposition_frame)
+
+    terms = ["tensorflow", "halcon", "PyTorch", "目标检测", "GPT-4", "gpt-4",
+             "深度学习", "a"]
+    lex = build_union_lexicon(legacy_terms=terms, aliases=_ALIAS_DATA)
+    frame = legacy_disposition_frame(terms, lex)
+    n = frame.disposition.value_counts()
+    assert int(n["legacy_concept"]) == lex.n_legacy
+    assert int(n["covered_by_atier"]) + int(n["duplicate_term"]) \
+        == len(lex.overlap_terms)
+    assert len(frame) == len(terms)
+    # PyTorch 被 A 级覆盖；gpt-4 归一重复（GPT-4 先占键）；"a" 短词丢弃
+    d = dict(zip(frame.term, frame.disposition))
+    assert d["PyTorch"] == "covered_by_atier"
+    assert d["tensorflow"] == "legacy_concept"
+    assert d["a"] == "skipped_short"
+    gpts = frame[frame.match_key == "gpt-4"]
+    assert sorted(gpts.disposition) == ["duplicate_term", "legacy_concept"]
+    # 同形守卫列：深度学习（A级概念）带语境校验
+    dl = frame[frame.skill_id == "uuid-dl"].iloc[0]
+    assert dl.homograph_guard == 1
+    # 确定性：同输入重算逐行相等
+    pd.testing.assert_frame_equal(frame, legacy_disposition_frame(terms, lex))
 
 
 # ---------- text_clean ----------

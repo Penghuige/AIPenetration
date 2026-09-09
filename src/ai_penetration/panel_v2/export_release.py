@@ -1,8 +1,13 @@
-"""panel_v2 M4-b：§18 发布物组装（11 件 + 同名 metadata.json）。
+"""panel_v2 M4-b：§18 发布物组装（13 件 + legacy 处置表 + 同名 metadata.json）。
 
 把 counts/relevance/scoring 产物与词典、锚点表汇总到 release/panel_v2/，
 逐文件生成 §18.1 十二字段 metadata（含 sha256、run_id、config_hash）。
 默认拒绝覆盖已存在发布文件（--force-release 显式覆盖，§4 版本纪律）。
+
+legacy 处置表（skill_legacy_v1，2026-09-09 增补件）：§18 原十三件只含 A 级
+概念/别名与扫描命中的 legacy 词，不含自建 6,872 词在 union 构建中的完整去向
+（并入 A 级 539 / 合成概念 6,328 / 短词丢弃 5）。本件逐词记录 disposition，
+与 build_union_lexicon 计数强制对账，使发布包对 legacy 空间自含可审。
 
 用法::
     python -X utf8 -m src.ai_penetration.panel_v2.export_release --run-id 20260907_v2a
@@ -22,7 +27,9 @@ import psycopg2
 from config.paths import get_project_paths
 
 from ..common import eps_conn_params, setup_logging
+from ..skill_ai_anchor import load_merged_skills
 from .anchors import anchor_dictionary_rows
+from .lexicon import LEGACY_PREFIX, build_union_lexicon
 
 logger = logging.getLogger("ai_penetration.panel_v2.export")
 
@@ -96,6 +103,69 @@ def export_dictionaries(rel: Path) -> None:
                               index=False, encoding="utf-8-sig")
 
 
+def legacy_disposition_frame(legacy_terms: list[str], lex) -> pd.DataFrame:
+    """自建词表逐词处置表（纯函数，与 build_union_lexicon 构建序一致）。
+
+    Args:
+        legacy_terms: 自建合并技能词典词表（与 union 构建同序输入）。
+        lex: 已构建的 UnionLexicon（用其 keys_map/homograph 判归属）。
+
+    Returns:
+        DataFrame[term, match_key, skill_id, disposition, homograph_guard]，
+        disposition ∈ {legacy_concept（合成独立概念）, covered_by_atier
+        （A 级已有同形键，并入该概念）, duplicate_term（自建表内部归一重复）,
+        skipped_short（归一键 <2 字符）}；按 (disposition, match_key, term)
+        排序保证跨运行确定性。
+    """
+    import unicodedata
+
+    rows = []
+    created: set[str] = set()
+    for term in legacy_terms:
+        key = unicodedata.normalize("NFKC", str(term)).lower()
+        if len(key) < 2:
+            disp, sid = "skipped_short", ""
+        else:
+            sid = lex.keys_map.get(key, "")
+            if not sid.startswith(LEGACY_PREFIX):
+                disp = "covered_by_atier"
+            elif key in created:
+                disp = "duplicate_term"
+            else:
+                created.add(key)
+                disp = "legacy_concept"
+        rows.append({
+            "term": str(term), "match_key": key, "skill_id": sid,
+            "disposition": disp,
+            "homograph_guard": int(bool(sid) and sid in lex.homograph),
+        })
+    out = pd.DataFrame(rows)
+    return out.sort_values(["disposition", "match_key", "term"],
+                           kind="stable").reset_index(drop=True)
+
+
+def export_legacy_disposition(rel: Path) -> pd.DataFrame:
+    """用生产同源路径重建 union 词表并落 skill_legacy_v1.parquet。
+
+    断言强制对账：legacy_concept 计数 == lex.n_legacy，
+    covered+duplicate == len(lex.overlap_terms)，全量 == len(terms)。
+    """
+    terms = load_merged_skills(include_llm=True)
+    lex = build_union_lexicon(include_legacy=True, legacy_terms=terms)
+    frame = legacy_disposition_frame(terms, lex)
+    n = frame.disposition.value_counts()
+    assert int(n.get("legacy_concept", 0)) == lex.n_legacy, "legacy 计数失配"
+    assert int(n.get("covered_by_atier", 0)) + int(n.get("duplicate_term", 0)) \
+        == len(lex.overlap_terms), "重叠计数失配"
+    assert len(frame) == len(terms), "词数失配"
+    frame.to_parquet(rel / "skill_legacy_v1.parquet", index=False)
+    logger.info("legacy 处置表: %d 词 → 合成概念 %d / 并入A级 %d / 内部重复 %d / 短词 %d",
+                len(frame), int(n.get("legacy_concept", 0)),
+                int(n.get("covered_by_atier", 0)),
+                int(n.get("duplicate_term", 0)), int(n.get("skipped_short", 0)))
+    return frame
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="panel_v2 §18 发布组装")
     parser.add_argument("--run-id", default=datetime.now().strftime("%Y%m%d_%H%M"))
@@ -109,6 +179,7 @@ def main() -> None:
         raise SystemExit("发布目录已有本次结果（--force-release 覆盖，或改 run_id）")
 
     export_dictionaries(rel)
+    export_legacy_disposition(rel)
     # job_ai_score 以 18 单元 dataset 产出（B1 内存纪律），发布前流式合并
     score_dir = rel / "job_ai_score"
     score_single = rel / "job_ai_score.parquet"
@@ -130,6 +201,7 @@ def main() -> None:
         ("skill_concept_v1.parquet", "skill_id", "ai_dict.skill_concepts"),
         ("skill_alias_v1.parquet", "alias_id", "ai_dict.skill_aliases(active)"),
         ("skill_candidate_d_v1.parquet", "term", "pass2/skill_vocab.json"),
+        ("skill_legacy_v1.parquet", "term", "panel_v2/lexicon.py(union构建处置)"),
         ("ai_anchor_dictionary_v1.csv", "anchor_version+keyword", "panel_v2/anchors.py"),
         ("job_anchor_flag.parquet", "job_id", "panel_v2/scan.py"),
         ("job_skill_long.parquet", "job_id+skill_code", "panel_v2/scan.py"),
