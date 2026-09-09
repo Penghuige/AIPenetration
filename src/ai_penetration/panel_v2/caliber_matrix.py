@@ -92,12 +92,12 @@ def main() -> None:
         "v2_015": float(cy.aijob_main_annual_raw_015.mean()),
     }
     rows = [
-        ("cell1", f"v1 规则 × 当年全量广告（不去重）",
+        ("cell1", "v1 规则 × 当年全量广告（不去重）",
          stat["all"][2] / max(stat["all"][0], 1), stat["all"][0]),
-        ("cell2", f"v1 规则 × 当年 master 去重文本",
+        ("cell2", "v1 规则 × 当年 master 去重文本",
          stat["mst"][2] / max(stat["mst"][0], 1), stat["mst"][0]),
-        ("cell3", "v2 主指标 >0.05 × master（发布值）", v2["v2_005"], len(cy)),
-        ("cell4", "v2 严格 >0.15 × master（发布值）", v2["v2_015"], len(cy)),
+        ("cell3", "v2 暴露率 >0.05 × master（发布值）", v2["v2_005"], len(cy)),
+        ("cell4", "v2 主指标 >0.15 × master（发布值）", v2["v2_015"], len(cy)),
     ]
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     lines = [f"# 口径归因矩阵（{args.year}，抽样 {args.sample_pct}%）", "",
