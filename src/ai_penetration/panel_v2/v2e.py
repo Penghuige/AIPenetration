@@ -154,7 +154,7 @@ def main() -> None:
         _meta(p, args.run_id, pk, src, anchor_version="main,cn_paper,babina",
               dictionary_version=args.lex_version)
         made += 1
-    print(f"v2e 发布: {made} 件 @ {rel3}，用时 "
+    print(f"{args.out} 发布: {made} 件 @ {rel3}，用时 "
           f"{(datetime.now() - t0).total_seconds() / 60:.1f} 分钟")
 
 
