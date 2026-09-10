@@ -409,10 +409,14 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--slices", type=int, default=4)
     parser.add_argument("--bench", action="store_true")
+    parser.add_argument("--out-tag", default="",
+                        help="输出目录标签：pass2<tag> 与 release/panel_v2<tag>"
+                             "（v2h 重扫用，避免覆盖 v2ac 基底）")
     args = parser.parse_args()
     paths = get_project_paths()
-    setup_logging(paths.log_dir / "panel_v2_scan.log")
-    out_dir = paths.output_dir / "panel_v2" / "pass2"
+    setup_logging(paths.log_dir / f"panel_v2_scan{args.out_tag}.log")
+    out_dir = paths.output_dir / "panel_v2" / f"pass2{args.out_tag}"
+    rel_out = paths.output_dir / "release" / f"panel_v2{args.out_tag}"
     out_dir.mkdir(parents=True, exist_ok=True)
     logger.info("锚点规则版本: %s | 主样本版号: %s",
                 ANCHOR_RULES_VERSION, MASTER_VERSION)
@@ -442,13 +446,12 @@ def main() -> None:
     conn.close()
     canon = sum(s["canonical"] for s in stats)
     dup_hits = sum(s.get("dup_hits", 0) for s in stats)
-    merge_parts(out_dir, paths.output_dir / "release" / "panel_v2")
+    merge_parts(out_dir, rel_out)
     # 守恒终判：合并去重后的 flag 行数必须等于 master（Σcanonical 允许多计
     # 跨切片重复命中，由 merge keep-first 归一）
     import pyarrow.parquet as pq
     n_flag = pq.ParquetFile(
-        paths.output_dir / "release" / "panel_v2"
-        / "job_anchor_flag.parquet").metadata.num_rows
+        rel_out / "job_anchor_flag.parquet").metadata.num_rows
     if n_flag != n_master:
         raise SystemExit(
             f"守恒失败: 合并后 flag {n_flag} != master {n_master}"
