@@ -142,10 +142,12 @@ def verify_counts(counts: pd.DataFrame) -> None:
 
 
 def main() -> None:
-    argparse.ArgumentParser(description="panel_v2 §13 共现计数").parse_args()
+    ap = argparse.ArgumentParser(description="panel_v2 §13 共现计数")
+    ap.add_argument("--rel", default="panel_v2", help="release 子目录名")
+    args = ap.parse_args()
     paths = get_project_paths()
     setup_logging(paths.log_dir / "panel_v2_counts.log")
-    rel = paths.output_dir / "release" / "panel_v2"
+    rel = paths.output_dir / "release" / args.rel
     counts = compute_counts(rel)
     counts.to_parquet(rel / "skill_ai_counts.parquet", index=False)
     logger.info("skill_ai_counts: %d 行", len(counts))

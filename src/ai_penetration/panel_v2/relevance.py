@@ -135,12 +135,15 @@ def decode_skill_ids(rel: pd.DataFrame, vocab_path: Path) -> pd.DataFrame:
 
 
 def main() -> None:
-    argparse.ArgumentParser(description="panel_v2 §14 共现率与平滑").parse_args()
+    ap = argparse.ArgumentParser(description="panel_v2 §14 共现率与平滑")
+    ap.add_argument("--rel", default="panel_v2", help="release 子目录名")
+    ap.add_argument("--pass2", default="pass2", help="pass2 目录名（词表来源）")
+    args = ap.parse_args()
     paths = get_project_paths()
     setup_logging(paths.log_dir / "panel_v2_relevance.log")
-    rel_dir = paths.output_dir / "release" / "panel_v2"
+    rel_dir = paths.output_dir / "release" / args.rel
     counts = pd.read_parquet(rel_dir / "skill_ai_counts.parquet")
-    pass2 = paths.output_dir / "panel_v2" / "pass2"
+    pass2 = paths.output_dir / "panel_v2" / args.pass2
     tier_map = _load_tier_map(pass2 / "skill_vocab.json")
     rel = decode_skill_ids(compute_relevance(counts, tier_map),
                            pass2 / "skill_vocab.json")
