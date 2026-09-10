@@ -2,7 +2,9 @@
 # 生成式 LLM 走 OpenAI-compatible API（默认指向本机 WSL vLLM）；
 # 环境变量 AIPEN_LLM_BASE_URL / AIPEN_LLM_MODEL / AIPEN_LLM_API_KEY 可覆盖。
 llm:
-  base_url: "http://localhost:8000/v1"
+  # 本机 WSL vLLM 实际监听 8101（09-07 金标准时经 env 覆盖运行，2026-09-10 落定
+  # config；历史文档中 172.27.202.75:8101 为 WSL NAT 地址，重启会变勿用）。
+  base_url: "http://localhost:8101/v1"
   api_key: "EMPTY"
   model: "Qwen3-8B"
   # 单次请求失败重试次数

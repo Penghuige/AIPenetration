@@ -60,7 +60,8 @@ def _init_worker(terms: dict[str, str]) -> None:
     _W["ascii"] = {k for k in order if all(ord(c) < 128 for c in k)}
 
 
-def scan_slice(table: str, b_start: int, b_end: int, tmp_dir: str) -> dict:
+def scan_slice(table: str, b_start: int, b_end: int, tmp_dir: str,
+               tag: str = "legacy") -> dict:
     """一个 ctid 切片：文本规范化→(platform,hash) 去重→带边界 Aho→(aid,key)。
 
     实现纪律（2026-09-10 重跑版：首版把全部命中对攒进 Python list，
@@ -72,7 +73,7 @@ def scan_slice(table: str, b_start: int, b_end: int, tmp_dir: str) -> dict:
     """
     auto, idx, n = _W["auto"], _W["idx"], _W["n"]
     ascii_keys = _W["ascii"]
-    task = f"lg_{table}_{b_start}_{b_end}"
+    task = f"lg_{tag[:6]}_{table}_{b_start}_{b_end}"  # tag 隔离多词表断点
     kf = Path(tmp_dir) / f"{task}.keys.bin"
     af = Path(tmp_dir) / f"{task}.aids.bin"
     hb = Path(tmp_dir) / f"{task}.hb.json"
@@ -202,11 +203,25 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="legacy df_unique_description 频数")
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--slices", type=int, default=4)
+    parser.add_argument("--terms-file", default=None,
+                        help="自定义词表（每行一键，NFKC+lower 后匹配）；"
+                             "用于时代缺词补登记与 B/C 发现候选的 df 计算")
+    parser.add_argument("--tag", default="legacy_df_freq_v1",
+                        help="输出件与 PG 表名后缀（表 ai_dict.legacy_term_freq"
+                             " 仅在默认 tag 时写，防污染治理主表）")
     args = parser.parse_args()
     paths = get_project_paths()
-    setup_logging(paths.log_dir / "panel_v2_legacy_freq.log")
+    setup_logging(paths.log_dir / f"panel_v2_{args.tag}.log")
     assert args.workers <= 8, "HDD 纪律"
-    terms = _legacy_terms()
+    if args.terms_file:
+        import unicodedata
+        keys = [unicodedata.normalize("NFKC", ln.strip()).lower()
+                for ln in Path(args.terms_file).read_text(
+                    encoding="utf-8").splitlines() if ln.strip()]
+        terms = {k: f"newterm:{k}" for k in keys}
+        logger.info("自定义词表 %d 键（tag=%s）", len(terms), args.tag)
+    else:
+        terms = _legacy_terms()
     logger.info("legacy 键 %d，规划切片", len(terms))
     conn = psycopg2.connect(**eps_conn_params())
     cur = conn.cursor()
@@ -225,19 +240,22 @@ def main() -> None:
     metas = []
     with ProcessPoolExecutor(max_workers=args.workers, initializer=_init_worker,
                              initargs=(terms,)) as pool:
-        for f in [pool.submit(scan_slice, t, lo, hi, str(tmp))
+        for f in [pool.submit(scan_slice, t, lo, hi, str(tmp), args.tag)
                   for t, lo, hi in tasks]:
             metas.append(f.result())
     freq = aggregate_counts(metas, tmp, n_alias=len(terms))
     order = sorted(terms)
     rows = [(k, terms[k], int(freq[i])) for i, k in enumerate(order)]
-    out_csv = paths.output_dir / "dictionary" / "legacy_df_freq_v1.csv"
+    out_csv = paths.output_dir / "dictionary" / f"{args.tag}.csv"
     import pandas as pd
     pd.DataFrame(rows, columns=["match_key", "skill_id", "df_unique_text"]
                  ).to_csv(out_csv, index=False, encoding="utf-8-sig")
     logger.info("legacy 频数落盘 %s（df>0: %d，df>=100: %d）", out_csv,
                 int((freq > 0).sum()), int((freq >= 100).sum()))
-    # 治理结果表（eps ai_dict 唯一合法写入目标；不动 A 级 zh_alias_freq）
+    # 治理结果表（eps ai_dict 唯一合法写入目标；仅默认 tag 写 PG——自定义
+    # 词表只落 CSV，防污染词典治理主表；A 级 zh_alias_freq 永远不碰）
+    if args.tag != "legacy_df_freq_v1":
+        return
     conn = psycopg2.connect(**eps_conn_params())
     try:
         c = conn.cursor()
