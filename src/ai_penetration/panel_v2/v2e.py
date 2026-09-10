@@ -74,35 +74,48 @@ def grade_and_exclusions(rel: Path, out_dir: Path) -> tuple[pd.DataFrame, "objec
 def main() -> None:
     parser = argparse.ArgumentParser(description="v2e 原预案复原代际")
     parser.add_argument("--run-id", default="20260909_v2e")
+    parser.add_argument("--out", default="panel_v2e")
+    parser.add_argument("--lex-version", default=LEX_VERSION)
+    parser.add_argument("--grade-csv", default=None,
+                        help="给定时从该分级表读取排除集（v2f 用 LLM 合并表），"
+                             "否则按 v2e 确定性规则现算")
+    parser.add_argument("--grade-col", default="grade",
+                        help="排除判定列（D 值所在列，v2f=final_grade）")
     args = parser.parse_args()
     paths = get_project_paths()
-    setup_logging(paths.log_dir / "panel_v2_v2e.log")
+    setup_logging(paths.log_dir / f"panel_v2_{args.out}.log")
     rel = paths.output_dir / "release" / "panel_v2"
-    rel3 = paths.output_dir / "release" / "panel_v2e"
+    rel3 = paths.output_dir / "release" / args.out
     if (rel3 / "quality_control_report.md").exists():
-        raise SystemExit("panel_v2e 已存在（删目录或改 run-id）")
+        raise SystemExit(f"{args.out} 已存在（删目录或改 run-id）")
     t0 = datetime.now()
     import numpy as np
-    frame, _ = grade_and_exclusions(rel, paths.output_dir)
+    if args.grade_csv:
+        frame = pd.read_csv(paths.output_dir / "dictionary" / args.grade_csv,
+                            encoding="utf-8-sig")
+    else:
+        frame, _ = grade_and_exclusions(rel, paths.output_dir)
     vocab = json.loads((paths.output_dir / "panel_v2" / "pass2"
                         / "skill_vocab.json").read_text(encoding="utf-8"))
-    d_ids = set(frame[frame.grade == "D"].skill_id)
+    d_ids = set(frame[frame[args.grade_col] == "D"].skill_id)
     codes = np.array(sorted(vocab[s] for s in d_ids if s in vocab), np.int32)
     print(f"D 级排除 {len(codes)} 键；A 级全参与；B/C 共 "
-          f"{int((frame.grade != 'D').sum())} 键正式参与")
+          f"{int((frame[args.grade_col] != 'D').sum())} 键正式参与")
     build_inputs(rel, rel3, codes)
     from . import quality, scoring
     scoring.run(rel3)
     quality.run(rel3)
-    # 分级治理件
+    # 分级治理件（v2e 现算落盘；v2f 从合并表来，不覆写 v1 件）
     import shutil
-    gcsv = paths.output_dir / "dictionary" / "skill_legacy_graded_BCD_v1.csv"
-    frame.to_csv(gcsv, index=False, encoding="utf-8-sig")
+    gname = args.grade_csv or "skill_legacy_graded_BCD_v1.csv"
+    gcsv = paths.output_dir / "dictionary" / gname
+    if not args.grade_csv:
+        frame.to_csv(gcsv, index=False, encoding="utf-8-sig")
     for f in ("skill_concept_v1.parquet", "skill_alias_v1.parquet",
               "ai_anchor_dictionary_v1.csv", "skill_legacy_v1.parquet",
               "skill_candidate_d_v1.parquet"):
         (rel3 / f).write_bytes((rel / f).read_bytes())
-    shutil.copy2(gcsv, rel3 / "skill_legacy_graded_BCD_v1.csv")
+    shutil.copy2(gcsv, rel3 / gname)
     single = rel3 / "job_ai_score.parquet"
     import pyarrow as pa
     if not single.exists():
@@ -117,8 +130,9 @@ def main() -> None:
         ("skill_alias_v1.parquet", "alias_id", "ai_dict.skill_aliases(active)"),
         ("skill_candidate_d_v1.parquet", "term", "pass2/skill_vocab.json"),
         ("skill_legacy_v1.parquet", "term", "panel_v2/lexicon.py(union构建处置)"),
-        ("skill_legacy_graded_BCD_v1.csv", "skill_id",
-         "panel_v2/lexicon_v2d.py(§10.3.1 A/B/C/D 分级)"),
+        (gname, "skill_id",
+         "panel_v2/lexicon_llm.py(T1∧T2 合并分级)" if args.grade_csv
+         else "panel_v2/lexicon_v2d.py(§10.3.1 A/B/C/D 分级)"),
         ("ai_anchor_dictionary_v1.csv", "anchor_version+keyword",
          "panel_v2/anchors.py"),
         ("job_anchor_flag.parquet", "job_id", "panel_v2/scan.py(v2a 复用)"),
@@ -138,7 +152,7 @@ def main() -> None:
             logger.warning("缺文件跳过: %s", name)
             continue
         _meta(p, args.run_id, pk, src, anchor_version="main,cn_paper,babina",
-              dictionary_version=LEX_VERSION)
+              dictionary_version=args.lex_version)
         made += 1
     print(f"v2e 发布: {made} 件 @ {rel3}，用时 "
           f"{(datetime.now() - t0).total_seconds() / 60:.1f} 分钟")
