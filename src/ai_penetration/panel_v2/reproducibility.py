@@ -45,9 +45,11 @@ def artifact_row_count(path: Path) -> int | None:
 
 
 def _code_fingerprint(root: Path) -> str:
-    """无 Git 元数据时，对运行代码与口径配置生成稳定指纹。"""
+    """对实际可执行代码与口径配置生成稳定内容指纹。"""
     h = hashlib.sha256()
-    files = sorted((root / "src").rglob("*.py")) + sorted((root / "config").glob("*.yaml"))
+    files = sorted((root / "src").rglob("*.py"))
+    files += sorted((root / "config").rglob("*.py"))
+    files += sorted((root / "config").glob("*.yaml"))
     for path in files:
         rel = path.relative_to(root).as_posix()
         h.update(rel.encode("utf-8"))
@@ -57,27 +59,39 @@ def _code_fingerprint(root: Path) -> str:
     return h.hexdigest()
 
 
-def code_revision(root: Path | None = None) -> str:
-    """优先返回 Git HEAD；不可用时返回内容指纹。"""
-    root = root or get_project_paths().project_root
+def _git_value(root: Path, args: list[str]) -> str | None:
+    """执行只读 git 查询；Git 不可用时返回 None。"""
     try:
         proc = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
+            ["git", *args],
             cwd=root,
             check=True,
             capture_output=True,
             text=True,
             timeout=10,
         )
-        sha = proc.stdout.strip()
-        if sha:
-            return sha
     except (OSError, subprocess.SubprocessError):
-        pass
+        return None
+    return proc.stdout.strip()
+
+
+def code_revision(root: Path | None = None) -> str:
+    """返回能代表实际执行代码的版本标识。
+
+    干净 Git 工作区返回 HEAD；若存在未提交改动或 Git 元数据不可用，则返回
+    当前代码内容指纹，避免 manifest 把 dirty worktree 错记成旧 HEAD。
+    """
+    root = root or get_project_paths().project_root
+    sha = _git_value(root, ["rev-parse", "HEAD"])
+    status = _git_value(root, ["status", "--porcelain", "--untracked-files=all"])
+    if sha and status == "":
+        return sha
     return "sha256:" + _code_fingerprint(root)
 
 
-def _records(paths: Iterable[Path], root: Path) -> tuple[list[str], dict[str, str], dict[str, int | None]]:
+def _records(
+    paths: Iterable[Path], root: Path
+) -> tuple[list[str], dict[str, str], dict[str, int | None]]:
     """把一组文件转换成 manifest 的路径/hash/行数三张表。"""
     names: list[str] = []
     hashes: dict[str, str] = {}
@@ -130,6 +144,7 @@ def write_run_manifest(
         "started_at": started_at.isoformat(timespec="seconds"),
         "finished_at": datetime.now().isoformat(timespec="seconds"),
         "git_commit_or_code_hash": code_revision(root),
+        "code_tree_sha256": _code_fingerprint(root),
         "input_file_paths": inp,
         "input_file_sha256": inp_sha,
         "input_row_counts": inp_rows,
