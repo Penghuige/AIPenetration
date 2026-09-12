@@ -6,7 +6,8 @@
 全量重算：D 级过滤 → counts（flag 变了必须重算）→ relevance → scoring →
 quality → 装配。词表仍为 v1.3（legacy_grade_v2），主口径仍为指南 §2.4（005）。
 
-产物：release/panel_v2h（15 件 + metadata，run_id 20260910_v2h）。
+产物：release/panel_v2h（15 件 + metadata + run_manifest.json，
+run_id 20260910_v2h）。
 
 用法::
     python -X utf8 -m src.ai_penetration.panel_v2.v2h [--run-id 20260910_v2h]
@@ -32,6 +33,7 @@ from . import quality, scoring
 from .counts import compute_counts
 from .export_release import _meta
 from .relevance import _load_tier_map, compute_relevance, decode_skill_ids
+from .reproducibility import write_run_manifest
 
 logger = logging.getLogger("ai_penetration.panel_v2.v2h")
 
@@ -89,46 +91,56 @@ def main() -> None:
     rel3.mkdir(parents=True, exist_ok=True)
 
     # 1) 输入件从 v2b 移入 v2h（flag/long/firm 为规则 b 扫描产物）
-    for f in ("job_anchor_flag.parquet", "job_skill_long.parquet",
-              "job_firm.parquet"):
+    scan_inputs = ("job_anchor_flag.parquet", "job_skill_long.parquet",
+                   "job_firm.parquet")
+    for f in scan_inputs:
         shutil.copy2(rel2 / f, rel3 / f)
+
     # 2) v1.3 D 级过滤
-    grade = pd.read_csv(paths.output_dir / "dictionary"
-                        / "skill_legacy_graded_BCD_v2.csv",
-                        encoding="utf-8-sig")
-    vocab = json.loads((paths.output_dir / "panel_v2" / "pass2b"
-                        / "skill_vocab.json").read_text(encoding="utf-8"))
+    gcsv = paths.output_dir / "dictionary" / "skill_legacy_graded_BCD_v2.csv"
+    grade = pd.read_csv(gcsv, encoding="utf-8-sig")
+    pass2b = paths.output_dir / "panel_v2" / "pass2b"
+    vocab_path = pass2b / "skill_vocab.json"
+    vocab = json.loads(vocab_path.read_text(encoding="utf-8"))
     d_ids = set(grade[grade.final_grade == "D"].skill_id)
     codes = np.array(sorted(vocab[s] for s in d_ids if s in vocab), np.int32)
     logger.info("D 级排除 %d 码", len(codes))
     filter_longs(rel3, codes)
+
     # 3) counts（新 flag）→ relevance
     counts = compute_counts(rel3)
     counts.to_parquet(rel3 / "skill_ai_counts.parquet", index=False)
     logger.info("skill_ai_counts: %d 行", len(counts))
-    pass2b = paths.output_dir / "panel_v2" / "pass2b"
-    rel_df = decode_skill_ids(compute_relevance(counts,
-                                                _load_tier_map(pass2b / "skill_vocab.json")),
-                              pass2b / "skill_vocab.json")
+    rel_df = decode_skill_ids(
+        compute_relevance(counts, _load_tier_map(vocab_path)), vocab_path
+    )
     rel_df.to_parquet(rel3 / "skill_ai_relevance.parquet", index=False)
     logger.info("skill_ai_relevance: %d 行", len(rel_df))
+
     # 4) scoring + quality
     scoring.run(rel3)
     quality.run(rel3)
+
     # 5) 装配：字典/锚点/分级件 + metadata
-    for f in ("skill_concept_v1.parquet", "skill_alias_v1.parquet",
-              "skill_candidate_d_v1.parquet", "skill_legacy_v1.parquet",
-              "ai_anchor_dictionary_v1.csv"):
+    copied_release_inputs = (
+        "skill_concept_v1.parquet", "skill_alias_v1.parquet",
+        "skill_candidate_d_v1.parquet", "skill_legacy_v1.parquet",
+        "ai_anchor_dictionary_v1.csv",
+    )
+    for f in copied_release_inputs:
         shutil.copy2(rel_src / f, rel3 / f)
-    gcsv = paths.output_dir / "dictionary" / "skill_legacy_graded_BCD_v2.csv"
     shutil.copy2(gcsv, rel3 / gcsv.name)
+
     single = rel3 / "job_ai_score.parquet"
     files = sorted((rel3 / "job_ai_score").glob("*.parquet"))
+    if not files:
+        raise RuntimeError("job_ai_score 分区为空，拒绝装配 v2h release")
     with pq.ParquetWriter(single, pq.read_schema(files[0]),
                           compression="zstd") as w:
         for f in files:
             for rb in pq.ParquetFile(f).iter_batches(batch_size=2_000_000):
                 w.write_table(pa.Table.from_batches([rb]))
+
     specs = [
         ("skill_concept_v1.parquet", "skill_id", "ai_dict.skill_concepts"),
         ("skill_alias_v1.parquet", "alias_id", "ai_dict.skill_aliases(active)"),
@@ -148,16 +160,37 @@ def main() -> None:
         ("job_ai_score_loo.parquet", "job_id", "panel_v2/scoring.py(§14.3 v2h)"),
         ("quality_control_report.md", "-", "panel_v2/quality.py(v2h)"),
     ]
-    made = 0
+
+    missing = [name for name, _, _ in specs if not (rel3 / name).exists()]
+    if missing:
+        raise RuntimeError(
+            "指南 §18 必需发布件缺失，拒绝生成正式 v2h release: "
+            + ", ".join(missing)
+        )
+
     for name, pk, src in specs:
-        p = rel3 / name
-        if not p.exists():
-            logger.warning("缺文件跳过: %s", name)
-            continue
-        _meta(p, args.run_id, pk, src, anchor_version="main,cn_paper,babina",
-              dictionary_version=LEX_VERSION)
-        made += 1
-    print(f"panel_v2h 发布: {made} 件 @ {rel3}，用时 "
+        _meta(
+            rel3 / name, args.run_id, pk, src,
+            anchor_version="main,cn_paper,babina",
+            dictionary_version=LEX_VERSION,
+        )
+
+    # 6) 指南 §4.2：把本次正式运行的代码/配置、输入、输出绑定成一个总账。
+    manifest_inputs = [rel2 / f for f in scan_inputs]
+    manifest_inputs += [rel_src / f for f in copied_release_inputs]
+    manifest_inputs += [gcsv, vocab_path]
+    manifest_outputs = [rel3 / name for name, _, _ in specs]
+    manifest = write_run_manifest(
+        rel3,
+        run_id=args.run_id,
+        started_at=t0,
+        input_paths=manifest_inputs,
+        output_paths=manifest_outputs,
+        dictionary_version=LEX_VERSION,
+        anchor_version="main,cn_paper,babina@20260909_b",
+    )
+
+    print(f"panel_v2h 发布: {len(specs)} 件 + metadata + {manifest.name} @ {rel3}，用时 "
           f"{(datetime.now() - t0).total_seconds() / 60:.1f} 分钟")
 
 
