@@ -51,12 +51,8 @@ def test_setup_logging_can_add_file_after_console_only(tmp_path: Path):
     old_handlers = list(root.handlers)
     old_level = root.level
     try:
-        for handler in list(root.handlers):
+        for handler in old_handlers:
             root.removeHandler(handler)
-            try:
-                handler.close()
-            except Exception:
-                pass
 
         setup_logging()
         log_path = tmp_path / "nested" / "run.log"
@@ -77,10 +73,11 @@ def test_setup_logging_can_add_file_after_console_only(tmp_path: Path):
     finally:
         for handler in list(root.handlers):
             root.removeHandler(handler)
-            try:
-                handler.close()
-            except Exception:
-                pass
+            if handler not in old_handlers:
+                try:
+                    handler.close()
+                except Exception:
+                    pass
         for handler in old_handlers:
             root.addHandler(handler)
         root.setLevel(old_level)
