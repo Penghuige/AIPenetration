@@ -20,29 +20,51 @@ DEFAULT_OMEGA_SNAPSHOT = "output/reports/omega_ai_scores_20260819_105630.json"
 
 
 def setup_logging(log_path: Path | None = None) -> None:
-    """配置根 logger 输出到终端与可选日志文件。
+    """幂等配置根 logger 的终端与可选文件输出。
+
+    可在同一进程内多次调用：不会重复添加 stdout handler；后续首次传入
+    ``log_path`` 时仍会补装文件 handler。根 logger 设为 DEBUG，使文件 handler
+    能记录 DEBUG；终端 handler 自身限制为 INFO。
 
     Args:
-        log_path: 日志文件路径；为空时仅输出到终端。
+        log_path: 日志文件路径；为空时仅确保终端输出。
             文件 handler 记录 DEBUG 级，终端记录 INFO 级。
-
-    Side Effects:
-        会向根 logger 追加 handler，避免在进程内重复调用。
     """
     root = logging.getLogger()
-    if any(isinstance(h, logging.StreamHandler) for h in root.handlers):
+    root.setLevel(logging.DEBUG)
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"
+    )
+
+    has_stdout = any(
+        isinstance(h, logging.StreamHandler)
+        and not isinstance(h, logging.FileHandler)
+        and getattr(h, "stream", None) is sys.stdout
+        for h in root.handlers
+    )
+    if not has_stdout:
+        console = logging.StreamHandler(sys.stdout)
+        console.setLevel(logging.INFO)
+        console.setFormatter(fmt)
+        root.addHandler(console)
+
+    if log_path is None:
         return
-    root.setLevel(logging.INFO)
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
-    console = logging.StreamHandler(sys.stdout)
-    console.setFormatter(fmt)
-    root.addHandler(console)
-    if log_path:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        fh = logging.FileHandler(log_path, encoding="utf-8")
-        fh.setLevel(logging.DEBUG)
-        fh.setFormatter(fmt)
-        root.addHandler(fh)
+
+    log_path = Path(log_path).resolve()
+    has_file = any(
+        isinstance(h, logging.FileHandler)
+        and Path(getattr(h, "baseFilename", "")).resolve() == log_path
+        for h in root.handlers
+    )
+    if has_file:
+        return
+
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = logging.FileHandler(log_path, encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(fmt)
+    root.addHandler(fh)
 
 
 def eps_conn_params() -> dict:
