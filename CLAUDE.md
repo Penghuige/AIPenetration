@@ -166,3 +166,25 @@ LLM 批量调用前先确认其空闲，勿与重型任务抢窗口。
 - 涉及判定口径的结论性数字，写报告前先注明所用 `--method` 与 ω 快照时间戳
 - 全量跑批前：读 §3 流式规范 + §9 机器画像，跑完先做守恒核验（三粒度总数相等、
   组内还原、跨面板锚点一致）再交付数字
+
+## 11. 本机出网规范（代理）
+
+**本机无直连外网能力，所有出网流量必须显式走代理端口 `127.0.0.1:7897`。**
+
+已验证事实（2026-09-15 实测）：
+
+- 直连外部站点：连接超时，无任何直连出口
+- 走代理：`github.com` HTTP 200 可用；`api.github.com` 可通但共享 IP 匿名限流（403）
+- 走代理仍被 `Connection was reset` 重置：`raw.githubusercontent.com`、
+  `codeload.github.com`、git 协议（`clone`/`fetch`/release 资产下载）
+- 环境变量 `HTTP_PROXY` / `HTTPS_PROXY` **未设置**，故 `curl`、`pip`、
+  `python requests` 默认直连会挂起；只有 `git` 因 `git config --global http.proxy` 生效
+
+操作要求：
+
+- 命令行取网：显式加 `-x http://127.0.0.1:7897`
+- Python 取网：显式传 `proxies={"https": "http://127.0.0.1:7897"}`
+- 需要 GitHub 仓库内容时：`clone` 与 release 下载当前不可用，改用 `github.com`
+  的 HTML/blob 页面（走代理 200）逐文件读取
+- **失败即报告，禁止连续重试**：直连的典型表现是长时间静默挂起，连续试错会空转
+  大量时间；确认代理不通就停下来报告状态，由用户决定下一步
