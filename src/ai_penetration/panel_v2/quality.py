@@ -104,7 +104,8 @@ def gate_checks(rel: Path) -> tuple[list[str], dict]:
     else:
         texts = pq.read_table(text_path).to_pandas()
         required_text = {
-            "job_id", "year", "job_description_raw", "job_description_clean",
+            "job_id", "job_id_sha256", "job_id_raw", "source_platform", "year",
+            "job_description_raw", "job_description_clean",
             "job_description_match", "text_hash",
         }
         missing_text = required_text - set(texts.columns)
@@ -115,6 +116,16 @@ def gate_checks(rel: Path) -> tuple[list[str], dict]:
             )
         if texts.job_id.duplicated().any():
             fails.append("job_text_clean job_id 不唯一")
+        if "job_id_sha256" in texts.columns:
+            sha = texts.job_id_sha256.astype(str)
+            if sha.duplicated().any():
+                fails.append("完整 SHA256 stable job_id 不唯一")
+            if not sha.str.fullmatch(r"[0-9a-f]{64}").all():
+                fails.append("job_id_sha256 格式非法")
+        if {"source_platform", "job_id_raw"}.issubset(texts.columns):
+            pair = texts[["source_platform", "job_id_raw"]].astype(str)
+            if pair.duplicated().any():
+                fails.append("(source_platform, job_id_raw) 在 canonical 文本表中不唯一")
 
     # §18 正式发布词典必须能独立解释正式长表。
     concept_path = rel / "skill_concept_v1.parquet"
