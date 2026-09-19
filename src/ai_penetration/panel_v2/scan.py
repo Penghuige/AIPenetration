@@ -38,7 +38,8 @@ from config.paths import get_project_paths
 from ..common import eps_conn_params, setup_logging
 from ..text_clean import clean_description, text_hash, to_match
 from .anchors import ANCHOR_RULES_VERSION, match_all_versions
-from .dedup import ADMISSION_WHERE, MASTER_VERSION, SHARDS, _blocks, _h63
+from .dedup import (ADMISSION_WHERE, MASTER_VERSION, SHARDS, _blocks,
+                    _stable_job_id)
 
 logger = logging.getLogger("ai_penetration.panel_v2.scan")
 
@@ -79,7 +80,7 @@ def export_master(out_dir: Path) -> None:
                        s.get("version"), MASTER_VERSION)
     conn = _results_conn()
     cur = conn.cursor()
-    cur.execute("SELECT job_id_raw, plat, job_id, city, year, company_id, thash "
+    cur.execute("SELECT job_id, city, year, company_id, thash "
                 "FROM public.job_master_gzsz")
     rows = cur.fetchall()
     conn.close()
@@ -92,11 +93,10 @@ def export_master(out_dir: Path) -> None:
     city = np.empty(n, np.int16)
     thash = np.empty(n, np.int64)
     comps: dict[str, int] = {}
-    # key = h63(rid)：master 的 rid 全局唯一（实证 0 重复组），跨切片/跨平台
-    # 的重复命中由 worker hit_seen + PG 端 DISTINCT ON 仲裁（rid 复合平台编码
-    # 会因映射覆盖缺口产生漏命中，2026-09-07 实证 9867 例，已弃用）
-    for i, (rid, _plat, jid, city_id, y, comp, hash_value) in enumerate(rows):
-        key[i] = _h63(str(rid))
+    # key 直接使用 §3.2 稳定 job_id = SHA256(platform|raw_id) 的 63-bit 代理。
+    # pass2 对原始行用同一公式重算，避免任何 rid-only/平台编码旁路。
+    for i, (jid, city_id, y, comp, hash_value) in enumerate(rows):
+        key[i] = int(jid)
         job_id[i] = int(jid)
         year[i] = int(y)
         company[i] = comps.setdefault(str(comp), len(comps))
@@ -105,7 +105,7 @@ def export_master(out_dir: Path) -> None:
     order = np.argsort(key, kind="stable")
     k_sorted = key[order]
     if np.any(k_sorted[1:] == k_sorted[:-1]):
-        raise RuntimeError("canonical key 哈希碰撞")
+        raise RuntimeError("canonical 稳定 job_id 碰撞")
     npy_dir.mkdir(parents=True, exist_ok=True)
     tmp = out_dir / "_master_tmp"
     tmp.mkdir(parents=True, exist_ok=True)
@@ -310,7 +310,7 @@ def scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str) -> dict
         cur = conn.cursor(f"pass2_{task}")
         cur.itersize = 50000
         cur.execute(
-            f"SELECT recruit_id, job_description FROM public.{shard} "
+            f"SELECT recruit_id, platform, job_description FROM public.{shard} "
             "WHERE ctid >= '(%s,0)'::tid AND ctid < '(%s,0)'::tid "
             + ADMISSION_WHERE,  # 单源谓词（审计 D3：禁再手抄）
             (int(lo), int(hi)))
@@ -320,9 +320,9 @@ def scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str) -> dict
             batch = cur.fetchmany(50000)
             if not batch:
                 break
-            for rid, desc in batch:
+            for rid, platform, desc in batch:
                 n_rows += 1
-                k = _h63(str(rid))
+                k = _stable_job_id(str(platform or ""), str(rid))
                 idx = int(np.searchsorted(keys, k))
                 if idx >= keys.size or int(keys[idx]) != k:
                     continue
