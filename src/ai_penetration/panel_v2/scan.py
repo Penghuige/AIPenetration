@@ -36,7 +36,7 @@ import psycopg2
 from config.paths import get_project_paths
 
 from ..common import eps_conn_params, setup_logging
-from ..text_clean import match_from_raw, text_hash
+from ..text_clean import clean_description, text_hash, to_match
 from .anchors import ANCHOR_RULES_VERSION, match_all_versions
 from .dedup import ADMISSION_WHERE, MASTER_VERSION, SHARDS, _blocks, _h63
 
