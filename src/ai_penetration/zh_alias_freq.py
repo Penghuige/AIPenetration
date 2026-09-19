@@ -10,8 +10,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import re
-from hashlib import blake2b
 from pathlib import Path
 
 import ahocorasick
@@ -23,6 +21,7 @@ from config.paths import get_project_paths
 
 from .common import eps_connect, eps_conn_params, setup_logging
 from .load_guangdong import GD_SHARDS
+from .text_clean import match_from_raw, text_hash as canonical_text_hash
 
 logger = logging.getLogger("ai_penetration.zh_alias_freq")
 
@@ -31,40 +30,15 @@ FREQ_PROTOCOL_VERSION = "distinct_text_hash_v2_20260919"
 # 语料城市：交接口径下的字典发现语料（用户 2026-09-06 决策：仅广深）
 FREQ_CITIES = ("广州市", "深圳市")
 
-_WS_RE = re.compile(r"\s+")
-
-# 平台固定字典（2026-09-06 采样确认的基础值；未列入的字符串散列到 10~1023）
-_PLATFORM_FIXED: dict[str, int] = {
-    "其他": 0, "58同城": 1, "51Job": 2, "职友集": 3, "猎聘网": 4,
-    "智联招聘": 5, "BOSS直聘": 6, "拉勾网": 7, "百姓网": 8, "9120": 9,
-}
-
-
-def platform_id(platform: str) -> int:
-    """平台字符串 → 10bit 编号（固定字典优先，未知串散列到高位段）。"""
-    pid = _PLATFORM_FIXED.get((platform or "").strip())
-    if pid is not None:
-        return pid
-    return 10 + (int.from_bytes(
-        blake2b((platform or "").strip().encode("utf-8"), digest_size=2).digest(), "big"
-    ) % 1014)
-
-
 def normalize_desc(desc: str) -> str:
-    """规范化岗位描述：小写 + 删除全部空白（交接口径的规范化文本定义）。"""
-    return _WS_RE.sub("", (desc or "").lower())
+    """频数扫描与正式 matcher 共用同一 raw→clean→match 规范化链。"""
+    return match_from_raw(str(desc or ""))
 
 
 def text_key(desc: str, platform: str = "") -> int:
-    """规范化描述 → 64bit 文档键；platform 参数仅为旧调用兼容。"""
+    """§10.3.2 COUNT(DISTINCT text_hash) 使用正式 text_hash。"""
     del platform
-    return int.from_bytes(
-        blake2b(
-            normalize_desc(desc).encode("utf-8"),
-            digest_size=8,
-        ).digest(),
-        "big",
-    )
+    return canonical_text_hash(normalize_desc(desc))
 
 
 def load_zh_mixed_aliases() -> dict[str, tuple[str, str]]:
@@ -179,7 +153,8 @@ def scan_slice(table: str, b_start: int, b_end: int, tmp_dir: str) -> dict:
                 break
             for (desc,) in batch:
                 rows += 1
-                key = text_key(str(desc))
+                norm = normalize_desc(str(desc))
+                key = canonical_text_hash(norm)
                 if key in local_seen:
                     continue
                 local_seen.add(key)
