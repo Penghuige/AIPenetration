@@ -176,6 +176,7 @@ def build_union_lexicon(
     include_legacy: bool = True,
     legacy_terms: list[str] | None = None,
     aliases: list[tuple[str, str]] | None = None,
+    legacy_skill_ids: dict[str, str] | None = None,
 ) -> UnionLexicon:
     """构建 union 词表匹配器。
 
@@ -184,6 +185,8 @@ def build_union_lexicon(
         legacy_terms: 自建词表；None 时加载现行合并词典（6,872 词）。
         aliases: A 级 (alias, skill_id) 对；None 时从 ai_dict 读取（注入参数
             供离线单测）。
+        legacy_skill_ids: 可选的规范化 legacy key → 最终 formal_skill_id。
+            用于把经 §10.3.3 确认的别名直接映射回既有 A 级概念。
 
     Returns:
         UnionLexicon。
@@ -212,13 +215,25 @@ def build_union_lexicon(
             key = unicodedata.normalize("NFKC", term).lower()
             if len(key) < 2:
                 continue
+            target_sid = (
+                legacy_skill_ids.get(key)
+                if legacy_skill_ids is not None
+                else None
+            )
             if key in keys:
+                if target_sid and keys[key] != target_sid:
+                    raise RuntimeError(
+                        f"legacy 规范键 {key!r} 要求映射 {target_sid}，"
+                        f"但 A 级已映射 {keys[key]}"
+                    )
                 overlap.append(term)
-                continue  # A 级已覆盖（同形键），概念空间优先
-            keys[key] = LEGACY_PREFIX + key
+                continue
+            sid = target_sid or (LEGACY_PREFIX + key)
+            keys[key] = sid
             if term in _AMBIGUOUS_AI_TERMS:
-                homograph[keys[key]] = _AMBIGUOUS_AI_TERMS[term]
-            n_legacy += 1
+                homograph[sid] = _AMBIGUOUS_AI_TERMS[term]
+            if sid.startswith(LEGACY_PREFIX):
+                n_legacy += 1
 
     automaton = ahocorasick.Automaton()
     for key, sid in keys.items():
@@ -233,6 +248,48 @@ def build_union_lexicon(
         n_concepts=len(set(keys.values())), overlap_terms=tuple(overlap),
     )
 
+
+def load_formal_legacy_spec(grade_path) -> tuple[list[str], dict[str, str], dict[str, str]]:
+    """读取最终 §10 分级，返回正式 legacy 表面、概念映射与 tier。
+
+    final_grade=D 的候选不进入正式 matcher；A 表示 T2 已映射到既有 A 概念，
+    B/C 保持独立 formal_skill_id。返回映射键均为 NFKC+lower。
+    """
+    from pathlib import Path
+
+    import pandas as pd
+
+    frame = pd.read_csv(Path(grade_path), encoding="utf-8-sig")
+    required = {"term", "final_grade"}
+    missing = required - set(frame.columns)
+    if missing:
+        raise RuntimeError(
+            "最终分级文件缺字段: " + ", ".join(sorted(missing))
+        )
+    formal = frame[frame.final_grade.isin(["A", "B", "C"])].copy()
+    terms: list[str] = []
+    sid_by_key: dict[str, str] = {}
+    tier_by_sid: dict[str, str] = {}
+    for _, row in formal.iterrows():
+        term = str(row.term)
+        key = unicodedata.normalize("NFKC", term).lower()
+        sid = str(
+            row.get("formal_skill_id")
+            or row.get("mapped_existing_skill_id")
+            or row.get("skill_id")
+        )
+        if not sid or sid == "nan":
+            raise RuntimeError(f"正式词条 {term!r} 缺 formal_skill_id")
+        if key in sid_by_key and sid_by_key[key] != sid:
+            raise RuntimeError(
+                f"正式 legacy 键 {key!r} 映射多个概念: "
+                f"{sid_by_key[key]} vs {sid}"
+            )
+        sid_by_key[key] = sid
+        terms.append(term)
+        if str(row.final_grade) in {"B", "C"}:
+            tier_by_sid[sid] = str(row.final_grade)
+    return terms, sid_by_key, tier_by_sid
 
 def anchor_concept_ids(lex_terms: set[str]) -> dict[str, bool]:
     """（辅助）标记 legacy 空间供导出统计；A 级概念覆盖判断在导出层做。
