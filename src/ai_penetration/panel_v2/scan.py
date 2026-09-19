@@ -217,7 +217,8 @@ def _init_worker(npy_dir: str) -> None:
 
 
 def _flush_parts(out: Path, task: str, part: int,
-                 flags_buf: list, long_buf: list, firm_buf: list) -> None:
+                 flags_buf: list, long_buf: list, firm_buf: list,
+                 text_buf: list) -> None:
     """子批 buffer 即时写 zstd parquet 分区（指南 §4.1）。"""
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -250,6 +251,17 @@ def _flush_parts(out: Path, task: str, part: int,
             "span_verified": pa.array(cols[10], pa.int8()),
         }), out / "parts_long" / f"{task}_{part:04d}.parquet",
                        compression="zstd")
+    if text_buf:
+        cols = list(zip(*text_buf))
+        pq.write_table(pa.table({
+            "job_id": pa.array(cols[0], pa.int64()),
+            "year": pa.array(cols[1], pa.int32()),
+            "job_description_raw": pa.array(cols[2], pa.string()),
+            "job_description_clean": pa.array(cols[3], pa.string()),
+            "job_description_match": pa.array(cols[4], pa.string()),
+            "text_hash": pa.array(cols[5], pa.int64()),
+        }), out / "parts_text" / f"{task}_{part:04d}.parquet",
+                       compression="zstd")
     if firm_buf:
         cols = list(zip(*firm_buf))
         pq.write_table(pa.table({
@@ -274,7 +286,7 @@ def scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str) -> dict
             return stat
         logger.warning("切片 %s 完成戳不符（%s/%s/%s），清分片重扫", task,
                        stat.get("version"), stat.get("hi"), stat.get("rules"))
-        for d in ("parts_flags", "parts_long", "parts_firm"):
+        for d in ("parts_flags", "parts_long", "parts_firm", "parts_text"):
             for stale in (out / d).glob(f"{task}_*.parquet"):
                 stale.unlink()  # 防旧分片混入 merge（重扫部分失败留残）
         done.unlink()
@@ -289,6 +301,7 @@ def scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str) -> dict
     flags_buf: list = []
     long_buf: list = []
     firm_buf: list = []
+    text_buf: list = []
     n_pairs = 0
     try:
         with conn.cursor() as setup:
@@ -301,7 +314,7 @@ def scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str) -> dict
             "WHERE ctid >= '(%s,0)'::tid AND ctid < '(%s,0)'::tid "
             + ADMISSION_WHERE,  # 单源谓词（审计 D3：禁再手抄）
             (int(lo), int(hi)))
-        for d in ("parts_flags", "parts_long", "parts_firm"):
+        for d in ("parts_flags", "parts_long", "parts_firm", "parts_text"):
             (out / d).mkdir(parents=True, exist_ok=True)
         while True:
             batch = cur.fetchmany(50000)
@@ -318,7 +331,9 @@ def scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str) -> dict
                 if int(m["city"][idx]) != int(city_id):
                     noncanonical_copies += 1
                     continue
-                match_txt = match_from_raw(str(desc))
+                raw_txt = str(desc)
+                clean_txt = clean_description(raw_txt)
+                match_txt = to_match(clean_txt)
                 if text_hash(match_txt) != int(m["thash"][idx]):
                     noncanonical_copies += 1
                     continue
@@ -349,17 +364,19 @@ def scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str) -> dict
                         int(match_txt[match.start:match.end] == match.surface_form),
                     ))
                 firm_buf.append((job_id, yr, int(m["company"][idx])))
+                text_buf.append((job_id, yr, raw_txt, clean_txt, match_txt,
+                                 int(m["thash"][idx])))
                 n_pairs += len(matches)
                 if len(flags_buf) >= FLUSH_ROWS:
-                    _flush_parts(out, task, part, flags_buf, long_buf, firm_buf)
-                    flags_buf, long_buf, firm_buf = [], [], []
+                    _flush_parts(out, task, part, flags_buf, long_buf, firm_buf, text_buf)
+                    flags_buf, long_buf, firm_buf, text_buf = [], [], [], []
                     part += 1
             if len(flags_buf) >= FLUSH_ROWS:  # fetchmany 边界也检查
-                _flush_parts(out, task, part, flags_buf, long_buf, firm_buf)
-                flags_buf, long_buf, firm_buf = [], [], []
+                _flush_parts(out, task, part, flags_buf, long_buf, firm_buf, text_buf)
+                flags_buf, long_buf, firm_buf, text_buf = [], [], [], []
                 part += 1
         cur.close()
-        _flush_parts(out, task, part, flags_buf, long_buf, firm_buf)
+        _flush_parts(out, task, part, flags_buf, long_buf, firm_buf, text_buf)
     finally:
         conn.close()
     stat = {"task": task, "rows": n_rows, "canonical": n_canon,
