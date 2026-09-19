@@ -44,8 +44,8 @@ def load_inputs(rel_dir: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict
     order = np.argsort(jid_arr)
     job_ids = jid_arr[order]
     pos = np.searchsorted(job_ids, longs["job_id"].to_numpy())
-    assert np.all(job_ids[pos] == longs["job_id"].to_numpy()), \
-        "long 表存在 flag 表之外的 job_id"
+    if not np.all(job_ids[pos] == longs["job_id"].to_numpy()):
+        raise RuntimeError("long 表存在 flag 表之外的 job_id")
     flag_idx = {v: flags[f"anchor_{v}"].to_numpy()[order]
                 for v in ANCHOR_VERSIONS}
     return pos.astype(np.int64), longs["skill_code"].to_numpy(np.int32), \
@@ -123,21 +123,43 @@ def compute_counts(rel_dir: Path) -> pd.DataFrame:
 
 
 def verify_counts(counts: pd.DataFrame) -> None:
-    """§13.7 计数不变量（任一失败 raise）。"""
-    g = counts.groupby(["anchor_version", "window_type", "year", "skill_code"])
-    assert g.size().max() == 1, "同一 skill×窗口×锚点出现多行"
+    """§13.7 计数不变量；任何失败均显式阻断。"""
+    g = counts.groupby(
+        ["anchor_version", "window_type", "year", "skill_code"]
+    )
+    if int(g.size().max()) != 1:
+        raise RuntimeError("同一 skill×窗口×锚点出现多行")
     bad = counts[counts["n_ai_cooccur"] > counts["n_skill"]]
-    assert bad.empty, f"{len(bad)} 行分子>分母"
-    assert (counts["n_skill"] > 0).all(), "n_skill<=0"
+    if not bad.empty:
+        raise RuntimeError(f"{len(bad)} 行分子>分母")
+    if not (counts["n_skill"] > 0).all():
+        raise RuntimeError("n_skill<=0")
     for ver in ANCHOR_VERSIONS:
-        ann = counts[(counts.anchor_version == ver) & (counts.window_type == "annual")]
-        pool = counts[(counts.anchor_version == ver) & (counts.window_type == "pooled")]
+        ann = counts[
+            (counts.anchor_version == ver)
+            & (counts.window_type == "annual")
+        ]
+        pool = counts[
+            (counts.anchor_version == ver)
+            & (counts.window_type == "pooled")
+        ]
         a = ann.groupby("skill_code")[["n_skill", "n_ai_cooccur"]].sum()
         p = pool.set_index("skill_code")[["n_skill", "n_ai_cooccur"]]
-        joined = a.join(p, how="outer", lsuffix="_a", rsuffix="_p").fillna(0)
-        assert np.allclose(joined["n_skill_a"], joined["n_skill_p"]) and \
-            np.allclose(joined["n_ai_cooccur_a"], joined["n_ai_cooccur_p"]), \
-            f"pooled 年度加总不守恒 ({ver})"
+        joined = a.join(
+            p, how="outer", lsuffix="_a", rsuffix="_p"
+        ).fillna(0)
+        ok = (
+            np.array_equal(
+                joined["n_skill_a"].to_numpy(np.int64),
+                joined["n_skill_p"].to_numpy(np.int64),
+            )
+            and np.array_equal(
+                joined["n_ai_cooccur_a"].to_numpy(np.int64),
+                joined["n_ai_cooccur_p"].to_numpy(np.int64),
+            )
+        )
+        if not ok:
+            raise RuntimeError(f"pooled 年度加总不守恒 ({ver})")
     logger.info("§13.7 计数不变量全部通过")
 
 
