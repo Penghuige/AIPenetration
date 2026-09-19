@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import platform
 import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
+import importlib.metadata
 
 from config.paths import get_project_paths, load_config_yaml
 
@@ -110,6 +112,21 @@ def _records(
     return names, hashes, rows
 
 
+def environment_versions() -> dict[str, str]:
+    """记录会影响正式计算的解释器和关键依赖版本。"""
+    packages = ["numpy", "pandas", "pyarrow", "scipy", "psycopg2-binary", "PyYAML"]
+    out = {
+        "python": platform.python_version(),
+        "implementation": platform.python_implementation(),
+    }
+    for name in packages:
+        try:
+            out[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            out[name] = "NOT_INSTALLED"
+    return out
+
+
 def write_run_manifest(
     release_dir: Path,
     *,
@@ -145,6 +162,7 @@ def write_run_manifest(
         "finished_at": datetime.now().isoformat(timespec="seconds"),
         "git_commit_or_code_hash": code_revision(root),
         "code_tree_sha256": _code_fingerprint(root),
+        "environment_versions": environment_versions(),
         "input_file_paths": inp,
         "input_file_sha256": inp_sha,
         "input_row_counts": inp_rows,
