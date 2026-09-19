@@ -315,8 +315,14 @@ def apply_semantic_review_to_grade(
 
         final = str(row.grade)
         reasons: list[str] = []
-        if r2.get("s") is False:
-            reasons.append("t2_not_skill")
+        if r2.get("s") is not True:
+            reasons.append("t2_skill_not_confirmed")
+        valid_types = {
+            "method", "tool", "software", "model",
+            "framework", "data", "language", "other",
+        }
+        if r2.get("s") is True and r2.get("c") not in valid_types:
+            reasons.append("t2_type_missing_or_invalid")
         if c1 in NON_SKILL_CATS:
             reasons.append(f"t1_{c1}")
         if rel_idx == -2:
