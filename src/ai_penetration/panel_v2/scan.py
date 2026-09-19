@@ -178,6 +178,8 @@ def _flush_parts(out: Path, task: str, part: int,
             "anchor_cn_paper": pa.array(cols[3], pa.int8()),
             "anchor_babina": pa.array(cols[4], pa.int8()),
             "groups_main_bits": pa.array(cols[5], pa.int16()),
+            "matched_anchor_groups_main": pa.array(cols[6], pa.string()),
+            "matched_anchor_terms_main": pa.array(cols[7], pa.string()),
         }), out / "parts_flags" / f"{task}_{part:04d}.parquet")
     if long_buf:
         cols = list(zip(*long_buf))
@@ -185,6 +187,12 @@ def _flush_parts(out: Path, task: str, part: int,
             "job_id": pa.array(cols[0], pa.int64()),
             "year": pa.array(cols[1], pa.int32()),
             "skill_code": pa.array(cols[2], pa.int32()),
+            "surface_form": pa.array(cols[3], pa.string()),
+            "start": pa.array(cols[4], pa.int32()),
+            "end": pa.array(cols[5], pa.int32()),
+            "mention_count": pa.array(cols[6], pa.int32()),
+            "match_method": pa.array(cols[7], pa.string()),
+            "ambiguity_flag": pa.array(cols[8], pa.int8()),
         }), out / "parts_long" / f"{task}_{part:04d}.parquet")
     if firm_buf:
         cols = list(zip(*firm_buf))
@@ -204,7 +212,8 @@ def scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str) -> dict
         stat = json.loads(done.read_text(encoding="utf-8"))
         # 三校验（审计 D2：--slices 变化时同名任务范围不同，旧"完成"不可信）
         if (stat.get("version") == MASTER_VERSION and stat.get("hi") == hi
-                and stat.get("rules") == ANCHOR_RULES_VERSION):
+                and stat.get("rules") == ANCHOR_RULES_VERSION
+                and stat.get("scan_version") == SCAN_VERSION):
             return stat
         logger.warning("切片 %s 完成戳不符（%s/%s/%s），清分片重扫", task,
                        stat.get("version"), stat.get("hi"), stat.get("rules"))
@@ -219,6 +228,7 @@ def scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str) -> dict
     conn = psycopg2.connect(**eps_conn_params())
     n_rows = n_canon = part = 0
     dup_hits = 0
+    canonical_text_mismatch = 0
     hit_seen: set[int] = set()  # raw 同 (plat,city,rid) 真重复行只识别一次（§6.2.1.1）
     flags_buf: list = []
     long_buf: list = []
@@ -247,6 +257,10 @@ def scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str) -> dict
                 idx = int(np.searchsorted(keys, k))
                 if idx >= keys.size or int(keys[idx]) != k:
                     continue
+                match_txt = match_from_raw(str(desc))
+                if text_hash(match_txt) != int(m["thash"][idx]):
+                    canonical_text_mismatch += 1
+                    continue
                 if k in hit_seen:
                     dup_hits += 1
                     continue
@@ -254,18 +268,35 @@ def scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str) -> dict
                 n_canon += 1
                 job_id = int(m["job_id"][idx])
                 yr = int(m["year"][idx])
-                match_txt = match_from_raw(str(desc))
                 hits = match_all_versions(match_txt)
                 bits = 0
                 for g in hits["main"].groups:
                     bits |= GROUP_BITS[g]
-                codes = sorted(sid2code[s] for s in lex.extract(match_txt))
-                flags_buf.append((job_id, yr, hits["main"].flag,
-                                  hits["cn_paper"].flag, hits["babina"].flag,
-                                  bits))
-                long_buf.extend((job_id, yr, c) for c in codes)
+                skill_hits = lex.extract_matches(match_txt)
+                skill_hits.sort(key=lambda h: (sid2code[h.skill_id], h.start, h.end))
+                flags_buf.append((
+                    job_id, yr, hits["main"].flag,
+                    hits["cn_paper"].flag, hits["babina"].flag, bits,
+                    "|".join(hits["main"].groups),
+                    "|".join(hits["main"].terms),
+                ))
+                long_buf.extend(
+                    (
+                        job_id,
+                        yr,
+                        sid2code[h.skill_id],
+                        h.surface_form,
+                        h.start,
+                        h.end,
+                        h.mention_count,
+                        "legacy_exact" if h.skill_id.startswith("legacy:")
+                        else "active_alias",
+                        int(h.skill_id in lex.homograph),
+                    )
+                    for h in skill_hits
+                )
                 firm_buf.append((job_id, yr, int(m["company"][idx])))
-                n_pairs += len(codes)
+                n_pairs += len(skill_hits)
                 if len(flags_buf) >= FLUSH_ROWS:
                     _flush_parts(out, task, part, flags_buf, long_buf, firm_buf)
                     flags_buf, long_buf, firm_buf = [], [], []
@@ -278,10 +309,19 @@ def scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str) -> dict
         _flush_parts(out, task, part, flags_buf, long_buf, firm_buf)
     finally:
         conn.close()
-    stat = {"task": task, "rows": n_rows, "canonical": n_canon,
-            "skill_pairs": n_pairs, "dup_hits": dup_hits,
-            "version": MASTER_VERSION, "lo": int(lo), "hi": int(hi),
-            "rules": ANCHOR_RULES_VERSION}
+    stat = {
+        "task": task,
+        "rows": n_rows,
+        "canonical": n_canon,
+        "skill_pairs": n_pairs,
+        "dup_hits": dup_hits,
+        "canonical_text_mismatch": canonical_text_mismatch,
+        "version": MASTER_VERSION,
+        "scan_version": SCAN_VERSION,
+        "lo": int(lo),
+        "hi": int(hi),
+        "rules": ANCHOR_RULES_VERSION,
+    }
     tmp = out / f".{task}.done.tmp"
     tmp.write_text(json.dumps(stat), encoding="utf-8")
     tmp.rename(done)
