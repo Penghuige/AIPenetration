@@ -153,6 +153,18 @@ def run(rel_dir: Path, bench: bool = False) -> None:
     longs = pq.read_table(rel_dir / "job_skill_long.parquet").to_pandas()
     firm = pq.read_table(rel_dir / "job_firm.parquet").to_pandas()
     rel = pq.read_table(rel_dir / "skill_ai_relevance.parquet").to_pandas()
+    if "dictionary_version" in rel.columns:
+        versions = {
+            str(v) for v in rel.dictionary_version.dropna().unique()
+            if str(v).strip()
+        }
+        if len(versions) != 1:
+            raise RuntimeError(
+                f"skill_ai_relevance dictionary_version 非唯一: {sorted(versions)}"
+            )
+        dictionary_version = next(iter(versions))
+    else:
+        dictionary_version = "unspecified"
 
     jobs = np.sort(flags.job_id.to_numpy())
     if bench:
@@ -229,6 +241,7 @@ def run(rel_dir: Path, bench: bool = False) -> None:
                         "anchor_version": ver, "window_type": win,
                         "score_type": st, "ai_score": cov,
                         "matched_skill_count": matched,
+                        "dictionary_version": dictionary_version,
                         "weighted_skill_count": weighted.astype(np.int32),
                         "score_skill_coverage": np.divide(
                             weighted, matched, out=np.zeros(n_jobs),
