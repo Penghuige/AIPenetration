@@ -46,6 +46,10 @@ def validate_frame(df: pd.DataFrame) -> None:
         )
     if df.job_id.duplicated().any():
         raise ValueError("discovery frame job_id 不唯一")
+    if df[["platform", "text_hash"]].duplicated().any():
+        raise ValueError(
+            "discovery frame 必须是 §6.2.0 DISTINCT(platform,text_hash) 语料"
+        )
     if df.text_hash.isna().any():
         raise ValueError("discovery frame text_hash 缺失")
     if (df.description.astype(str).str.len() < 10).any():
