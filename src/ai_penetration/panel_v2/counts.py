@@ -43,8 +43,10 @@ def load_inputs(rel_dir: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict
     jid_arr = flags["job_id"].to_numpy()
     order = np.argsort(jid_arr)
     job_ids = jid_arr[order]
-    pos = np.searchsorted(job_ids, longs["job_id"].to_numpy())
-    if not np.all(job_ids[pos] == longs["job_id"].to_numpy()):
+    long_ids = longs["job_id"].to_numpy()
+    pos = np.searchsorted(job_ids, long_ids)
+    valid = pos < len(job_ids)
+    if not valid.all() or not np.all(job_ids[pos[valid]] == long_ids[valid]):
         raise RuntimeError("long 表存在 flag 表之外的 job_id")
     flag_idx = {v: flags[f"anchor_{v}"].to_numpy()[order]
                 for v in ANCHOR_VERSIONS}
@@ -60,7 +62,7 @@ def compute_counts(rel_dir: Path) -> pd.DataFrame:
     # 不是"岗位×技能×年"——键里根本没有 skill）
     logger.info("计数基线: 岗位=%d 岗位-技能行=%d 岗位×年组合数=%d",
                 len(flags["main"]) if isinstance(flags, dict) else 0,
-                len(skill), len(np.unique(np.stack([job_idx, year]))))
+                len(skill), len(np.unique(np.stack([job_idx, year], axis=1), axis=0)))
     years = np.sort(np.unique(year))
     n_y = len(years)
     yidx = np.searchsorted(years, year)
