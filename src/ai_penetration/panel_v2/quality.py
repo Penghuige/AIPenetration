@@ -41,6 +41,8 @@ from .anchors import ANCHOR_RULES_VERSION
 
 logger = logging.getLogger("ai_penetration.panel_v2.quality")
 
+QUALITY_STATS_SCHEMA_VERSION = 1
+
 
 def _sha_stats(df: pd.DataFrame, cols: list[str]) -> str:
     """对指定关键列做稳定的全行校验和。
@@ -56,6 +58,23 @@ def _sha_stats(df: pd.DataFrame, cols: list[str]) -> str:
         hashed = pd.util.hash_pandas_object(df[use], index=False).to_numpy(np.uint64)
         h.update(np.ascontiguousarray(hashed).tobytes())
     return h.hexdigest()[:16]
+
+
+def _persist_quality_stats(stats_path: Path, stats: dict, fails: list[str]) -> Path:
+    """质量门通过后才推进 canonical baseline；失败运行只写旁路快照。"""
+    payload = dict(stats)
+    payload["_schema_version"] = QUALITY_STATS_SCHEMA_VERSION
+    encoded = json.dumps(payload, ensure_ascii=False, indent=1, default=str)
+    if fails:
+        failed = stats_path.with_name(
+            f"{stats_path.stem}.failed_{datetime.now():%Y%m%d_%H%M%S}{stats_path.suffix}"
+        )
+        failed.write_text(encoded, encoding="utf-8")
+        return failed
+    tmp = stats_path.with_name(f".{stats_path.name}.tmp")
+    tmp.write_text(encoded, encoding="utf-8")
+    tmp.replace(stats_path)
+    return stats_path
 
 
 def _rerun_drift(prev: dict, stats: dict) -> list[str]:
@@ -327,7 +346,12 @@ def run(rel: Path | None = None) -> None:
     (rel / "quality_control_report.md").write_text(
         "\n".join(report), encoding="utf-8"
     )
-    stats_path.write_text(json.dumps(stats, indent=1), encoding="utf-8")
+    persisted = _persist_quality_stats(stats_path, stats, fails)
+    if fails:
+        logger.error(
+            "质量门失败：canonical baseline 未更新；本次统计旁路保存到 %s",
+            persisted,
+        )
     logger.info("质量门: fail=%d warn=%d", len(fails), len(warns))
     if fails:
         raise SystemExit(2)
