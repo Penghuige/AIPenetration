@@ -34,7 +34,7 @@ from .counts import compute_counts
 from .anchors import anchor_dictionary_rows
 from .export_release import _meta, export_final_dictionaries, export_legacy_disposition
 from .lexicon import load_formal_legacy_spec
-from .relevance import _load_tier_map, compute_relevance, decode_skill_ids
+from .relevance import compute_relevance, decode_skill_ids
 from .reproducibility import write_run_manifest
 
 logger = logging.getLogger("ai_penetration.panel_v2.v2h")
@@ -80,16 +80,30 @@ def filter_longs(rel2: Path, codes: np.ndarray) -> None:
 
 
 
-def formal_tier_map(vocab_path: Path, grade_path: Path) -> np.ndarray:
-    """skill_code → 最终 A/B/C confidence tier。"""
-    tier_map = _load_tier_map(vocab_path)
-    _, _, tier_by_sid = load_formal_legacy_spec(grade_path)
+def formal_tier_map(
+    vocab_path: Path,
+    grade_path: Path,
+    a_concept_path: Path,
+) -> np.ndarray:
+    """skill_code → 最终 A/B/C confidence tier（仅冻结文件输入）。"""
     vocab = json.loads(vocab_path.read_text(encoding="utf-8"))
+    n_codes = max(vocab.values()) + 1
+    tier_map = np.full(n_codes, "", dtype=object)
+
+    a = pd.read_csv(a_concept_path, encoding="utf-8-sig")
+    if "skill_id" not in a.columns or "confidence_tier" not in a.columns:
+        raise RuntimeError("A 级冻结 concept 文件缺 skill_id/confidence_tier")
+    for sid, tier in zip(a.skill_id.astype(str), a.confidence_tier):
+        if sid in vocab and not pd.isna(tier):
+            tier_map[int(vocab[sid])] = str(tier)
+
+    _, _, tier_by_sid = load_formal_legacy_spec(grade_path)
     for sid, tier in tier_by_sid.items():
         if sid in vocab:
             tier_map[int(vocab[sid])] = tier
+
     used = np.array(sorted(vocab.values()), dtype=np.int64)
-    missing = [int(c) for c in used if not str(tier_map[int(c)]).strip()]
+    missing = [int(code) for code in used if not str(tier_map[int(code)]).strip()]
     if missing:
         raise RuntimeError(
             f"正式词表有 {len(missing)} 个 skill_code 缺 confidence_tier，"
@@ -169,6 +183,14 @@ def main() -> None:
     rel2 = paths.output_dir / "release" / "panel_v2b"   # 扫描合并产物（输入）
     rel3 = paths.output_dir / "release" / "panel_v2h"   # 本代际发布（输出）
     rel3.mkdir(parents=True, exist_ok=True)
+    a_concept = (
+        paths.output_dir / "dictionary"
+        / "skill_concept_bilingual_a_frozen_v1.1.csv"
+    )
+    a_alias = (
+        paths.output_dir / "dictionary"
+        / "skill_alias_active_bilingual_a_frozen_v1.1.csv"
+    )
 
     # 1) 输入件从 v2b 移入 v2h（flag/long/firm 为规则 b 扫描产物）
     scan_inputs = ("job_anchor_flag.parquet", "job_skill_long.parquet",
@@ -187,7 +209,7 @@ def main() -> None:
     codes = np.array(sorted(vocab[s] for s in d_ids if s in vocab), np.int32)
     logger.info("formal scan 后残余 D 级码: %d", len(codes))
     filter_longs(rel3, codes)
-    tiers = formal_tier_map(vocab_path, gcsv)
+    tiers = formal_tier_map(vocab_path, gcsv, a_concept)
     enrich_job_skill_long(
         rel3 / "job_skill_long.parquet",
         vocab_path,
@@ -210,14 +232,6 @@ def main() -> None:
     quality.run(rel3)
 
     # 5) 装配：严格按 §18 从冻结 A 文件 + 最终语义分级重建词典。
-    a_concept = (
-        paths.output_dir / "dictionary"
-        / "skill_concept_bilingual_a_frozen_v1.1.csv"
-    )
-    a_alias = (
-        paths.output_dir / "dictionary"
-        / "skill_alias_active_bilingual_a_frozen_v1.1.csv"
-    )
     for source in (a_concept, a_alias, gcsv):
         if not source.exists():
             raise RuntimeError(f"正式发布输入缺失: {source}")
