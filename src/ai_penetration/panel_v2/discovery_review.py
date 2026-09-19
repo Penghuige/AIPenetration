@@ -431,12 +431,13 @@ def write_outputs(
     candidates = candidates.rename(columns={
         "df_unique_description": "sample_df_unique_description",
         "candidate_anchor_cooc": "sample_candidate_anchor_cooc",
+        "first_year": "sample_first_year",
     })
 
     full = pd.read_csv(full_freq_path, encoding="utf-8-sig")
     required_freq = {
         "match_key", "df_unique_text",
-        "main_anchor_unique_text", "candidate_anchor_cooc",
+        "main_anchor_unique_text", "candidate_anchor_cooc", "first_year",
     }
     missing = required_freq - set(full.columns)
     if missing:
@@ -453,7 +454,7 @@ def write_outputs(
     candidates = candidates.merge(
         full[[
             "term", "df_unique_description",
-            "main_anchor_unique_text", "candidate_anchor_cooc",
+            "main_anchor_unique_text", "candidate_anchor_cooc", "first_year",
         ]],
         on="term",
         how="left",
