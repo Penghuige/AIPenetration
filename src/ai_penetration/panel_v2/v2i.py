@@ -45,7 +45,7 @@ from .reproducibility import sha256_file, write_run_manifest
 logger = logging.getLogger("ai_penetration.panel_v2.v2i")
 
 
-LEX_VERSION = "bilingual_a_frozen_v1.1+governed_v1.4"
+LEX_VERSION = "bilingual_a_frozen_v1.1+governed_v1.5"
 
 
 def require_handoff_manifests(paths) -> list[Path]:
@@ -55,13 +55,22 @@ def require_handoff_manifests(paths) -> list[Path]:
         paths.report_dir / "model_benchmark_technical_manifest_v1.json",
         paths.report_dir / "model_benchmark_prerun_manifest_v1.json",
         paths.output_dir / "dictionary" / "formal_discovery_manifest_v1.json",
+        paths.output_dir / "llm_review" / "formal_discovery_v1" / "extraction_manifest.json",
+        paths.output_dir / "dictionary" / "formal_discovery_review_manifest_v1.json",
         paths.output_dir / "dictionary" / "skill_legacy_governance_manifest_v3.json",
     ]
     for path in required:
         if not path.exists():
             raise RuntimeError(f"缺少原始交接必需 manifest: {path}")
         payload = json.loads(path.read_text(encoding="utf-8"))
-        expected = "complete" if path.name == "skill_legacy_governance_manifest_v3.json" else "formal_pass"
+        expected = (
+            "complete"
+            if path.name in {
+                "skill_legacy_governance_manifest_v3.json",
+                "formal_discovery_review_manifest_v1.json",
+            }
+            else "formal_pass"
+        )
         if payload.get("status") != expected:
             raise RuntimeError(
                 f"上游 manifest 未通过: {path.name} status={payload.get('status')!r}"
@@ -168,7 +177,7 @@ def main() -> None:
     preflight_files += [
         frozen_concepts,
         frozen_aliases,
-        paths.output_dir / "dictionary" / "skill_legacy_graded_BCD_v3.csv",
+        paths.output_dir / "dictionary" / "skill_governed_ABCD_v4.csv",
         paths.output_dir / "panel_v2" / "pass2_handoff_scan" / "skill_vocab.json",
     ]
     missing_preflight = [str(p) for p in preflight_files if not p.exists()]
@@ -198,10 +207,10 @@ def main() -> None:
         shutil.copy2(rel2 / f, rel3 / f)
 
     # 2) v1.3 D 级过滤
-    gcsv = paths.output_dir / "dictionary" / "skill_legacy_graded_BCD_v3.csv"
-    governance_manifest = paths.output_dir / "dictionary" / "skill_legacy_governance_manifest_v3.json"
+    gcsv = paths.output_dir / "dictionary" / "skill_governed_ABCD_v4.csv"
+    governance_manifest = paths.output_dir / "dictionary" / "formal_discovery_review_manifest_v1.json"
     if not governance_manifest.exists():
-        raise RuntimeError("缺少 T1/T2 治理 provenance manifest；请重新运行 lexicon_llm merge")
+        raise RuntimeError("缺少 formal discovery review provenance manifest")
     grade = pd.read_csv(gcsv, encoding="utf-8-sig")
     discovery_manifest = json.loads(
         (paths.output_dir / "dictionary" / "formal_discovery_manifest_v1.json")
@@ -210,7 +219,7 @@ def main() -> None:
     if discovery_manifest.get("governance_sha256") != sha256_file(gcsv):
         raise RuntimeError(
             "formal discovery manifest 绑定的治理表与当前 "
-            "skill_legacy_graded_BCD_v3.csv 不一致"
+            "skill_governed_ABCD_v4.csv 不一致"
         )
     pass2b = paths.output_dir / "panel_v2" / "pass2_handoff_scan"
     vocab_path = pass2b / "skill_vocab.json"
@@ -293,7 +302,7 @@ def main() -> None:
         ("skill_concept_v1.parquet", "skill_id", "governance.py(A/B/C formal)"),
         ("skill_alias_v1.parquet", "alias_id", "governance.py(A/B/C aliases)"),
         ("skill_candidate_d_v1.parquet", "term", "governance.py(D only)"),
-        ("skill_legacy_graded_BCD_v3.csv", "term",
+        ("skill_governed_ABCD_v4.csv", "term",
          "panel_v2/lexicon_llm.py(T1/T2 concept mapping)"),
         ("skill_legacy_governance_manifest_v3.json", "-",
          "panel_v2/lexicon_llm.py(provenance)"),
