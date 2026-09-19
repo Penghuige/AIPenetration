@@ -63,7 +63,7 @@ def require_handoff_manifests(paths) -> list[Path]:
         paths.output_dir / "dictionary" / "formal_discovery_manifest_v1.json",
         paths.output_dir / "llm_review" / "formal_discovery_v1" / "extraction_manifest.json",
         paths.output_dir / "dictionary" / "formal_discovery_review_manifest_v1.json",
-        paths.output_dir / "dictionary" / "skill_legacy_governance_manifest_v3.json",
+        paths.output_dir / "dictionary" / "formal_discovery_review_manifest_v1.json",
     ]
     for path in required:
         if not path.exists():
@@ -72,7 +72,7 @@ def require_handoff_manifests(paths) -> list[Path]:
         expected = (
             "complete"
             if path.name in {
-                "skill_legacy_governance_manifest_v3.json",
+                "formal_discovery_review_manifest_v1.json",
                 "formal_discovery_review_manifest_v1.json",
             }
             else "formal_pass"
