@@ -36,6 +36,7 @@ def _require_fixed_config() -> dict:
     required = [
         ("model", "repository"), ("model", "revision"),
         ("model", "quantization"), ("model", "tokenizer_version"),
+        ("model", "tokenizer_path"),
         ("runtime", "framework"), ("runtime", "framework_version"),
         ("runtime", "cuda_version"), ("runtime", "pytorch_version"),
     ]
