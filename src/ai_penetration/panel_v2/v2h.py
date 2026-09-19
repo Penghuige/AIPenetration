@@ -218,12 +218,13 @@ def main() -> None:
     )
 
     # 3) counts（新 flag）→ relevance
-    counts = compute_counts(rel3)
+    counts = decode_skill_ids(compute_counts(rel3), vocab_path)
     counts.to_parquet(rel3 / "skill_ai_counts.parquet", index=False)
     logger.info("skill_ai_counts: %d 行", len(counts))
     rel_df = decode_skill_ids(
         compute_relevance(counts, tiers), vocab_path
     )
+    rel_df["dictionary_version"] = LEX_VERSION
     rel_df.to_parquet(rel3 / "skill_ai_relevance.parquet", index=False)
     logger.info("skill_ai_relevance: %d 行", len(rel_df))
 
