@@ -315,6 +315,8 @@ def main() -> None:
          "panel_v2/scan.py(longest-match+span evidence)"),
         ("job_firm.parquet", "job_id", "panel_v2/scan.py"),
         ("job_text_clean.parquet", "job_id",
+         "panel_v2/scan.py(raw/clean/match/full stable id)"),
+        ("job_text_clean.parquet", "job_id",
          "panel_v2/scan.py(raw/clean/match §6.1)"),
         ("skill_ai_counts.parquet", "skill+ver+win+year", "panel_v2/counts.py"),
         ("skill_ai_relevance.parquet", "skill+ver+win+year", "panel_v2/relevance.py"),
