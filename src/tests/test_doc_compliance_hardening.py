@@ -21,6 +21,7 @@ from src.ai_penetration.panel_v2.scoring import THRESHOLDS, VERSIONS, WINDOWS
 def test_rerun_drift_blocks_key_stat_changes():
     """指南 §17.6.10 的关键统计漂移必须可被识别。"""
     prev = {
+        "checksum_schema_version": 2,
         "n_jobs": 100,
         "n_pairs": 200,
         "checksum_flags": "aaa",
