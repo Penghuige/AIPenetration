@@ -342,6 +342,7 @@ def apply_semantic_review_to_grade(
             final = "A"
 
         rec.update({
+            "v2e_grade": str(row.grade),
             "t1_cat": c1,
             "t2_skill": r2.get("s"),
             "t2_type": r2.get("c"),
