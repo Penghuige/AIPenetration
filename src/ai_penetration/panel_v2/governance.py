@@ -158,14 +158,39 @@ def materialize_formal_dictionary(
             rec["alias_normalized"] = key
         if "language" in rec:
             rec["language"] = "zh" if _CJK_RE.search(term) else "en"
+        if "alias_type" in rec:
+            rec["alias_type"] = "governed_surface"
+        if "source" in rec:
+            rec["source"] = "china_recruitment_governance"
+        is_ascii = all(ord(ch) < 128 for ch in key)
+        if "matching_rule" in rec:
+            rec["matching_rule"] = (
+                "ascii_alnum_boundary" if is_ascii else "substring_longest"
+            )
+        if "ambiguity_flag" in rec:
+            rec["ambiguity_flag"] = "1" if bool(row.get("t2_ambig", False)) else "0"
+        if "confidence_tier" in rec:
+            rec["confidence_tier"] = str(row.final_grade)
+        if "dictionary_version" in rec:
+            rec["dictionary_version"] = dictionary_version
         if "is_active" in rec:
             rec["is_active"] = "1"
+        if "primary_skill_id" in rec:
+            rec["primary_skill_id"] = sid
+        if "boundary_rule" in rec:
+            rec["boundary_rule"] = (
+                "ascii_alnum" if is_ascii else "none"
+            )
+        if "case_sensitive" in rec:
+            rec["case_sensitive"] = "0"
         if "activation_reason" in rec:
             rec["activation_reason"] = (
                 "mapped_existing_by_t2"
                 if str(row.final_grade) == "A"
                 else f"governed_grade_{row.final_grade}"
             )
+        if "translation_status" in rec:
+            rec["translation_status"] = "not_applicable_governed"
         alias_rows.append(rec)
         existing_alias[key] = sid
 
@@ -173,6 +198,11 @@ def materialize_formal_dictionary(
         aliases = pd.concat([aliases, pd.DataFrame(alias_rows)], ignore_index=True)
     if aliases.alias_id.astype(str).duplicated().any():
         raise ValueError("物化后 alias_id 重复")
+
+    if "dictionary_version" in concepts.columns:
+        concepts["dictionary_version"] = dictionary_version
+    if "dictionary_version" in aliases.columns:
+        aliases["dictionary_version"] = dictionary_version
 
     concept_ids = set(concepts.skill_id.astype(str))
     dangling = set(aliases.skill_id.astype(str)) - concept_ids
