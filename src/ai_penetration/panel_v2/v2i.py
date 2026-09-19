@@ -345,6 +345,8 @@ def main() -> None:
         ("job_ai_score.parquet", "job+ver+win+stype", "panel_v2/scoring.py"),
         ("job_ai_classification.parquet", "job_id", "panel_v2/scoring.py"),
         ("job_ai_score_loo.parquet", "job_id", "panel_v2/scoring.py(§14.3)"),
+        ("job_ai_score_robustness.parquet", "job_id",
+         "panel_v2/scoring.py(exclude-C/remove-anchor)"),
         ("quality_control_report.md", "-", "panel_v2/quality.py"),
     ]
     missing = [name for name, _, _ in specs if not (rel3 / name).exists()]
