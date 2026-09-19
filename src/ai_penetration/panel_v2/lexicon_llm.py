@@ -285,46 +285,6 @@ def run_t2(limit: int = 0, workers: int = 3) -> None:
     batch_review(items, SYS_T2, user, out, workers=workers)
 
 
-def _legacy_first_year() -> dict[str, int]:
-    """从当前旧 union 全量 annual counts 恢复 legacy 技能首次出现年份。
-
-    这里只借用“该 term 在哪个年份出现过”这一事实，不继承旧 B/C grade。
-    """
-    import pandas as pd
-    paths = get_project_paths()
-    counts_path = (
-        paths.output_dir / "release" / "panel_v2"
-        / "skill_ai_counts.parquet"
-    )
-    vocab_path = (
-        paths.output_dir / "panel_v2" / "pass2" / "skill_vocab.json"
-    )
-    if not counts_path.exists() or not vocab_path.exists():
-        raise RuntimeError(
-            "缺少历史全量 annual counts/vocab，无法为 B/C UUID 确定首次发现年份"
-        )
-    counts = pd.read_parquet(
-        counts_path,
-        columns=[
-            "skill_code", "anchor_version", "window_type",
-            "year", "n_skill",
-        ],
-    )
-    annual = counts[
-        (counts.anchor_version == "main")
-        & (counts.window_type == "annual")
-        & (counts.n_skill > 0)
-    ]
-    vocab = json.loads(vocab_path.read_text(encoding="utf-8"))
-    code2sid = {int(code): str(sid) for sid, code in vocab.items()}
-    out: dict[str, int] = {}
-    for code, group in annual.groupby("skill_code"):
-        sid = code2sid.get(int(code))
-        if sid and sid.startswith("legacy:"):
-            out[sid] = int(group.year.min())
-    return out
-
-
 # ------------------------------------------------------------------ 合并
 
 
@@ -427,7 +387,7 @@ def merge_final() -> None:
     )
     required_freq = {
         "match_key", "skill_id", "df_unique_text",
-        "candidate_anchor_cooc",
+        "candidate_anchor_cooc", "first_year",
     }
     missing_freq = required_freq - set(freq.columns)
     if missing_freq:
@@ -438,8 +398,6 @@ def merge_final() -> None:
     freq["term"] = freq.match_key.astype(str).map(_norm_key)
     if freq.term.duplicated().any():
         raise RuntimeError("legacy_df_freq_v1 term 不唯一")
-    first_year = _legacy_first_year()
-
     rows = []
     for row in freq.itertuples(index=False):
         term = str(row.term)
@@ -502,11 +460,11 @@ def merge_final() -> None:
                 "NEW_CONCEPT" if final in {"B", "C"} else "REJECT_D"
             )
             if final in {"B", "C"}:
-                fy = first_year.get(source_sid)
-                if fy is None:
+                fy = int(row.first_year)
+                if not 2014 <= fy <= 2025:
                     raise RuntimeError(
-                        f"正式 B/C 候选缺首次出现年份: "
-                        f"{term!r} sid={source_sid!r}"
+                        f"正式 B/C 候选缺有效全量 first_year: "
+                        f"{term!r} first_year={fy}"
                     )
                 final_skill_id = stable_bc_skill_id(term, fy)
         else:
@@ -514,7 +472,7 @@ def merge_final() -> None:
                 f"未知 T2 relation: term={term!r}, r={relation}"
             )
 
-        fy = first_year.get(source_sid, 9999)
+        fy = int(row.first_year)
         rows.append({
             "term": term,
             "source_skill_id": source_sid,
