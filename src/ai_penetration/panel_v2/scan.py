@@ -551,6 +551,8 @@ def main() -> None:
                         help="输出目录标签：pass2<tag> 与 release/panel_v2<tag>"
                              "（v2h 重扫用，避免覆盖 v2ac 基底）")
     args = parser.parse_args()
+    if args.workers > 8:
+        raise SystemExit("--workers 不得超过 8（大表 IO 纪律）")
     paths = get_project_paths()
     setup_logging(paths.log_dir / f"panel_v2_scan{args.out_tag}.log")
     out_dir = paths.output_dir / "panel_v2" / f"pass2{args.out_tag}"
@@ -590,14 +592,16 @@ def main() -> None:
     import pyarrow.parquet as pq
     n_flag = pq.ParquetFile(
         rel_out / "job_anchor_flag.parquet").metadata.num_rows
-    if n_flag != n_master:
+    n_text = pq.ParquetFile(
+        rel_out / "job_text_clean.parquet").metadata.num_rows
+    if n_flag != n_master or n_text != n_master:
         raise SystemExit(
-            f"守恒失败: 合并后 flag {n_flag} != master {n_master}"
+            f"守恒失败: flag={n_flag}, text={n_text}, master={n_master}"
             f"（Σcanonical={canon} 本地去重 {dup_hits}）")
     dur = (datetime.now() - t0).total_seconds() / 3600
     print(f"pass2 完成: canonical={canon:,}(dup hits {dup_hits:,}) "
           f"pairs={sum(s['skill_pairs'] for s in stats):,} "
-          f"flag={n_flag:,} 用时 {dur:.2f}h，守恒核验通过 ✓")
+          f"flag={n_flag:,} text={n_text:,} 用时 {dur:.2f}h，守恒核验通过 ✓")
 
 
 if __name__ == "__main__":
