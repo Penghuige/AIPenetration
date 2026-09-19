@@ -597,8 +597,11 @@ def build_master() -> tuple[int, int]:
                   ON e.city = s.city AND e.recruit_id = s.rid
             ), rid_rank AS (
                 SELECT *,
-                       row_number() OVER (PARTITION BY jid
-                                          ORDER BY city, day, thash) AS rn_rid,
+                       row_number() OVER (
+                           PARTITION BY jid
+                           ORDER BY comp DESC, dlen DESC, (day < 0) ASC,
+                                    day ASC, rid ASC, city ASC, thash ASC
+                       ) AS rn_rid,
                        count(*) OVER (PARTITION BY jid) - 1 AS rule1_dups
                 FROM joined
             )
@@ -642,8 +645,11 @@ def build_master() -> tuple[int, int]:
                    count(*) OVER w AS grp_n,
                    min(day) OVER w AS gmin,
                    max(day) OVER w AS gmax,
-                   row_number() OVER (PARTITION BY company_id, posh, city, thash, yr, seg
-                                      ORDER BY comp DESC, dlen DESC, day ASC, rid ASC, jid ASC) AS pick
+                   row_number() OVER (
+                       PARTITION BY company_id, posh, city, thash, yr, seg
+                       ORDER BY comp DESC, dlen DESC, (day < 0) ASC,
+                                day ASC, rid ASC, jid ASC
+                   ) AS pick
             FROM public.{TABLE_SEG}
             WINDOW w AS (PARTITION BY company_id, posh, city, thash, yr, seg)
         )
