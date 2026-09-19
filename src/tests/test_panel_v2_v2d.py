@@ -4,6 +4,7 @@ from __future__ import annotations
 import pandas as pd
 
 from src.ai_penetration.panel_v2.lexicon import LEGACY_PREFIX, build_union_lexicon
+from src.ai_penetration.panel_v2.lexicon_llm import apply_semantic_review_to_grade
 from src.ai_penetration.panel_v2.lexicon_v2d import (
     governance_frame,
     grade_legacy_frame,
@@ -70,3 +71,53 @@ def test_grade_legacy_frame_guide_rules():
     assert int(g.loc[g.term == "机器学习基础", "tautological"].iloc[0]) == 1
     # 确定性
     pd.testing.assert_frame_equal(g, grade_legacy_frame(keys, dfreq, cooc, fy))
+
+
+
+def test_semantic_review_closes_grade_and_mapping_contract():
+    grade = pd.DataFrame([
+        {
+            "term": "oldalias", "skill_id": "legacy:oldalias",
+            "df_freq": 120, "cand_cooc": 0.1, "first_year": 2015,
+            "tautological": 0, "grade": "B",
+        },
+        {
+            "term": "newmodel", "skill_id": "legacy:newmodel",
+            "df_freq": 7, "cand_cooc": 0.1, "first_year": 2023,
+            "tautological": 0, "grade": "C",
+        },
+        {
+            "term": "proxyonly", "skill_id": "legacy:proxyonly",
+            "df_freq": 7, "cand_cooc": 0.1, "first_year": 2023,
+            "tautological": 0, "grade": "C",
+        },
+        {
+            "term": "ambig", "skill_id": "legacy:ambig",
+            "df_freq": 100, "cand_cooc": 0.6, "first_year": 2020,
+            "tautological": 0, "grade": "B",
+        },
+    ])
+    t1 = {term: "skill" for term in grade.term}
+    t2 = {
+        "oldalias": {"s": True, "c": "tool", "n": False, "r": 0, "a": False},
+        "newmodel": {"s": True, "c": "model", "n": True, "r": -1, "a": False},
+        "proxyonly": {"s": True, "c": "model", "n": False, "r": -1, "a": False},
+        "ambig": {"s": True, "c": "other", "n": False, "r": -2, "a": True},
+    }
+    items = {
+        "oldalias": {"cand_skill_ids": ["uuid-existing"]},
+        "newmodel": {"cand_skill_ids": []},
+        "proxyonly": {"cand_skill_ids": []},
+        "ambig": {"cand_skill_ids": ["uuid-a", "uuid-b"]},
+    }
+    out = apply_semantic_review_to_grade(
+        grade, t1_cat=t1, t2_by_term=t2, t2_items_by_term=items
+    ).set_index("term")
+
+    assert out.loc["oldalias", "final_grade"] == "A"
+    assert out.loc["oldalias", "formal_skill_id"] == "uuid-existing"
+    assert out.loc["newmodel", "final_grade"] == "C"
+    assert out.loc["proxyonly", "final_grade"] == "D"
+    assert "c_new_tech_not_confirmed" in out.loc["proxyonly", "demote_reason"]
+    assert out.loc["ambig", "final_grade"] == "D"
+    assert "t2_ambiguous_mapping" in out.loc["ambig", "demote_reason"]
