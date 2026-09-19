@@ -16,10 +16,11 @@ from pathlib import Path
 import pandas as pd
 
 from config.paths import get_project_paths, load_config_yaml
-from src.model_platform.llm import create_llm_client
+from src.model_platform.llm import create_llm_client, extract_json_from_response
 from .governance import stable_bc_skill_id
 
-REVIEW_VERSION = "formal_discovery_review_v1"
+REVIEW_VERSION = "formal_discovery_review_v2_full_corpus"
+RETRIEVAL_VERSION = "char_bigram_jaccard_top10_v1"
 ALLOWED_TYPES = {
     "programming_language", "method_algorithm", "software_tool",
     "platform_framework_library", "data_database", "hardware_equipment",
@@ -151,6 +152,18 @@ def _load_registry(paths) -> tuple[pd.DataFrame, dict[str, set[str]], dict[str, 
     return pd.DataFrame(records), exact, tier
 
 
+def _registry_hash(registry: pd.DataFrame) -> str:
+    cols = [
+        "alias", "skill_id", "tier", "canonical_zh",
+        "canonical_en", "definition", "category",
+    ]
+    stable = registry[cols].fillna("").astype(str).sort_values(
+        ["skill_id", "alias", "canonical_zh"], kind="stable"
+    )
+    payload = stable.to_csv(index=False, lineterminator="\n").encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 class Retriever:
     def __init__(self, registry: pd.DataFrame):
         self.registry = registry.reset_index(drop=True)
@@ -210,22 +223,28 @@ SYSTEM = (
 def review(candidates: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     paths = get_project_paths()
     cfg = load_config_yaml("model_config_v1.yaml")
-    if str(cfg.get("model", {}).get("revision", "")).strip() in {"", "TO_BE_CONFIRMED"}:
+    revision = str(cfg.get("model", {}).get("revision", "")).strip()
+    if revision in {"", "TO_BE_CONFIRMED"}:
         raise RuntimeError("model_config_v1 尚未冻结 revision")
     registry, exact, tiers = _load_registry(paths)
+    registry_sha = _registry_hash(registry)
     retriever = Retriever(registry)
     client = create_llm_client()
+    prompt_sha = hashlib.sha256(SYSTEM.encode("utf-8")).hexdigest()
     cache_path = (
         paths.output_dir / "llm_review" / "formal_discovery_v1"
         / "candidate_review.jsonl"
     )
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    cached = {}
+    cached: dict[str, dict] = {}
     if cache_path.exists():
         for line in cache_path.read_text(encoding="utf-8").splitlines():
-            if line.strip():
-                rec = json.loads(line)
-                cached[str(rec["term"])] = rec
+            if not line.strip():
+                continue
+            rec = json.loads(line)
+            key = str(rec.get("cache_key", ""))
+            if key:
+                cached[key] = rec
 
     results = []
     with cache_path.open("a", encoding="utf-8") as fh:
@@ -239,6 +258,7 @@ def review(candidates: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
                     "final_skill_id": sid, "existing_tier": tiers.get(sid, "A"),
                     "skill_type": str(row.skill_type_suggestion),
                     "new_tech": False, "ambiguous": False, "top10": [],
+                    "raw_output": "", "cache_key": "",
                 }
             elif len(exact_ids) > 1:
                 rec = {
@@ -246,9 +266,8 @@ def review(candidates: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
                     "final_skill_id": "", "existing_tier": "",
                     "skill_type": str(row.skill_type_suggestion),
                     "new_tech": False, "ambiguous": True, "top10": [],
+                    "raw_output": "", "cache_key": "",
                 }
-            elif term in cached:
-                rec = cached[term]
             else:
                 top = retriever.top10(term)
                 payload = {
@@ -258,56 +277,96 @@ def review(candidates: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
                     "evidence_examples": json.loads(row.evidence_examples),
                     "candidates": top,
                 }
-                try:
-                    res = client.complete_json(
-                        system_prompt=SYSTEM,
-                        user_prompt=json.dumps(payload, ensure_ascii=False),
-                        temperature=float(cfg["generation"]["temperature"]),
-                        max_output_tokens=500,
-                        extra_payload={
-                            "seed": int(cfg["generation"]["seed"]),
-                            "chat_template_kwargs": {"enable_thinking": False},
-                        },
-                    )
-                except Exception as exc:
-                    raise RuntimeError(
-                        f"候选语义评审失败 term={term!r}: {exc}"
-                    ) from exc
-                if not isinstance(res, dict):
-                    raise RuntimeError(f"候选语义评审非对象 term={term!r}")
-                decision = str(res.get("decision", ""))
-                if decision not in {
-                    "MATCH_EXISTING", "NEW_CONCEPT", "AMBIGUOUS", "NOT_SKILL"
-                }:
-                    raise RuntimeError(f"未知 decision term={term!r}: {decision!r}")
-                stype = str(res.get("skill_type", row.skill_type_suggestion))
-                if stype not in ALLOWED_TYPES:
-                    raise RuntimeError(f"未知 skill_type term={term!r}: {stype!r}")
-                sid = ""
-                existing_tier = ""
-                if decision == "MATCH_EXISTING":
+                payload_text = json.dumps(
+                    payload, ensure_ascii=False, sort_keys=True
+                )
+                cache_key = hashlib.sha256(
+                    "|".join([
+                        term, revision, prompt_sha, registry_sha,
+                        RETRIEVAL_VERSION,
+                        hashlib.sha256(payload_text.encode("utf-8")).hexdigest(),
+                    ]).encode("utf-8")
+                ).hexdigest()
+                if cache_key in cached:
+                    rec = cached[cache_key]
+                else:
                     try:
-                        idx = int(res["index"])
-                    except (KeyError, TypeError, ValueError) as exc:
-                        raise RuntimeError(f"MATCH_EXISTING 缺 index: {term!r}") from exc
-                    if idx < 0 or idx >= len(top):
-                        raise RuntimeError(f"MATCH_EXISTING index 越界: {term!r}")
-                    sid = str(top[idx]["skill_id"])
-                    existing_tier = str(top[idx]["tier"])
-                rec = {
-                    "term": term, "decision": decision,
-                    "final_skill_id": sid, "existing_tier": existing_tier,
-                    "skill_type": stype,
-                    "new_tech": bool(res.get("new_tech", False)),
-                    "ambiguous": bool(res.get("ambiguous", decision == "AMBIGUOUS")),
-                    "top10": top,
-                }
-                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                fh.flush()
+                        raw = client.complete_text(
+                            system_prompt=SYSTEM,
+                            user_prompt=payload_text,
+                            temperature=float(cfg["generation"]["temperature"]),
+                            max_output_tokens=500,
+                            extra_payload={
+                                "seed": int(cfg["generation"]["seed"]),
+                                "chat_template_kwargs": {"enable_thinking": False},
+                            },
+                        )
+                        res = extract_json_from_response(raw)
+                    except Exception as exc:
+                        raise RuntimeError(
+                            f"候选语义评审失败 term={term!r}: {exc}"
+                        ) from exc
+                    if not isinstance(res, dict):
+                        raise RuntimeError(
+                            f"候选语义评审非对象 term={term!r}"
+                        )
+                    decision = str(res.get("decision", ""))
+                    if decision not in {
+                        "MATCH_EXISTING", "NEW_CONCEPT",
+                        "AMBIGUOUS", "NOT_SKILL",
+                    }:
+                        raise RuntimeError(
+                            f"未知 decision term={term!r}: {decision!r}"
+                        )
+                    stype = str(
+                        res.get("skill_type", row.skill_type_suggestion)
+                    )
+                    if stype not in ALLOWED_TYPES:
+                        raise RuntimeError(
+                            f"未知 skill_type term={term!r}: {stype!r}"
+                        )
+                    sid = ""
+                    existing_tier = ""
+                    if decision == "MATCH_EXISTING":
+                        try:
+                            idx = int(res["index"])
+                        except (KeyError, TypeError, ValueError) as exc:
+                            raise RuntimeError(
+                                f"MATCH_EXISTING 缺 index: {term!r}"
+                            ) from exc
+                        if idx < 0 or idx >= len(top):
+                            raise RuntimeError(
+                                f"MATCH_EXISTING index 越界: {term!r}"
+                            )
+                        sid = str(top[idx]["skill_id"])
+                        existing_tier = str(top[idx]["tier"])
+                    rec = {
+                        "cache_key": cache_key,
+                        "term": term,
+                        "decision": decision,
+                        "final_skill_id": sid,
+                        "existing_tier": existing_tier,
+                        "skill_type": stype,
+                        "new_tech": bool(res.get("new_tech", False)),
+                        "ambiguous": bool(
+                            res.get("ambiguous", decision == "AMBIGUOUS")
+                        ),
+                        "top10": top,
+                        "raw_output": raw,
+                        "registry_sha256": registry_sha,
+                        "review_prompt_sha256": prompt_sha,
+                        "retrieval_version": RETRIEVAL_VERSION,
+                    }
+                    fh.write(
+                        json.dumps(rec, ensure_ascii=False) + "\n"
+                    )
+                    fh.flush()
             results.append(rec)
 
     review_df = pd.DataFrame(results)
-    audit = candidates.merge(review_df, on="term", how="left", validate="one_to_one")
+    audit = candidates.merge(
+        review_df, on="term", how="left", validate="one_to_one"
+    )
     grades = []
     final_ids = []
     for row in audit.itertuples():
@@ -344,12 +403,71 @@ def review(candidates: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     return audit, review_df
 
 
-def write_outputs(mentions_path: Path) -> tuple[Path, Path]:
+def prepare_candidates(mentions_path: Path) -> tuple[Path, Path]:
+    """先聚合 Qwen 表面形式，供全量 legacy_freq 确定性扫描。"""
     paths = get_project_paths()
     mentions = pd.read_parquet(mentions_path)
     candidates = aggregate_mentions(mentions)
-    audit, _review = review(candidates)
+    out_dir = paths.output_dir / "dictionary"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    candidate_path = out_dir / "formal_discovery_candidates_v1.csv"
+    terms_path = out_dir / "formal_discovery_terms_v1.txt"
+    candidates.to_csv(candidate_path, index=False, encoding="utf-8-sig")
+    terms_path.write_text(
+        "\n".join(candidates.term.astype(str)) + "\n",
+        encoding="utf-8",
+    )
+    return candidate_path, terms_path
 
+
+def write_outputs(
+    mentions_path: Path,
+    full_freq_path: Path,
+) -> tuple[Path, Path]:
+    """用全量招聘语料频数重新定级，不使用抽样 mentions 次数替代 §10.3.2。"""
+    paths = get_project_paths()
+    mentions = pd.read_parquet(mentions_path)
+    candidates = aggregate_mentions(mentions)
+    candidates = candidates.rename(columns={
+        "df_unique_description": "sample_df_unique_description",
+        "candidate_anchor_cooc": "sample_candidate_anchor_cooc",
+    })
+
+    full = pd.read_csv(full_freq_path, encoding="utf-8-sig")
+    required_freq = {
+        "match_key", "df_unique_text",
+        "main_anchor_unique_text", "candidate_anchor_cooc",
+    }
+    missing = required_freq - set(full.columns)
+    if missing:
+        raise ValueError(
+            "全量候选频数文件缺列: " + ", ".join(sorted(missing))
+        )
+    full = full.rename(columns={
+        "match_key": "term",
+        "df_unique_text": "df_unique_description",
+    })
+    full["term"] = full.term.astype(str).map(_norm)
+    if full.term.duplicated().any():
+        raise ValueError("全量候选频数 term 不唯一")
+    candidates = candidates.merge(
+        full[[
+            "term", "df_unique_description",
+            "main_anchor_unique_text", "candidate_anchor_cooc",
+        ]],
+        on="term",
+        how="left",
+        validate="one_to_one",
+    )
+    if candidates.df_unique_description.isna().any():
+        missing_terms = candidates.loc[
+            candidates.df_unique_description.isna(), "term"
+        ].astype(str).head(10).tolist()
+        raise RuntimeError(
+            "候选未经过全量 §10.3.2 扫描: " + ", ".join(missing_terms)
+        )
+
+    audit, _review = review(candidates)
     out_dir = paths.output_dir / "dictionary"
     out_dir.mkdir(parents=True, exist_ok=True)
     audit_path = out_dir / "formal_discovery_candidate_audit_v1.csv"
@@ -385,7 +503,9 @@ def write_outputs(mentions_path: Path) -> tuple[Path, Path]:
     base = v3.copy()
     if "source" not in base.columns:
         base["source"] = "legacy_governance_v3"
-    v4 = pd.concat([base, pd.DataFrame(new_rows)], ignore_index=True, sort=False)
+    v4 = pd.concat(
+        [base, pd.DataFrame(new_rows)], ignore_index=True, sort=False
+    )
     if v4.term.astype(str).map(_norm).duplicated().any():
         dup = v4.loc[
             v4.term.astype(str).map(_norm).duplicated(), "term"
@@ -399,27 +519,61 @@ def write_outputs(mentions_path: Path) -> tuple[Path, Path]:
 
     v4_path = out_dir / "skill_governed_ABCD_v4.csv"
     v4.to_csv(v4_path, index=False, encoding="utf-8-sig")
+    review_cache = (
+        paths.output_dir / "llm_review" / "formal_discovery_v1"
+        / "candidate_review.jsonl"
+    )
     manifest = {
         "status": "complete",
         "review_version": REVIEW_VERSION,
-        "mentions_sha256": hashlib.sha256(mentions_path.read_bytes()).hexdigest(),
-        "candidate_audit_sha256": hashlib.sha256(audit_path.read_bytes()).hexdigest(),
-        "governance_sha256": hashlib.sha256(v4_path.read_bytes()).hexdigest(),
+        "retrieval_version": RETRIEVAL_VERSION,
+        "mentions_sha256": hashlib.sha256(
+            mentions_path.read_bytes()
+        ).hexdigest(),
+        "full_freq_sha256": hashlib.sha256(
+            full_freq_path.read_bytes()
+        ).hexdigest(),
+        "candidate_audit_sha256": hashlib.sha256(
+            audit_path.read_bytes()
+        ).hexdigest(),
+        "governance_sha256": hashlib.sha256(
+            v4_path.read_bytes()
+        ).hexdigest(),
+        "review_cache_sha256": (
+            hashlib.sha256(review_cache.read_bytes()).hexdigest()
+            if review_cache.exists() else None
+        ),
+        "review_prompt_sha256": hashlib.sha256(
+            SYSTEM.encode("utf-8")
+        ).hexdigest(),
         "n_candidates": len(audit),
         "n_new_terms": len(new_rows),
         "grade_counts": audit.final_grade.value_counts().to_dict(),
     }
     (out_dir / "formal_discovery_review_manifest_v1.json").write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
     )
     return audit_path, v4_path
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="正式候选聚合与概念治理")
+    ap = argparse.ArgumentParser(
+        description="正式候选聚合、全量频数接入与概念治理"
+    )
     ap.add_argument("--mentions", type=Path, required=True)
+    ap.add_argument("--prepare-only", action="store_true")
+    ap.add_argument("--full-freq", type=Path)
     args = ap.parse_args()
-    write_outputs(args.mentions)
+    if args.prepare_only:
+        prepare_candidates(args.mentions)
+        return
+    if args.full_freq is None:
+        raise SystemExit(
+            "正式分级必须提供 --full-freq；先 --prepare-only 生成 terms，"
+            "再用 legacy_freq --terms-file 对全量语料扫描"
+        )
+    write_outputs(args.mentions, args.full_freq)
 
 
 if __name__ == "__main__":
