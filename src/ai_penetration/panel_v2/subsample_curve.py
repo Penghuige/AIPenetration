@@ -39,7 +39,17 @@ def curve_frame(cls: pd.DataFrame, score: pd.DataFrame,
         DataFrame[year, n, zero_skill_rate, r005_all, r005_matched,
         hi030_all, hi030_matched]。
     """
-    df = cls.merge(score, on="job_id", how="inner")
+    if cls.job_id.duplicated().any() or score.job_id.duplicated().any():
+        raise ValueError("classification/score 的 job_id 必须各自唯一")
+    df = cls.merge(score, on="job_id", how="left", validate="one_to_one")
+    if len(df) != len(cls):
+        raise RuntimeError("子样本曲线 join 行数不守恒")
+    nonzero = df.zero_skill_override == 0
+    missing = nonzero & df.ai_score.isna()
+    if missing.any():
+        raise RuntimeError(
+            f"有技能岗位缺 main_annual_raw 得分: {int(missing.sum())} 行"
+        )
     df["hi030"] = (df.ai_score > 0.30).astype(float)
     rows = []
     for y, sub in df[df.year >= y_min].groupby("year"):
