@@ -130,11 +130,32 @@ def gate_checks(rel: Path) -> tuple[list[str], dict]:
     # §18 正式发布词典必须能独立解释正式长表。
     concept_path = rel / "skill_concept_v1.parquet"
     alias_path = rel / "skill_alias_v1.parquet"
+    source_path = rel / "source_skill_record_v1.parquet"
     if not concept_path.exists() or not alias_path.exists():
         fails.append("缺少 §18 正式 skill_concept/skill_alias 发布件")
     else:
         concepts = pq.read_table(concept_path).to_pandas()
         aliases = pq.read_table(alias_path).to_pandas()
+        required_concept_cols = {
+            "skill_id", "canonical_zh", "canonical_en", "skill_type",
+            "skill_category", "confidence_tier", "dictionary_version",
+            "valid_from", "valid_to",
+        }
+        missing_concept_cols = sorted(required_concept_cols - set(concepts.columns))
+        if missing_concept_cols:
+            fails.append(
+                "正式概念词典缺 §7.2 字段: " + ", ".join(missing_concept_cols)
+            )
+        required_alias_cols = {
+            "alias_id", "skill_id", "alias", "alias_normalized", "language",
+            "source", "matching_rule", "ambiguity_flag", "confidence_tier",
+            "dictionary_version",
+        }
+        missing_alias_cols = sorted(required_alias_cols - set(aliases.columns))
+        if missing_alias_cols:
+            fails.append(
+                "正式别名词典缺 §7.3 字段: " + ", ".join(missing_alias_cols)
+            )
         concept_ids = set(concepts.skill_id.astype(str))
         if concepts.skill_id.astype(str).duplicated().any():
             fails.append("正式词典 skill_id 不唯一")
@@ -151,6 +172,32 @@ def gate_checks(rel: Path) -> tuple[list[str], dict]:
                 )
             if longs[["job_id", "skill_id"]].duplicated().any():
                 fails.append("(job_id, skill_id) 不唯一")
+
+        if not source_path.exists():
+            fails.append("缺少 §7.4.1 source_skill_record_v1.parquet")
+        else:
+            source_records = pq.read_table(source_path).to_pandas()
+            required_source_cols = {
+                "source_name", "source_version", "source_skill_id",
+                "source_label", "source_description", "source_category",
+                "internal_skill_id", "mapping_type", "mapping_evidence",
+            }
+            missing_source_cols = sorted(
+                required_source_cols - set(source_records.columns)
+            )
+            if missing_source_cols:
+                fails.append(
+                    "source_skill_record 缺字段: "
+                    + ", ".join(missing_source_cols)
+                )
+            dangling_source = (
+                set(source_records.internal_skill_id.astype(str)) - concept_ids
+                if "internal_skill_id" in source_records.columns else set()
+            )
+            if dangling_source:
+                fails.append(
+                    f"source_skill_record 存在正式概念外引用（{len(dangling_source)}）"
+                )
 
     # 1 job_id 唯一 + 引用完整
     anchor_detail_cols = {"matched_anchor_groups_main", "matched_anchor_terms_main"}
