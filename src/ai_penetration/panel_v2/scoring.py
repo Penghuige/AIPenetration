@@ -162,13 +162,18 @@ def run(rel_dir: Path, bench: bool = False) -> None:
         firm = firm[firm.job_id.isin(keep_jobs)]
         jobs = keep_jobs
         logger.info("[bench] 截取 %d 岗位试算", len(jobs))
-    j_of = np.searchsorted(jobs, longs.job_id.to_numpy())
+    long_ids = longs.job_id.to_numpy()
+    j_of = np.searchsorted(jobs, long_ids)
+    valid_long = j_of < len(jobs)
+    if not valid_long.all() or not np.all(jobs[j_of[valid_long]] == long_ids[valid_long]):
+        raise RuntimeError("job_skill_long 含 classification/flags 外 job_id")
     s_of = longs.skill_code.to_numpy(np.int32)
     y_of = longs.year.to_numpy(np.int32)
     n_skill = int(rel.skill_code.max()) + 1
     years = np.sort(np.unique(flags.year.to_numpy()))
-    ymin = int(years[0])
-    yidx_pairs = y_of - ymin
+    yidx_pairs = np.searchsorted(years, y_of)
+    if not np.all(years[yidx_pairs] == y_of):
+        raise RuntimeError("job_skill_long 含 flags 年份集合外年份")
     # job → company 映射（firm 每 job 一行，按 job_id 对齐，防行序错配）
     company_of_job = np.zeros(len(jobs), np.int32)
     firm_job_arr = firm.job_id.to_numpy()
@@ -198,7 +203,7 @@ def run(rel_dir: Path, bench: bool = False) -> None:
         raise RuntimeError("留一 triple 键打包假设 yidx<16（防扩年后静默错配）")
     score_dir = rel_dir / "job_ai_score"
     score_dir.mkdir(parents=True, exist_ok=True)
-    cls = pd.DataFrame({"job_id": jobs, "year": job_year + ymin})
+    cls = pd.DataFrame({"job_id": jobs, "year": years[job_year]})
     n_jobs = len(jobs)
     for ver in VERSIONS:
         for win in WINDOWS:
@@ -266,7 +271,7 @@ def run(rel_dir: Path, bench: bool = False) -> None:
 
     loo = _job_loo_scores(j_of, s_of, yidx_pairs, company_of_job[j_of],
                           pair_anchored, unit_dense, n_y, len(jobs))
-    loo_frame = pd.DataFrame({"job_id": jobs, "year": job_year + ymin})
+    loo_frame = pd.DataFrame({"job_id": jobs, "year": years[job_year]})
     for win, (score, cov) in loo.items():
         loo_frame[f"loo_main_{win}_raw"] = score
         loo_frame[f"loo_main_{win}_coverage"] = cov
