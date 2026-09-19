@@ -17,6 +17,8 @@ from config.paths import get_project_paths
 from ..common import eps_conn_params
 from .dedup import SHARDS
 
+JOB_REQUIRED = {"recruit_id", "publish_time", "job_description", "position", "platform"}
+
 JOB_EXPECTED = {
     "recruit_id": "原始岗位编号",
     "publish_time": "发布日期",
@@ -84,9 +86,16 @@ def audit(snapshot_id: str):
                 "data_type": dtype, "nullable": nullable,
                 "expected_role": JOB_EXPECTED.get(name, ""),
             })
-        missing = sorted(set(JOB_EXPECTED) - col_names)
-        if missing:
-            blocking.append(job_table + " 缺字段: " + ", ".join(missing))
+        missing_required = sorted(JOB_REQUIRED - col_names)
+        if missing_required:
+            blocking.append(
+                job_table + " 缺主链必需字段: " + ", ".join(missing_required)
+            )
+        missing_optional = sorted((set(JOB_EXPECTED) - JOB_REQUIRED) - col_names)
+        if missing_optional:
+            warnings.append(
+                job_table + " 缺审计辅助字段: " + ", ".join(missing_optional)
+            )
 
         ecols = _columns(cur, ent_table)
         e_names = {x[0] for x in ecols}
