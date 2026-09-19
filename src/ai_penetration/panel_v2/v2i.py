@@ -199,7 +199,8 @@ def main() -> None:
             f"staging 已存在: {rel3}；使用 --resume 继续，或人工清理后重跑"
         )
     rel3.mkdir(parents=True, exist_ok=True)
-    if target.exists() and (target / "quality_stats.json").exists()             and not (rel3 / "quality_stats.json").exists():
+    if (target.exists() and (target / "quality_stats.json").exists()
+            and not (rel3 / "quality_stats.json").exists()):
         shutil.copy2(target / "quality_stats.json", rel3 / "quality_stats.json")
 
     # 1) 输入件从 handoff scan 移入 staging
@@ -303,9 +304,9 @@ def main() -> None:
         ("skill_alias_v1.parquet", "alias_id", "governance.py(A/B/C aliases)"),
         ("skill_candidate_d_v1.parquet", "term", "governance.py(D only)"),
         ("skill_governed_ABCD_v4.csv", "term",
-         "panel_v2/lexicon_llm.py(T1/T2 concept mapping)"),
-        ("skill_legacy_governance_manifest_v3.json", "-",
-         "panel_v2/lexicon_llm.py(provenance)"),
+         "panel_v2/discovery_review.py(v3 legacy + formal discovery)"),
+        ("formal_discovery_review_manifest_v1.json", "-",
+         "panel_v2/discovery_review.py(provenance)"),
         ("ai_anchor_dictionary_v1.csv", "anchor_version+keyword",
          "panel_v2/anchors.py(规则 20260909_b)"),
         ("job_anchor_flag.parquet", "job_id", "panel_v2/scan.py(canonical+terms)"),
