@@ -79,6 +79,30 @@ def check_invariants() -> tuple[list[str], list[str], list[str]]:
     notes: list[str] = []
     try:
         cur = conn.cursor()
+        # 0) 上一任交接的 170 批中文化必须先真正完成，才能称为 frozen。
+        cur.execute("""
+            SELECT count(*) FROM ai_dict.skill_concepts
+            WHERE translation_status IS NULL
+               OR translation_status = ''
+               OR translation_status = 'pending_codex_zh'
+        """)
+        n_pending = int(cur.fetchone()[0])
+        (ok if n_pending == 0 else bad).append(
+            f"正式概念无 pending_codex_zh/空翻译状态: {n_pending} 违例"
+        )
+        cur.execute("""
+            SELECT count(DISTINCT dictionary_version),
+                   count(*) FILTER (WHERE skill_id IS NULL OR skill_id = '')
+            FROM ai_dict.skill_concepts
+        """)
+        n_versions, empty_skill_id = cur.fetchone()
+        (ok if int(n_versions) == 1 else bad).append(
+            f"概念表 dictionary_version 单一: {int(n_versions)} 个版本"
+        )
+        (ok if int(empty_skill_id) == 0 else bad).append(
+            f"概念 skill_id 全部非空: {int(empty_skill_id)} 违例"
+        )
+
         # 1) 歧义别名不得为激活态（限 zh/mixed；en 来源别名按指南 §7.6.4 豁免
         #    中文频数限制，其歧义由来源侧 activation_reason=unique_source_label 管理）
         cur.execute("""
