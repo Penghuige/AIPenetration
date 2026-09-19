@@ -131,30 +131,40 @@ class UnionLexicon:
         return hits
 
 
-def _load_atier_aliases() -> list[tuple[str, str]]:
-    """读 A 级激活别名 (alias, skill_id)。
-
-    确定性保证（B3 审计修复）：同一 alias 多 skill_id 时取 min(skill_id)，
-    按 alias 排序返回——first-wins 结果跨进程/跨重跑稳定（实证 36 个
-    碰撞键如 abap/ansible/cobol，若不定序会造成 skill_code 跨分片错位）。
-    """
+def _load_atier_alias_records() -> list[AliasRecord]:
+    """读 A 级激活别名，并按 primary_skill_id 解析多概念同形词。"""
     conn = psycopg2.connect(**eps_conn_params())
     try:
         cur = conn.cursor()
         cur.execute("""
-            SELECT alias, min(skill_id) AS skill_id FROM ai_dict.skill_aliases
+            SELECT alias, skill_id, coalesce(primary_skill_id, ''),
+                   coalesce(ambiguity_flag, '0')
+            FROM ai_dict.skill_aliases
             WHERE is_active='1' AND alias IS NOT NULL AND length(trim(alias))>=2
-            GROUP BY alias ORDER BY alias
+            ORDER BY alias, skill_id
         """)
-        return [(r[0], r[1]) for r in cur.fetchall()]
+        rows = [
+            AliasRecord(
+                alias=str(alias), skill_id=str(skill_id),
+                primary_skill_id=str(primary or ""),
+                ambiguity_flag=1 if str(ambiguity) == "1" else 0,
+            )
+            for alias, skill_id, primary, ambiguity in cur.fetchall()
+        ]
+        return resolve_active_alias_records(rows)
     finally:
         conn.close()
+
+
+def _load_atier_aliases() -> list[tuple[str, str]]:
+    """兼容旧调用方的 (alias, skill_id) 视图；不再使用 min(skill_id) 裁决。"""
+    return [(r.alias, r.skill_id) for r in _load_atier_alias_records()]
 
 
 def build_union_lexicon(
     include_legacy: bool = True,
     legacy_terms: list[str] | None = None,
-    aliases: list[tuple[str, str]] | None = None,
+    aliases: list[tuple[str, str] | AliasRecord] | None = None,
 ) -> UnionLexicon:
     """构建 union 词表匹配器。
 
@@ -168,13 +178,25 @@ def build_union_lexicon(
         UnionLexicon。
     """
     if aliases is None:
-        aliases = _load_atier_aliases()
+        aliases = _load_atier_alias_records()
     keys: dict[str, str] = {}  # match_key -> skill_id（同键先入优先：A 级 uuid）
+    ambiguous_keys: set[str] = set()
     homograph: dict[str, re.Pattern] = {}
-    for alias, sid in aliases:
-        key = unicodedata.normalize("NFKC", alias).lower()
-        if key not in keys:
-            keys[key] = sid
+    for item in aliases:
+        if isinstance(item, AliasRecord):
+            alias, sid = item.alias, item.skill_id
+            ambiguity_flag = int(item.ambiguity_flag)
+        else:
+            alias, sid = item
+            ambiguity_flag = 0
+        key = _norm_key(alias)
+        if key in keys and keys[key] != sid:
+            raise RuntimeError(
+                f"规范化激活别名仍映射多个概念: {key!r} -> {keys[key]!r}/{sid!r}"
+            )
+        keys.setdefault(key, sid)
+        if ambiguity_flag:
+            ambiguous_keys.add(key)
         if alias in _AMBIGUOUS_AI_TERMS:
             homograph[sid] = _AMBIGUOUS_AI_TERMS[alias]
 
@@ -205,7 +227,8 @@ def build_union_lexicon(
                 n_atier, n_legacy, len(overlap), len(keys), len(homograph))
     return UnionLexicon(
         automaton=automaton, ascii_keys=ascii_keys, homograph=homograph,
-        keys_map=keys, n_atier=n_atier, n_legacy=n_legacy,
+        keys_map=keys, ambiguous_keys=frozenset(ambiguous_keys),
+        n_atier=n_atier, n_legacy=n_legacy,
         n_concepts=len(keys), overlap_terms=tuple(overlap),
     )
 
