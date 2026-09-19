@@ -57,7 +57,7 @@ def require_handoff_manifests(paths) -> list[Path]:
     required = [
         paths.output_dir / "data_audit" / "source_db_manifest_v1.json",
         paths.output_dir / "dictionary" / "external_translation_completion_manifest_v1.json",
-        paths.report_dir / "model_benchmark_technical_manifest_v1.json",
+        paths.report_dir / "model_selection_manifest_v1.json",
         paths.report_dir / "model_benchmark_prerun_manifest_v1.json",
         paths.output_dir / "dictionary" / "formal_discovery_manifest_v1.json",
         paths.output_dir / "llm_review" / "formal_discovery_v1" / "extraction_manifest.json",
