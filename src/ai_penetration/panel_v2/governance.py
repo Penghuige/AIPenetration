@@ -76,6 +76,97 @@ def _alias_id(skill_id: str, term: str) -> str:
     return "gov-" + digest
 
 
+def materialize_source_skill_records(
+    base_concepts: pd.DataFrame,
+    dictionary_version: str,
+) -> pd.DataFrame:
+    """从冻结 A 级概念中的显式来源字段物化 §7.4.1 来源映射表。
+
+    只使用原文件已经存在的来源标识，不猜测缺失 release/version。
+    """
+    required = {
+        "skill_id", "canonical_zh", "canonical_en", "skill_type",
+        "source_primary", "source_version_primary", "source_id_primary",
+        "esco_uri", "onet_element_ids",
+    }
+    missing = required - set(base_concepts.columns)
+    if missing:
+        raise ValueError("冻结概念表缺来源字段: " + ", ".join(sorted(missing)))
+
+    rows: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    def add(
+        sid: str,
+        source_name: str,
+        source_version: str,
+        source_skill_id: str,
+        label: str,
+        description: str,
+        category: str,
+        mapping_type: str,
+        mapping_evidence: str,
+    ) -> None:
+        source_name = str(source_name or "").strip()
+        source_skill_id = str(source_skill_id or "").strip()
+        if not source_name or not source_skill_id:
+            return
+        key = (source_name, source_skill_id, sid)
+        if key in seen:
+            return
+        seen.add(key)
+        rows.append({
+            "source_name": source_name,
+            "source_version": str(source_version or "UNKNOWN_LOCAL_SNAPSHOT"),
+            "source_skill_id": source_skill_id,
+            "source_label": label,
+            "source_description": description,
+            "source_category": category,
+            "internal_skill_id": sid,
+            "mapping_type": mapping_type,
+            "mapping_evidence": mapping_evidence,
+            "dictionary_version": dictionary_version,
+        })
+
+    for _, row in base_concepts.iterrows():
+        sid = str(row.skill_id)
+        label = str(row.get("canonical_en") or row.get("canonical_zh") or "")
+        desc = str(
+            row.get("definition_en")
+            or row.get("description_en")
+            or ""
+        )
+        cat = str(row.get("skill_type") or "")
+        add(
+            sid,
+            str(row.get("source_primary") or ""),
+            str(row.get("source_version_primary") or "UNKNOWN_LOCAL_SNAPSHOT"),
+            str(row.get("source_id_primary") or ""),
+            label, desc, cat,
+            "primary_source_record",
+            "frozen_concept.source_primary/source_id_primary",
+        )
+        add(
+            sid, "ESCO", str(row.get("source_version_primary") or "UNKNOWN_LOCAL_SNAPSHOT"),
+            str(row.get("esco_uri") or ""), label, desc, cat,
+            "source_crosswalk",
+            "frozen_concept.esco_uri",
+        )
+        add(
+            sid, "O*NET", "UNKNOWN_LOCAL_SNAPSHOT",
+            str(row.get("onet_element_ids") or ""), label, desc, cat,
+            "source_crosswalk",
+            "frozen_concept.onet_element_ids (preserved verbatim)",
+        )
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        raise ValueError("无法从冻结概念表物化任何 source_skill_record")
+    if out[["source_name", "source_skill_id", "internal_skill_id"]].duplicated().any():
+        raise ValueError("source_skill_record 主键重复")
+    return out.reset_index(drop=True)
+
+
 def materialize_formal_dictionary(
     base_concepts: pd.DataFrame,
     base_aliases: pd.DataFrame,
