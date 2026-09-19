@@ -17,7 +17,6 @@ import json
 import logging
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
-from hashlib import blake2b
 from pathlib import Path
 
 import numpy as np
@@ -26,8 +25,9 @@ import psycopg2
 from config.paths import get_project_paths
 
 from ..common import eps_conn_params, setup_logging
-from ..zh_alias_freq import FREQ_PROTOCOL_VERSION, aggregate_counts, text_key
-from .anchors import normalize_desc
+from ..zh_alias_freq import FREQ_PROTOCOL_VERSION, aggregate_counts
+from ..text_clean import match_from_raw, text_hash
+from .anchors import match_all_versions
 from .dedup import SHARDS, _blocks
 from .lexicon import LEGACY_PREFIX, _is_ascii_alnum, build_union_lexicon
 
@@ -147,8 +147,8 @@ def scan_slice(table: str, b_start: int, b_end: int, tmp_dir: str,
                 rows += 1
                 # 匹配文本与生产 matcher 同义；文档频数键严格按指南 §10.3.2
                 # 使用纯规范化 text_hash，不再把 platform 拼入 distinct key。
-                norm = normalize_desc(str(desc))
-                key = text_key(str(desc))
+                norm = match_from_raw(str(desc))
+                key = text_hash(norm)
                 for end, k in auto.iter(norm):
                     if k in ascii_keys:
                         s0 = end - len(k) + 1
@@ -210,7 +210,8 @@ def main() -> None:
     args = parser.parse_args()
     paths = get_project_paths()
     setup_logging(paths.log_dir / f"panel_v2_{args.tag}.log")
-    assert args.workers <= 8, "HDD 纪律"
+    if args.workers > 8:
+        raise SystemExit("HDD 纪律：workers 不得超过 8")
     if args.terms_file:
         import unicodedata
         keys = [unicodedata.normalize("NFKC", ln.strip()).lower()
