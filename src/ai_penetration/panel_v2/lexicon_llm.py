@@ -218,10 +218,21 @@ def candidates_t2() -> list[dict]:
     paths = get_project_paths()
     lg = pd.read_csv(paths.output_dir / "dictionary" / "legacy_df_freq_v1.csv",
                      encoding="utf-8-sig")
-    ali = pd.read_parquet(paths.output_dir / "release" / "panel_v2"
-                          / "skill_alias_v1.parquet")
-    aliases = sorted({_norm_key(a) for a in ali.alias.astype(str)
-                      if len(_norm_key(str(a))) >= 2})
+    # 候选顺序仍由规范化激活别名字符串决定，保持与既有 T2 JSONL 的
+    # index 语义兼容；同时绑定其正式 primary_skill_id，供 merge 真正归一化。
+    from .lexicon import _load_atier_aliases
+    resolved_aliases = _load_atier_aliases()
+    alias_to_sid: dict[str, str] = {}
+    for alias, sid in resolved_aliases:
+        key = _norm_key(alias)
+        if len(key) < 2:
+            continue
+        if key in alias_to_sid and alias_to_sid[key] != sid:
+            raise RuntimeError(
+                f"A 级规范化别名 {key!r} 仍映射多个 primary skill"
+            )
+        alias_to_sid[key] = sid
+    aliases = sorted(alias_to_sid)
     aidx = _bigram_index(aliases)
     out = []
     for i, key in enumerate(lg.match_key):
@@ -233,9 +244,13 @@ def candidates_t2() -> list[dict]:
                 score[j] = score.get(j, 0) + 1
         top = [aliases[j] for j, _ in
                sorted(score.items(), key=lambda kv: (-kv[1], kv[0]))[:10]]
-        out.append({"id": i, "term": key,
-                    "df": int(lg.df_unique_text.iloc[i]),
-                    "cand": top})
+        out.append({
+            "id": i,
+            "term": key,
+            "df": int(lg.df_unique_text.iloc[i]),
+            "cand": top,
+            "cand_skill_ids": [alias_to_sid[t] for t in top],
+        })
     return out
 
 
@@ -264,6 +279,84 @@ def run_t2(limit: int = 0, workers: int = 3) -> None:
 NON_SKILL_CATS = {"task_fragment", "soft_trait", "edu_req", "exp_req",
                   "benefit", "job_title", "company", "goods_service", "other"}
 
+
+def apply_semantic_review_to_grade(
+    grade: "pd.DataFrame",
+    *,
+    t1_cat: dict[str, str],
+    t2_by_term: dict[str, dict],
+    t2_items_by_term: dict[str, dict],
+) -> "pd.DataFrame":
+    """把 §10.3.3 语义复核真正落实到 A/B/C/D 与概念映射。
+
+    T2 判非技能、T1 非技能类别、AMBIGUOUS 映射均降 D；仅靠
+    first_year>=2019 代理进入的低频 C 必须由 T2 new_tech=true 确认；
+    T2 明确映射到既有 A 级候选时，最终 grade=A 并复用正式 skill_id。
+    """
+    import pandas as pd
+
+    rows: list[dict] = []
+    for _, row in grade.iterrows():
+        rec = row.to_dict()
+        term = str(row.term)
+        r2 = t2_by_term.get(term, {})
+        item = t2_items_by_term.get(term, {})
+        c1 = t1_cat.get(term)
+        rel_idx = r2.get("r")
+        mapped_sid: str | None = None
+        if isinstance(rel_idx, int) and rel_idx >= 0:
+            cand_sids = list(item.get("cand_skill_ids") or [])
+            if rel_idx >= len(cand_sids):
+                raise RuntimeError(
+                    f"T2 映射索引越界 term={term!r} r={rel_idx} "
+                    f"candidates={len(cand_sids)}"
+                )
+            mapped_sid = str(cand_sids[rel_idx])
+
+        final = str(row.grade)
+        reasons: list[str] = []
+        if r2.get("s") is False:
+            reasons.append("t2_not_skill")
+        if c1 in NON_SKILL_CATS:
+            reasons.append(f"t1_{c1}")
+        if rel_idx == -2:
+            reasons.append("t2_ambiguous_mapping")
+        taut = int(rec.get("tautological", rec.get("taut", 0)) or 0)
+        if r2.get("a") is True and taut == 1:
+            reasons.append("ambig_taut")
+
+        df_freq = int(rec.get("df_freq", 0) or 0)
+        cand_cooc = float(rec.get("cand_cooc", 0.0) or 0.0)
+        proxy_low_c = (
+            str(row.grade) == "C"
+            and df_freq < 10
+            and cand_cooc < 0.50
+        )
+        if proxy_low_c and r2.get("n") is not True:
+            reasons.append("c_new_tech_not_confirmed")
+
+        if reasons:
+            final = "D"
+            mapped_sid = None
+        elif mapped_sid:
+            final = "A"
+
+        rec.update({
+            "t1_cat": c1,
+            "t2_skill": r2.get("s"),
+            "t2_type": r2.get("c"),
+            "t2_new_tech": r2.get("n"),
+            "t2_ambig": r2.get("a"),
+            "t2_relation": rel_idx,
+            "mapped_existing_skill_id": mapped_sid,
+            "final_grade": final,
+            "demote_reason": "|".join(reasons),
+            "formal_skill_id": mapped_sid or str(row.skill_id),
+        })
+        rows.append(rec)
+    return pd.DataFrame(rows).sort_values(
+        ["final_grade", "term"], kind="stable"
+    ).reset_index(drop=True)
 
 def merge_final() -> None:
     """T1∧T2 信号合并进 v2e 分级 → 终版词表 v1.3（只出不进）。
@@ -312,42 +405,28 @@ def merge_final() -> None:
         t2_by_term[str(it["term"])] = r.get("res") or {}
     assert len(t2_by_term) == len(t2_items), "T2 覆盖不齐"
 
-    g = pd.read_csv(dic / "skill_legacy_graded_BCD_v1.csv", encoding="utf-8-sig")
-    rows = []
-    for _, row in g.iterrows():
-        term = str(row.term)
-        r2 = t2_by_term.get(term, {})
-        c1 = t1_cat.get(term)
-        final, reason = str(row.grade), ""
-        if row.grade != "D":
-            rs = []
-            if r2.get("s") is False:
-                rs.append("t2_not_skill")
-            if c1 in NON_SKILL_CATS:
-                rs.append(f"t1_{c1}")
-            if r2.get("a") is True and int(row.tautological) == 1:
-                rs.append("ambig_taut")
-            if rs:
-                final, reason = "D", "|".join(rs)
-        rows.append({"term": term, "skill_id": row.skill_id,
-                     "df_freq": int(row.df_freq),
-                     "taut": int(row.tautological),
-                     "v2e_grade": row.grade, "t1_cat": c1,
-                     "t2_skill": r2.get("s"), "t2_new_tech": r2.get("n"),
-                     "t2_ambig": r2.get("a"), "final_grade": final,
-                     "demote_reason": reason})
-    out = pd.DataFrame(rows).sort_values(
-        ["final_grade", "term"], kind="stable").reset_index(drop=True)
+    g = pd.read_csv(
+        dic / "skill_legacy_graded_BCD_v1.csv", encoding="utf-8-sig"
+    )
+    t2_items_by_term = {str(it["term"]): it for it in t2_items}
+    out = apply_semantic_review_to_grade(
+        g,
+        t1_cat=t1_cat,
+        t2_by_term=t2_by_term,
+        t2_items_by_term=t2_items_by_term,
+    )
     out.to_csv(dic / "skill_legacy_graded_BCD_v2.csv", index=False,
                encoding="utf-8-sig")
     fc = out.final_grade.value_counts()
     vc = out.v2e_grade.value_counts()
     dem = out[out.demote_reason != ""]
-    logger.info("v1.3: B %d / C %d / D %d（v2e 为 B %d/C %d/D %d；"
-                "本轮降级 %d 词，样例 %s）",
-                int(fc.get("B", 0)), int(fc.get("C", 0)), int(fc.get("D", 0)),
-                int(vc.get("B", 0)), int(vc.get("C", 0)), int(vc.get("D", 0)),
-                len(dem), dem.term.head(20).tolist())
+    logger.info(
+        "v1.3: A映射 %d / B %d / C %d / D %d（v2e 为 B %d/C %d/D %d；"
+        "降级 %d 词，样例 %s）",
+        int(fc.get("A", 0)), int(fc.get("B", 0)), int(fc.get("C", 0)),
+        int(fc.get("D", 0)), int(vc.get("B", 0)), int(vc.get("C", 0)),
+        int(vc.get("D", 0)), len(dem), dem.term.head(20).tolist(),
+    )
     # B 表：T1 全部非技能判定（legacy + A 级热词面；A 级本体不回删）
     sb = pd.DataFrame(t1_rows)
     sb = sb[sb.category.isin(NON_SKILL_CATS)].drop_duplicates("term")
