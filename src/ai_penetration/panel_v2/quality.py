@@ -226,6 +226,7 @@ def gate_checks(rel: Path) -> tuple[list[str], dict]:
         "skill_id", "surface_form", "start", "end", "mention_count",
         "match_method", "ambiguity_flag", "confidence_tier",
         "dictionary_version", "span_verified",
+        "covered_candidate_count", "covered_candidates",
     }
     missing_evidence = sorted(evidence_cols - set(longs.columns))
     if missing_evidence:
@@ -237,6 +238,7 @@ def gate_checks(rel: Path) -> tuple[list[str], dict]:
             (longs["start"] < 0)
             | (longs["end"] <= longs["start"])
             | (longs["mention_count"] < 1)
+            | (longs["covered_candidate_count"] < 0)
             | (longs["span_verified"] != 1)
             | (longs["surface_form"].astype(str).str.len()
                != (longs["end"] - longs["start"]))
