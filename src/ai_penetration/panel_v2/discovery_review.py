@@ -18,6 +18,7 @@ import pandas as pd
 from config.paths import get_project_paths, load_config_yaml
 from src.model_platform.llm import create_llm_client, extract_json_from_response
 from .governance import stable_bc_skill_id
+from .lexicon import AliasRecord, resolve_active_alias_records
 
 REVIEW_VERSION = "formal_discovery_review_v2_full_corpus"
 RETRIEVAL_VERSION = "char_bigram_jaccard_top10_v1"
@@ -96,7 +97,16 @@ def aggregate_mentions(mentions: pd.DataFrame) -> pd.DataFrame:
     ).reset_index(drop=True)
 
 
-def _load_registry(paths) -> tuple[pd.DataFrame, dict[str, set[str]], dict[str, str]]:
+def _safe(value) -> str:
+    if value is None or pd.isna(value):
+        return ""
+    return str(value).strip()
+
+
+def _load_registry(
+    paths,
+) -> tuple[pd.DataFrame, dict[str, set[str]], dict[str, str]]:
+    """加载与正式 matcher 完全一致的概念/别名注册表。"""
     concepts = pd.read_csv(
         paths.output_dir / "dictionary"
         / "skill_concept_bilingual_a_frozen_v1.1.csv",
@@ -109,33 +119,74 @@ def _load_registry(paths) -> tuple[pd.DataFrame, dict[str, set[str]], dict[str, 
         encoding="utf-8-sig",
         dtype=str,
     )
+    required_alias = {
+        "alias", "skill_id", "primary_skill_id", "ambiguity_flag"
+    }
+    missing = required_alias - set(aliases.columns)
+    if missing:
+        raise RuntimeError(
+            "冻结 A 级别名缺正式消歧字段: "
+            + ", ".join(sorted(missing))
+        )
+    resolved_aliases = resolve_active_alias_records([
+        AliasRecord(
+            alias=_safe(r.alias),
+            skill_id=_safe(r.skill_id),
+            primary_skill_id=_safe(r.primary_skill_id),
+            ambiguity_flag=1
+            if _safe(r.ambiguity_flag) == "1" else 0,
+        )
+        for r in aliases.itertuples(index=False)
+        if _safe(r.alias) and _safe(r.skill_id)
+    ])
+
     base = concepts.set_index("skill_id", drop=False)
     records = []
     exact: dict[str, set[str]] = {}
     tier: dict[str, str] = {}
-    for row in aliases.itertuples():
-        sid = str(row.skill_id)
-        key = _norm(row.alias)
+    for rec in resolved_aliases:
+        sid = str(rec.skill_id)
+        key = _norm(rec.alias)
         exact.setdefault(key, set()).add(sid)
         tier[sid] = "A"
-        c = base.loc[sid] if sid in base.index else None
+        concept = base.loc[sid] if sid in base.index else None
         records.append({
             "alias": key,
             "skill_id": sid,
             "tier": "A",
-            "canonical_zh": "" if c is None else str(c.get("canonical_zh", "") or ""),
-            "canonical_en": "" if c is None else str(c.get("canonical_en", "") or ""),
-            "definition": "" if c is None else str(
-                c.get("definition_en", c.get("description_en", "")) or ""
+            "canonical_zh": (
+                "" if concept is None
+                else _safe(concept.get("canonical_zh"))
             ),
-            "category": "" if c is None else str(c.get("skill_category", "") or ""),
+            "canonical_en": (
+                "" if concept is None
+                else _safe(concept.get("canonical_en"))
+            ),
+            "definition": (
+                "" if concept is None
+                else (
+                    _safe(concept.get("definition_en"))
+                    or _safe(concept.get("description_en"))
+                )
+            ),
+            "category": (
+                "" if concept is None
+                else _safe(concept.get("skill_category"))
+            ),
         })
 
-    v3_path = paths.output_dir / "dictionary" / "skill_legacy_graded_BCD_v3.csv"
+    v3_path = (
+        paths.output_dir / "dictionary"
+        / "skill_legacy_graded_BCD_v3.csv"
+    )
     v3 = pd.read_csv(v3_path, encoding="utf-8-sig")
-    for row in v3[v3.final_grade.isin(["A", "B", "C"])].itertuples():
-        sid = str(row.final_skill_id)
+    for row in v3[
+        v3.final_grade.isin(["A", "B", "C"])
+    ].itertuples(index=False):
+        sid = _safe(row.final_skill_id)
         key = _norm(row.term)
+        if not sid or not key:
+            raise RuntimeError("v3 正式治理行存在空 term/final_skill_id")
         exact.setdefault(key, set()).add(sid)
         old = tier.get(sid)
         rtier = str(row.final_grade)
@@ -144,24 +195,15 @@ def _load_registry(paths) -> tuple[pd.DataFrame, dict[str, set[str]], dict[str, 
             "alias": key,
             "skill_id": sid,
             "tier": tier[sid],
-            "canonical_zh": str(row.term),
+            "canonical_zh": key,
             "canonical_en": "",
             "definition": "",
-            "category": str(getattr(row, "t2_cat", "") or ""),
+            "category": _safe(getattr(row, "t2_cat", "")),
         })
-    return pd.DataFrame(records), exact, tier
-
-
-def _registry_hash(registry: pd.DataFrame) -> str:
-    cols = [
-        "alias", "skill_id", "tier", "canonical_zh",
-        "canonical_en", "definition", "category",
-    ]
-    stable = registry[cols].fillna("").astype(str).sort_values(
-        ["skill_id", "alias", "canonical_zh"], kind="stable"
-    )
-    payload = stable.to_csv(index=False, lineterminator="\n").encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
+    registry = pd.DataFrame(records)
+    if registry.empty:
+        raise RuntimeError("正式概念检索 registry 为空")
+    return registry, exact, tier
 
 
 class Retriever:
