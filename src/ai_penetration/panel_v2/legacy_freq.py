@@ -78,10 +78,12 @@ def scan_slice(table: str, b_start: int, b_end: int, tmp_dir: str,
     af = Path(tmp_dir) / f"{task}.aids.bin"
     aikf = Path(tmp_dir) / f"{task}.ai_keys.bin"
     aiaf = Path(tmp_dir) / f"{task}.ai_aids.bin"
+    yearf = Path(tmp_dir) / f"{task}.first_year.npy"
     hb = Path(tmp_dir) / f"{task}.hb.json"
     wl = (Path(tmp_dir) / f"{task}.wlog.txt").open("a", encoding="utf-8")
 
-    if kf.exists() and af.exists() and aikf.exists() and aiaf.exists():
+    if (kf.exists() and af.exists() and aikf.exists()
+            and aiaf.exists() and yearf.exists()):
         wl.close()
         return json.loads((Path(tmp_dir) / f"{task}.json").read_text(encoding="utf-8"))
 
@@ -95,6 +97,7 @@ def scan_slice(table: str, b_start: int, b_end: int, tmp_dir: str,
     buf_a_ai = np.empty(FLUSH, np.uint32)
     pos = seq = pairs = 0
     pos_ai = seq_ai = ai_pairs = 0
+    local_first_year = np.full(n, 65535, dtype=np.uint16)
 
     def spill() -> None:
         """溢出前桶内 (aid,key) 排序去重——模板相邻重复在桶级即消，
@@ -155,7 +158,7 @@ def scan_slice(table: str, b_start: int, b_end: int, tmp_dir: str,
         cur.itersize = 50000
         # 语料谓词与 A 级频率管线一致（词典语料面，非主样本准入面）
         cur.execute(
-            f"SELECT job_description FROM public.{table} "
+            f"SELECT publish_time, job_description FROM public.{table} "
             "WHERE ctid >= '(%s,0)'::tid AND ctid < '(%s,0)'::tid "
             "AND job_description IS NOT NULL AND job_description != '' "
             "AND position IS NOT NULL AND position != ''",
@@ -164,8 +167,10 @@ def scan_slice(table: str, b_start: int, b_end: int, tmp_dir: str,
             batch = cur.fetchmany(50000)
             if not batch:
                 break
-            for (desc,) in batch:
+            for publish_time, desc in batch:
                 rows += 1
+                year_s = str(publish_time or "")[:4]
+                year = int(year_s) if year_s.isdigit() else 0
                 # 匹配文本与生产 matcher 同义；文档频数键严格按指南 §10.3.2
                 # 使用纯规范化 text_hash，不再把 platform 拼入 distinct key。
                 norm = match_from_raw(str(desc))
@@ -179,6 +184,8 @@ def scan_slice(table: str, b_start: int, b_end: int, tmp_dir: str,
                         if _is_ascii_alnum(bef) or _is_ascii_alnum(aft):
                             continue
                     aid = idx[k]
+                    if 2014 <= year <= 2025 and year < int(local_first_year[aid]):
+                        local_first_year[aid] = year
                     buf_k[pos] = key
                     buf_a[pos] = aid
                     pos += 1
@@ -234,10 +241,12 @@ def scan_slice(table: str, b_start: int, b_end: int, tmp_dir: str,
             p.unlink()
     finally:
         wl.close()
+    np.save(yearf, local_first_year)
     meta = {"task": task, "rows": rows, "pairs": int(pairs),
             "ai_pairs": int(ai_pairs), "local_new": n_uniq_local,
             "keys_file": str(kf), "aids_file": str(af),
-            "ai_keys_file": str(aikf), "ai_aids_file": str(aiaf)}
+            "ai_keys_file": str(aikf), "ai_aids_file": str(aiaf),
+            "first_year_file": str(yearf)}
     (Path(tmp_dir) / f"{task}.json").write_text(json.dumps(meta), encoding="utf-8")
     hb.unlink(missing_ok=True)
     logger.info("legacy 切片 %s 完成: rows=%d pairs=%d", task, rows, pairs)
@@ -304,11 +313,17 @@ def main() -> None:
     ai_freq = aggregate_counts(
         ai_metas, tmp, n_alias=len(terms), cleanup=False
     )
+    first_year_arrays = [
+        np.load(m["first_year_file"]) for m in metas
+    ]
+    first_year = np.minimum.reduce(first_year_arrays)
+    first_year = np.where(first_year == 65535, 0, first_year).astype(np.int32)
     order = sorted(terms)
     rows = [
         (
             k, terms[k], int(freq[i]), int(ai_freq[i]),
             float(ai_freq[i] / freq[i]) if freq[i] else 0.0,
+            int(first_year[i]),
         )
         for i, k in enumerate(order)
     ]
@@ -318,12 +333,13 @@ def main() -> None:
         rows,
         columns=[
             "match_key", "skill_id", "df_unique_text",
-            "main_anchor_unique_text", "candidate_anchor_cooc",
+            "main_anchor_unique_text", "candidate_anchor_cooc", "first_year",
         ],
     ).to_csv(out_csv, index=False, encoding="utf-8-sig")
     for m in metas:
         for name in (
-            "keys_file", "aids_file", "ai_keys_file", "ai_aids_file"
+            "keys_file", "aids_file", "ai_keys_file", "ai_aids_file",
+            "first_year_file"
         ):
             Path(m[name]).unlink(missing_ok=True)
         (tmp / f"{m['task']}.json").unlink(missing_ok=True)
@@ -339,7 +355,8 @@ def main() -> None:
         c.execute("DROP TABLE IF EXISTS ai_dict.legacy_term_freq")
         c.execute("""CREATE TABLE ai_dict.legacy_term_freq (
             match_key text PRIMARY KEY, skill_id text, df_unique_text bigint,
-            main_anchor_unique_text bigint, candidate_anchor_cooc double precision)""")
+            main_anchor_unique_text bigint, candidate_anchor_cooc double precision,
+            first_year int)""")
         from psycopg2.extras import execute_values
         execute_values(c, "INSERT INTO ai_dict.legacy_term_freq VALUES %s",
                        rows, page_size=5000)
