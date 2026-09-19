@@ -520,6 +520,28 @@ def select(
         json.dumps(manifest, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    report = get_project_paths().report_dir / "model_benchmark_report.md"
+    lines = [
+        "# Qwen 模型候选技术基准与生产选择",
+        "",
+        f"- selected_candidate: {selected_candidate}",
+        f"- selected_model_signature: {selected['model_signature']}",
+        f"- production_config_sha256: {manifest['production_config_sha256']}",
+        "",
+        "## 候选比较",
+        "",
+    ]
+    for item in manifest["candidate_manifests"]:
+        lines += [
+            f"### {item['candidate_id']}",
+            f"- model_signature: {item['model_signature']}",
+            *[
+                f"- {k}: {v}"
+                for k, v in item["metrics"].items()
+            ],
+            "",
+        ]
+    report.write_text("\n".join(lines), encoding="utf-8")
     return out
 
 
