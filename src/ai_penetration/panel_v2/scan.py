@@ -128,8 +128,8 @@ def build_skill_vocab(out_dir: Path) -> None:
     if path.exists():
         return
     from ..skill_ai_anchor import load_merged_skills
-    from .lexicon import _load_atier_aliases, build_union_lexicon
-    aliases = _load_atier_aliases()   # 查询已 ORDER BY，first-wins 确定
+    from .lexicon import _load_atier_alias_records, build_union_lexicon
+    aliases = _load_atier_alias_records()
     lex = build_union_lexicon(legacy_terms=load_merged_skills(include_llm=True),
                               aliases=aliases)
     sids = sorted(set(lex.keys_map.values()))
@@ -145,8 +145,8 @@ def _init_worker(npy_dir: str) -> None:
     _WORKER["m"] = {n: np.load(Path(npy_dir) / f"{n}.npy", mmap_mode="r")
                     for n in ("key", "job_id", "year", "company", "city", "thash")}
     from ..skill_ai_anchor import load_merged_skills
-    from .lexicon import _load_atier_aliases, build_union_lexicon
-    aliases = _load_atier_aliases()
+    from .lexicon import _load_atier_alias_records, build_union_lexicon
+    aliases = _load_atier_alias_records()
     lex = build_union_lexicon(legacy_terms=load_merged_skills(include_llm=True),
                               aliases=aliases)
     vocab_path = Path(npy_dir).parent / "skill_vocab.json"
@@ -349,10 +349,13 @@ def merge_parts(out_dir: Path, rel_dir: Path) -> None:
     specs = (
         ("job_anchor_flag", "parts_flags",
          "job_id int8, year int, anchor_main smallint, anchor_cn_paper smallint,"
-         " anchor_babina smallint, groups_main_bits int",
+         " anchor_babina smallint, groups_main_bits int,"
+         " matched_anchor_groups_main text, matched_anchor_terms_main text",
          "job_id"),
         ("job_skill_long", "parts_long",
-         "job_id int8, year int, skill_code int",
+         "job_id int8, year int, skill_code int, skill_id text, surface_form text,"
+         " match_start int, match_end int, mention_count int, match_method text,"
+         " ambiguity_flag smallint, span_verified smallint",
          "job_id, skill_code"),
         ("job_firm", "parts_firm", "job_id int8, year int, company_code int",
          "job_id"),
@@ -369,7 +372,8 @@ def merge_parts(out_dir: Path, rel_dir: Path) -> None:
         cur.execute(f"DROP TABLE IF EXISTS public.{fin} CASCADE")
         cur.execute(f"CREATE TABLE public.{stg} ({cols})")
         files = sorted((out_dir / sub).glob("*.parquet"))
-        assert files, f"{sub} 无分片"
+        if not files:
+            raise RuntimeError(f"{sub} 无分片")
         for f in files:
             bio = _table_to_csv_buf(f)
             cur.copy_expert(
@@ -390,11 +394,13 @@ def merge_parts(out_dir: Path, rel_dir: Path) -> None:
                 f"GROUP BY job_id HAVING count(DISTINCT company_code) > 1) x")
             conflict = cur.fetchone()[0]
         if conflict:
-            logger.warning("keep-first 冲突披露 %s: %d 个 job 多拷贝识别不等价"
-                           "（受影响行由 ctid 序 keep-first 裁决，跨运行可翻转）",
-                           name, conflict)
+            raise RuntimeError(
+                f"canonical 扫描出现不等价重复 {name}: {conflict} 个 job；"
+                "拒绝用 ctid keep-first 仲裁")
+        order_by = (f"{dedup_key}, match_start, match_end, surface_form"
+                    if name == "job_skill_long" else f"{dedup_key}, job_id")
         cur.execute(f"CREATE TABLE public.{fin} AS SELECT DISTINCT ON ({dedup_key}) *"
-                    f" FROM public.{stg} ORDER BY {dedup_key}, job_id")
+                    f" FROM public.{stg} ORDER BY {order_by}")
         conn.commit()
         cur.execute(f"SELECT count(*) FROM public.{stg}")
         before = cur.fetchone()[0]
@@ -426,9 +432,11 @@ def _arrow_types(name: str) -> list:
     import pyarrow as pa
     if name == "job_anchor_flag":
         return [pa.int64(), pa.int32(), pa.int16(), pa.int16(), pa.int16(),
-                pa.int16()]
+                pa.int16(), pa.string(), pa.string()]
     if name == "job_skill_long":
-        return [pa.int64(), pa.int32(), pa.int32()]
+        return [pa.int64(), pa.int32(), pa.int32(), pa.string(), pa.string(),
+                pa.int32(), pa.int32(), pa.int32(), pa.string(), pa.int16(),
+                pa.int16()]
     return [pa.int64(), pa.int32(), pa.int32()]
 
 
