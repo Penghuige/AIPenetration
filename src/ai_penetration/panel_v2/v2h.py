@@ -31,7 +31,9 @@ from config.paths import get_project_paths
 from ..common import setup_logging
 from . import quality, scoring
 from .counts import compute_counts
-from .export_release import _meta
+from .anchors import anchor_dictionary_rows
+from .export_release import _meta, export_final_dictionaries, export_legacy_disposition
+from .lexicon import load_formal_legacy_spec
 from .relevance import _load_tier_map, compute_relevance, decode_skill_ids
 from .reproducibility import write_run_manifest
 
@@ -53,8 +55,7 @@ def filter_longs(rel2: Path, codes: np.ndarray) -> None:
     keep = drop = 0
     try:
         with pq.ParquetWriter(tmp, src.schema_arrow, compression="zstd") as w:
-            for rb in src.iter_batches(batch_size=4_000_000,
-                                       columns=["job_id", "year", "skill_code"]):
+            for rb in src.iter_batches(batch_size=2_000_000):
                 t = pa.Table.from_batches([rb])
                 sc = t["skill_code"].to_numpy()
                 m = ~np.isin(sc, codes)
@@ -78,6 +79,86 @@ def filter_longs(rel2: Path, codes: np.ndarray) -> None:
     logger.info("longs 过滤: 保留 %d，剔除 %d", keep, drop)
 
 
+
+def formal_tier_map(vocab_path: Path, grade_path: Path) -> np.ndarray:
+    """skill_code → 最终 A/B/C confidence tier。"""
+    tier_map = _load_tier_map(vocab_path)
+    _, _, tier_by_sid = load_formal_legacy_spec(grade_path)
+    vocab = json.loads(vocab_path.read_text(encoding="utf-8"))
+    for sid, tier in tier_by_sid.items():
+        if sid in vocab:
+            tier_map[int(vocab[sid])] = tier
+    used = np.array(sorted(vocab.values()), dtype=np.int64)
+    missing = [int(c) for c in used if not str(tier_map[int(c)]).strip()]
+    if missing:
+        raise RuntimeError(
+            f"正式词表有 {len(missing)} 个 skill_code 缺 confidence_tier，"
+            f"示例={missing[:10]}"
+        )
+    return tier_map
+
+
+def enrich_job_skill_long(
+    target: Path,
+    vocab_path: Path,
+    tier_map: np.ndarray,
+    *,
+    dictionary_version: str,
+) -> None:
+    """给 §11 job_skill_long 补正式 skill_id/tier/dictionary_version。"""
+    vocab = json.loads(vocab_path.read_text(encoding="utf-8"))
+    n_codes = max(vocab.values()) + 1
+    code_to_sid = np.empty(n_codes, dtype=object)
+    code_to_sid[:] = None
+    for sid, code in vocab.items():
+        code_to_sid[int(code)] = str(sid)
+    if any(x is None for x in code_to_sid):
+        raise RuntimeError("skill_vocab code 非连续，无法稳定解码 job_skill_long")
+
+    src = pq.ParquetFile(target)
+    existing = set(src.schema_arrow.names)
+    extra = {"skill_id", "confidence_tier", "dictionary_version"}
+    if extra <= existing:
+        src.close()
+        return
+    if existing & extra:
+        src.close()
+        raise RuntimeError(
+            f"job_skill_long 仅含部分正式字段: {sorted(existing & extra)}"
+        )
+
+    tmp = target.with_name("_job_skill_long_enriched.parquet")
+    writer = None
+    try:
+        for rb in src.iter_batches(batch_size=1_000_000):
+            t = pa.Table.from_batches([rb])
+            sc = t["skill_code"].to_numpy()
+            if (sc < 0).any() or (sc >= n_codes).any():
+                raise RuntimeError("job_skill_long 含 vocab 外 skill_code")
+            sids = code_to_sid[sc]
+            tiers = tier_map[sc]
+            if any(not str(x).strip() for x in tiers):
+                raise RuntimeError("job_skill_long 存在空 confidence_tier")
+            t = t.append_column("skill_id", pa.array(sids, type=pa.string()))
+            t = t.append_column(
+                "confidence_tier", pa.array(tiers, type=pa.string())
+            )
+            t = t.append_column(
+                "dictionary_version",
+                pa.array([dictionary_version] * len(t), type=pa.string()),
+            )
+            if writer is None:
+                writer = pq.ParquetWriter(tmp, t.schema, compression="zstd")
+            writer.write_table(t)
+    finally:
+        src.close()
+        if writer is not None:
+            writer.close()
+    if writer is None:
+        raise RuntimeError("job_skill_long 为空，拒绝正式发布")
+    tmp.replace(target)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="v2h 规则 b 一致版重算")
     ap.add_argument("--run-id", default="20260910_v2h")
@@ -85,7 +166,6 @@ def main() -> None:
     paths = get_project_paths()
     setup_logging(paths.log_dir / "panel_v2_v2h.log")
     t0 = datetime.now()
-    rel_src = paths.output_dir / "release" / "panel_v2"
     rel2 = paths.output_dir / "release" / "panel_v2b"   # 扫描合并产物（输入）
     rel3 = paths.output_dir / "release" / "panel_v2h"   # 本代际发布（输出）
     rel3.mkdir(parents=True, exist_ok=True)
@@ -96,23 +176,31 @@ def main() -> None:
     for f in scan_inputs:
         shutil.copy2(rel2 / f, rel3 / f)
 
-    # 2) v1.3 D 级过滤
+    # 2) 最终语义分级与正式 job_skill_long
     gcsv = paths.output_dir / "dictionary" / "skill_legacy_graded_BCD_v2.csv"
     grade = pd.read_csv(gcsv, encoding="utf-8-sig")
     pass2b = paths.output_dir / "panel_v2" / "pass2b"
     vocab_path = pass2b / "skill_vocab.json"
     vocab = json.loads(vocab_path.read_text(encoding="utf-8"))
-    d_ids = set(grade[grade.final_grade == "D"].skill_id)
+    # 新 formal scan 理论上已经不包含 D；保留这一步作防御性过滤。
+    d_ids = set(grade[grade.final_grade == "D"].skill_id.astype(str))
     codes = np.array(sorted(vocab[s] for s in d_ids if s in vocab), np.int32)
-    logger.info("D 级排除 %d 码", len(codes))
+    logger.info("formal scan 后残余 D 级码: %d", len(codes))
     filter_longs(rel3, codes)
+    tiers = formal_tier_map(vocab_path, gcsv)
+    enrich_job_skill_long(
+        rel3 / "job_skill_long.parquet",
+        vocab_path,
+        tiers,
+        dictionary_version=LEX_VERSION,
+    )
 
     # 3) counts（新 flag）→ relevance
     counts = compute_counts(rel3)
     counts.to_parquet(rel3 / "skill_ai_counts.parquet", index=False)
     logger.info("skill_ai_counts: %d 行", len(counts))
     rel_df = decode_skill_ids(
-        compute_relevance(counts, _load_tier_map(vocab_path)), vocab_path
+        compute_relevance(counts, tiers), vocab_path
     )
     rel_df.to_parquet(rel3 / "skill_ai_relevance.parquet", index=False)
     logger.info("skill_ai_relevance: %d 行", len(rel_df))
@@ -121,14 +209,31 @@ def main() -> None:
     scoring.run(rel3)
     quality.run(rel3)
 
-    # 5) 装配：字典/锚点/分级件 + metadata
-    copied_release_inputs = (
-        "skill_concept_v1.parquet", "skill_alias_v1.parquet",
-        "skill_candidate_d_v1.parquet", "skill_legacy_v1.parquet",
-        "ai_anchor_dictionary_v1.csv",
+    # 5) 装配：严格按 §18 从冻结 A 文件 + 最终语义分级重建词典。
+    a_concept = (
+        paths.output_dir / "dictionary"
+        / "skill_concept_bilingual_a_frozen_v1.1.csv"
     )
-    for f in copied_release_inputs:
-        shutil.copy2(rel_src / f, rel3 / f)
+    a_alias = (
+        paths.output_dir / "dictionary"
+        / "skill_alias_active_bilingual_a_frozen_v1.1.csv"
+    )
+    for source in (a_concept, a_alias, gcsv):
+        if not source.exists():
+            raise RuntimeError(f"正式发布输入缺失: {source}")
+    export_final_dictionaries(
+        rel3,
+        gcsv,
+        dictionary_version=LEX_VERSION,
+        a_concept_path=a_concept,
+        a_alias_path=a_alias,
+    )
+    export_legacy_disposition(rel3)
+    pd.DataFrame(anchor_dictionary_rows()).to_csv(
+        rel3 / "ai_anchor_dictionary_v1.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
     shutil.copy2(gcsv, rel3 / gcsv.name)
 
     single = rel3 / "job_ai_score.parquet"
@@ -151,7 +256,8 @@ def main() -> None:
         ("ai_anchor_dictionary_v1.csv", "anchor_version+keyword",
          "panel_v2/anchors.py(规则 20260909_b)"),
         ("job_anchor_flag.parquet", "job_id", "panel_v2/scan.py(规则 b 重扫)"),
-        ("job_skill_long.parquet", "job_id+skill_code", "panel_v2/v2h.py(D 级过滤)"),
+        ("job_skill_long.parquet", "job_id+skill_id",
+         "panel_v2/scan.py(证据)+v2h.py(正式词典解码)"),
         ("job_firm.parquet", "job_id", "panel_v2/scan.py(规则 b 重扫)"),
         ("skill_ai_counts.parquet", "skill+ver+win+year", "panel_v2/counts.py(规则 b)"),
         ("skill_ai_relevance.parquet", "skill+ver+win+year", "panel_v2/relevance.py(规则 b)"),
@@ -177,8 +283,14 @@ def main() -> None:
 
     # 6) 指南 §4.2：把本次正式运行的代码/配置、输入、输出绑定成一个总账。
     manifest_inputs = [rel2 / f for f in scan_inputs]
-    manifest_inputs += [rel_src / f for f in copied_release_inputs]
-    manifest_inputs += [gcsv, vocab_path]
+    manifest_inputs += [
+        a_concept,
+        a_alias,
+        gcsv,
+        vocab_path,
+        pass2b / "formal_legacy_spec.json",
+        pass2b / "skill_vocab.stamp.json",
+    ]
     manifest_outputs = [rel3 / name for name, _, _ in specs]
     manifest = write_run_manifest(
         rel3,
