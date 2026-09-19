@@ -396,21 +396,24 @@ def merge_final() -> None:
     for r in load_jsonl("t1_stopword.jsonl"):
         iid = int(r["id"])
         it = id2t1.get(iid)
-        assert it is not None, "T1 结果含重建外 id（词表漂移？）"
+        if it is None:
+            raise RuntimeError("T1 结果含重建外 id（词表漂移？）")
         covered.add(iid)
         res = r.get("res") or {}
         cat = res.get("c")
         t1_cat[str(it["term"])] = str(cat)  # 跨层重复词同判，后写无害
         t1_rows.append({"term": it["term"], "tier": it["tier"],
                         "category": cat})
-    assert covered == set(id2t1), \
-        f"T1 覆盖不齐 {len(covered)}/{len(id2t1)}"
+    if covered != set(id2t1):
+        raise RuntimeError(f"T1 覆盖不齐 {len(covered)}/{len(id2t1)}")
     t2_by_term: dict[str, dict] = {}
     for r in load_jsonl("t2_legacy_review.jsonl"):
         it = id2t2.get(int(r["id"]))
-        assert it is not None, "T2 结果含重建外 id"
+        if it is None:
+            raise RuntimeError("T2 结果含重建外 id")
         t2_by_term[str(it["term"])] = r.get("res") or {}
-    assert len(t2_by_term) == len(t2_items), "T2 覆盖不齐"
+    if len(t2_by_term) != len(t2_items):
+        raise RuntimeError("T2 覆盖不齐")
 
     g = pd.read_csv(
         dic / "skill_legacy_graded_BCD_v1.csv", encoding="utf-8-sig"
@@ -455,7 +458,8 @@ def main() -> None:
     args = ap.parse_args()
     paths = get_project_paths()
     setup_logging(paths.log_dir / f"lexicon_llm_{args.task}.log")
-    assert args.workers <= 4, "GPU 共享纪律：并发 ≤4"
+    if args.workers > 4:
+        raise SystemExit("GPU 共享纪律：并发 ≤4")
     if args.task == "t1":
         run_t1(args.workers)
     elif args.task == "t2":
