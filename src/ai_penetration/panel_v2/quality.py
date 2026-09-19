@@ -88,7 +88,36 @@ def gate_checks(rel: Path) -> tuple[list[str], dict]:
     rel_df = pq.read_table(rel / "skill_ai_relevance.parquet").to_pandas()
     cls = pq.read_table(rel / "job_ai_classification.parquet").to_pandas()
 
+    # §18 正式发布词典必须能独立解释正式长表。
+    concept_path = rel / "skill_concept_v1.parquet"
+    alias_path = rel / "skill_alias_v1.parquet"
+    if not concept_path.exists() or not alias_path.exists():
+        fails.append("缺少 §18 正式 skill_concept/skill_alias 发布件")
+    else:
+        concepts = pq.read_table(concept_path).to_pandas()
+        aliases = pq.read_table(alias_path).to_pandas()
+        concept_ids = set(concepts.skill_id.astype(str))
+        if concepts.skill_id.astype(str).duplicated().any():
+            fails.append("正式词典 skill_id 不唯一")
+        if aliases.alias_id.astype(str).duplicated().any():
+            fails.append("正式别名 alias_id 不唯一")
+        dangling_alias = set(aliases.skill_id.astype(str)) - concept_ids
+        if dangling_alias:
+            fails.append(f"正式别名存在无概念引用（{len(dangling_alias)} skill_id）")
+        if "skill_id" in longs.columns:
+            dangling_long = set(longs.skill_id.astype(str)) - concept_ids
+            if dangling_long:
+                fails.append(
+                    f"job_skill_long 含正式词典外 skill_id（{len(dangling_long)}）"
+                )
+            if longs[["job_id", "skill_id"]].duplicated().any():
+                fails.append("(job_id, skill_id) 不唯一")
+
     # 1 job_id 唯一 + 引用完整
+    anchor_detail_cols = {"matched_anchor_groups_main", "matched_anchor_terms_main"}
+    missing_anchor_detail = anchor_detail_cols - set(flags.columns)
+    if missing_anchor_detail:
+        fails.append("job_anchor_flag 缺命中明细: " + ", ".join(sorted(missing_anchor_detail)))
     if flags.job_id.duplicated().any():
         fails.append("job_id 不唯一")
     jset = np.sort(flags.job_id.to_numpy())
