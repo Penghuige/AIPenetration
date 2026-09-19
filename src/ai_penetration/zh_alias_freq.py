@@ -1,25 +1,10 @@
-"""中文/混合别名岗位描述频数计算（交接包冻结前置步骤，去重口径版）。
+"""中文/混合别名的规范化岗位描述文档频数（交接冻结前置步骤）。
 
-对 ai_dict.skill_aliases 中未激活的 zh/mixed 别名，在**广深语料**上计算
-「命中的不同规范化岗位描述数」，并输出歧义检查表。这是交接说明（00_交接
-说明.md 第二节）规定的中文化别名冻结前置步骤（频数 + 歧义）。
-
-口径（对齐指南 §6.2.0/§10.3.2）：
-- 频数 = COUNT(DISTINCT (platform, text_hash))——字典发现语料按平台内文本
-  去重，同文本跨平台各计一次；不受相同文本重复发布影响。
-- 规范化文本 = 小写 + 删除全部空白字符；text_hash 取 blake2b 6 字节(48bit)。
-- 去重键 key = (platform_id << 48) | text_hash，platform_id 用固定字符串
-  字典（未知串散列到高位段），8 ctid 切片并行扫描 + 主进程 numpy 全局去重，
-  eps 全程只读。
-
-输出：
-- ai_dict.zh_alias_freq(alias_id, alias, language, freq_total)  去重频数
-- ai_dict.alias_ambiguity(...)                                  一对多/过短歧义标记
-
-使用示例::
-
-    python -m src.ai_penetration.zh_alias_freq --force
+严格按指南 §10.3.2：freq_total = COUNT(DISTINCT normalized_text_hash)。
+同一规范化岗位描述即使跨平台重复发布也只计一次；平台不是频数键的一部分。
+语料范围仍遵循后续用户决策：广深、实际可得年份。
 """
+
 from __future__ import annotations
 
 import argparse
@@ -40,6 +25,8 @@ from .common import eps_connect, eps_conn_params, setup_logging
 from .load_guangdong import GD_SHARDS
 
 logger = logging.getLogger("ai_penetration.zh_alias_freq")
+
+FREQ_PROTOCOL_VERSION = "distinct_text_hash_v2_20260919"
 
 # 语料城市：交接口径下的字典发现语料（用户 2026-09-06 决策：仅广深）
 FREQ_CITIES = ("广州市", "深圳市")
@@ -68,12 +55,16 @@ def normalize_desc(desc: str) -> str:
     return _WS_RE.sub("", (desc or "").lower())
 
 
-def text_key(desc: str, platform: str) -> int:
-    """(platform, 规范化描述) → 56bit 去重键（pid<<48 | blake2b-48）。"""
-    h48 = int.from_bytes(
-        blake2b(normalize_desc(desc).encode("utf-8"), digest_size=6).digest(), "big"
+def text_key(desc: str, platform: str = "") -> int:
+    """规范化描述 → 64bit 文档键；platform 参数仅为旧调用兼容。"""
+    del platform
+    return int.from_bytes(
+        blake2b(
+            normalize_desc(desc).encode("utf-8"),
+            digest_size=8,
+        ).digest(),
+        "big",
     )
-    return (platform_id(platform) << 48) | h48
 
 
 def load_zh_mixed_aliases() -> dict[str, tuple[str, str]]:
@@ -155,7 +146,7 @@ def scan_slice(table: str, b_start: int, b_end: int, tmp_dir: str) -> dict:
     autom = _WORKER_STATE["autom"]
     aid_index = _WORKER_STATE["aid_index"]
     n_alias = _WORKER_STATE["n_alias"]
-    task = f"{table}_{b_start}_{b_end}"
+    task = f"{FREQ_PROTOCOL_VERSION}_{table}_{b_start}_{b_end}"
     keys_file = Path(tmp_dir) / f"{task}.keys.bin"
     aids_file = Path(tmp_dir) / f"{task}.aids.bin"
     if keys_file.exists() and aids_file.exists():
@@ -176,7 +167,7 @@ def scan_slice(table: str, b_start: int, b_end: int, tmp_dir: str) -> dict:
         cur = conn.cursor(f"freq_{task}")
         cur.itersize = 50000
         sql = f"""
-            SELECT platform, job_description FROM public.{table}
+            SELECT job_description FROM public.{table}
             WHERE ctid >= '(%s,0)'::tid AND ctid < '(%s,0)'::tid
               AND job_description IS NOT NULL AND job_description != ''
               AND position IS NOT NULL AND position != ''
@@ -186,13 +177,9 @@ def scan_slice(table: str, b_start: int, b_end: int, tmp_dir: str) -> dict:
             batch = cur.fetchmany(100000)
             if not batch:
                 break
-            for platform, desc in batch:
+            for (desc,) in batch:
                 rows += 1
-                norm = normalize_desc(desc)
-                h48 = int.from_bytes(
-                    blake2b(norm.encode("utf-8"), digest_size=6).digest(), "big"
-                )
-                key = (platform_id(platform) << 48) | h48
+                key = text_key(str(desc))
                 if key in local_seen:
                     continue
                 local_seen.add(key)
@@ -235,7 +222,7 @@ def aggregate_counts(metas: list[dict], tmp_dir: Path | None,
         n_alias: 别名总数（bincount minlength，保证数组覆盖全部别名）。
 
     Returns:
-        uint64 数组 freq[alias序号] = distinct (platform,text) 命中数。
+        uint64 数组 freq[alias序号] = distinct normalized text 命中数。
     """
     keys = np.concatenate([np.fromfile(m["keys_file"], dtype=np.uint64)
                            for m in metas if m["pairs"] > 0]) if metas else np.empty(0, np.uint64)
@@ -253,7 +240,7 @@ def aggregate_counts(metas: list[dict], tmp_dir: Path | None,
     freq = np.bincount(uniq_aids.astype(np.int64), minlength=n_alias).astype(np.uint64)
     n_uniq = int(uniq_aids.size)
     del keys_s, aids_s, change, uniq_aids
-    logger.info("去重完成: distinct (aid,text) 对 %d（重复率 %.2f%%）",
+    logger.info("去重完成: distinct (aid,normalized_text) 对 %d（重复率 %.2f%%）",
                 n_uniq, 100.0 * (1 - n_uniq / max(1, n_pairs)))
     # 中间文件统一清理（删除容错：Windows 偶发占用）
     for m in metas:
@@ -284,7 +271,7 @@ def write_freq_table(conn_params: dict, alias_rows: list[tuple[str, str, str]],
     Args:
         conn_params: eps 连接参数。
         alias_rows: [(alias_id, alias, language)]，与 freq 数组同序。
-        freq: 每个别名的 distinct (platform,text) 命中数。
+        freq: 每个别名的 distinct normalized text 命中数。
     """
     conn = psycopg2.connect(**conn_params)
     try:
