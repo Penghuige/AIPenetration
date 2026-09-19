@@ -32,6 +32,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from config.paths import get_project_paths
@@ -93,12 +94,52 @@ def _rerun_drift(prev: dict, stats: dict) -> list[str]:
     return [k for k in keys if k in prev and k in stats and prev[k] != stats[k]]
 
 
+def _check_span_evidence(path: Path) -> tuple[int, set[str]]:
+    """流式校验 §11/§17.6 的岗位技能证据字段与跨度内部一致性。"""
+    required = {
+        "surface_form", "start", "end", "mention_count",
+        "match_method", "ambiguity_flag",
+    }
+    pf = pq.ParquetFile(path)
+    missing = required - set(pf.schema_arrow.names)
+    if missing:
+        return 0, missing
+    bad = 0
+    for rb in pf.iter_batches(
+        batch_size=1_000_000,
+        columns=["surface_form", "start", "end", "mention_count"],
+    ):
+        tbl = rb.to_pydict()
+        surfaces = tbl["surface_form"]
+        starts = tbl["start"]
+        ends = tbl["end"]
+        mentions = tbl["mention_count"]
+        for surface, start, end, mention in zip(
+            surfaces, starts, ends, mentions
+        ):
+            if (
+                surface is None
+                or start is None
+                or end is None
+                or mention is None
+                or start < 0
+                or end <= start
+                or mention < 1
+                or len(surface) != end - start
+            ):
+                bad += 1
+    return bad, set()
+
+
 def gate_checks(rel: Path) -> tuple[list[str], dict]:
     """§17.6 阻断十项。返回 (失败列表, 统计量字典)。"""
     fails: list[str] = []
     stats: dict = {}
     flags = pq.read_table(rel / "job_anchor_flag.parquet").to_pandas()
-    longs = pq.read_table(rel / "job_skill_long.parquet").to_pandas()
+    long_path = rel / "job_skill_long.parquet"
+    longs = pq.read_table(
+        long_path, columns=["job_id", "skill_code"]
+    ).to_pandas()
     counts = pq.read_table(rel / "skill_ai_counts.parquet").to_pandas()
     rel_df = pq.read_table(rel / "skill_ai_relevance.parquet").to_pandas()
     cls = pq.read_table(rel / "job_ai_classification.parquet").to_pandas()
@@ -119,8 +160,20 @@ def gate_checks(rel: Path) -> tuple[list[str], dict]:
         fails.append("(job_id, skill_code) 不唯一")
     del ck
 
-    # 3 跨度回填：v2a waived（确定性子串匹配可重算）
-    stats["span_backfill"] = "waived_deterministic"
+    # 3 原文跨度证据：扫描时已强制 surface == match_text[start:end]；
+    # 发布质量门再独立检查 schema 与跨度内部一致性，禁止 waived。
+    bad_span, missing_span = _check_span_evidence(long_path)
+    if missing_span:
+        fails.append(
+            "§17.6.3 job_skill_long 缺证据字段: "
+            + ", ".join(sorted(missing_span))
+        )
+        stats["span_backfill"] = "missing_columns"
+    elif bad_span:
+        fails.append(f"§17.6.3 原文跨度/mention_count 无效（{bad_span} 行）")
+        stats["span_backfill"] = f"failed:{bad_span}"
+    else:
+        stats["span_backfill"] = "scan_verified_and_release_rechecked"
 
     # 4 分子≤分母
     if (counts.n_ai_cooccur > counts.n_skill).any():
@@ -209,7 +262,8 @@ def gate_checks(rel: Path) -> tuple[list[str], dict]:
     stats["checksum_flags"] = _sha_stats(
         flags_sorted,
         ["job_id", "year", "anchor_main", "anchor_cn_paper",
-         "anchor_babina", "groups_main_bits"],
+         "anchor_babina", "groups_main_bits",
+         "matched_anchor_groups_main", "matched_anchor_terms_main"],
     )
     counts_sorted = counts.sort_values(
         ["skill_code", "anchor_version", "window_type", "year"]
@@ -251,7 +305,9 @@ def warning_checks(rel: Path) -> tuple[list[str], dict]:
     warns: list[str] = []
     info: dict = {}
     flags = pq.read_table(rel / "job_anchor_flag.parquet").to_pandas()
-    longs = pq.read_table(rel / "job_skill_long.parquet").to_pandas()
+    longs = pq.read_table(
+        rel / "job_skill_long.parquet", columns=["job_id"]
+    ).to_pandas()
     cls = pq.read_table(rel / "job_ai_classification.parquet").to_pandas()
     rel_df = pq.read_table(rel / "skill_ai_relevance.parquet").to_pandas()
 
