@@ -61,10 +61,20 @@ def _meta(p: Path, run_id: str, primary_key: str, source_files: str,
     if p.suffix == ".parquet":
         schema = str(_pq.read_schema(p))
         n = _pq.ParquetFile(p).metadata.num_rows
-    else:
+    elif p.suffix == ".csv":
         text = p.read_text(encoding="utf-8-sig")
         schema = "csv"
         n = max(text.count("\n") - 1, 0)
+    elif p.suffix == ".json":
+        obj = json.loads(p.read_text(encoding="utf-8"))
+        schema = "json:" + type(obj).__name__
+        n = len(obj) if isinstance(obj, (list, dict)) else None
+    elif p.suffix == ".md":
+        schema = "markdown"
+        n = None
+    else:
+        schema = p.suffix.lstrip(".") or "unknown"
+        n = None
     meta = {
         "file_name": p.name, "run_id": run_id,
         "created_at": datetime.now().isoformat(timespec="seconds"),
