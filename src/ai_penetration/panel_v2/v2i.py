@@ -89,6 +89,7 @@ def filter_longs(rel2: Path, codes: np.ndarray,
         "job_id", "year", "skill_code", "skill_id", "surface_form",
         "match_start", "match_end", "mention_count", "match_method",
         "ambiguity_flag", "span_verified",
+        "covered_candidate_count", "covered_candidates",
     }
     missing = required - set(src.schema_arrow.names)
     if missing:
