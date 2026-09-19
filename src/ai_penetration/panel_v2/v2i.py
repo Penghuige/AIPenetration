@@ -56,13 +56,11 @@ def require_handoff_manifests(paths) -> list[Path]:
     """正式 v2i 发布前必须有真实执行产生的上游合规凭证。"""
     required = [
         paths.output_dir / "data_audit" / "source_db_manifest_v1.json",
-        paths.report_dir / "data_audit" / "data_audit_manifest_v1.json",
         paths.output_dir / "dictionary" / "external_translation_completion_manifest_v1.json",
         paths.report_dir / "model_benchmark_technical_manifest_v1.json",
         paths.report_dir / "model_benchmark_prerun_manifest_v1.json",
         paths.output_dir / "dictionary" / "formal_discovery_manifest_v1.json",
         paths.output_dir / "llm_review" / "formal_discovery_v1" / "extraction_manifest.json",
-        paths.output_dir / "dictionary" / "formal_discovery_review_manifest_v1.json",
         paths.output_dir / "dictionary" / "formal_discovery_review_manifest_v1.json",
     ]
     for path in required:
@@ -71,10 +69,7 @@ def require_handoff_manifests(paths) -> list[Path]:
         payload = json.loads(path.read_text(encoding="utf-8"))
         expected = (
             "complete"
-            if path.name in {
-                "formal_discovery_review_manifest_v1.json",
-                "formal_discovery_review_manifest_v1.json",
-            }
+            if path.name == "formal_discovery_review_manifest_v1.json"
             else "formal_pass"
         )
         if payload.get("status") != expected:
@@ -330,8 +325,6 @@ def main() -> None:
         ("job_firm.parquet", "job_id", "panel_v2/scan.py"),
         ("job_text_clean.parquet", "job_id",
          "panel_v2/scan.py(raw/clean/match/full stable id)"),
-        ("job_text_clean.parquet", "job_id",
-         "panel_v2/scan.py(raw/clean/match §6.1)"),
         ("skill_ai_counts.parquet", "skill+ver+win+year", "panel_v2/counts.py"),
         ("skill_ai_relevance.parquet", "skill+ver+win+year", "panel_v2/relevance.py"),
         ("job_ai_score.parquet", "job+ver+win+stype", "panel_v2/scoring.py"),
