@@ -47,6 +47,7 @@ class SkillMatch:
     end: int
     mention_count: int
     match_key: str
+    ambiguity_flag: int = 0
 
 
 @dataclass
@@ -56,6 +57,7 @@ class UnionLexicon:
     automaton: ahocorasick.Automaton = field(default=None)  # type: ignore[assignment]
     ascii_keys: frozenset[str] = frozenset()
     homograph: dict[str, re.Pattern] = field(default_factory=dict)
+    ambiguity_keys: frozenset[str] = frozenset()
     keys_map: dict[str, str] = field(default_factory=dict)  # match键→skill_id
     n_atier: int = 0
     n_legacy: int = 0
@@ -115,6 +117,9 @@ class UnionLexicon:
                 end=end,
                 mention_count=len(hits),
                 match_key=key,
+                ambiguity_flag=int(
+                    key in self.ambiguity_keys or sid in self.homograph
+                ),
             ))
         return sorted(out, key=lambda x: (x.start, x.end, x.skill_id))
 
@@ -172,11 +177,54 @@ def _load_atier_aliases() -> list[tuple[str, str]]:
         conn.close()
 
 
+
+def load_frozen_atier_aliases(
+    path,
+) -> tuple[list[tuple[str, str]], frozenset[str]]:
+    """从 A 级冻结 alias CSV 读取 matcher 输入与歧义键，不依赖 mutable DB。"""
+    from pathlib import Path
+
+    import pandas as pd
+
+    frame = pd.read_csv(Path(path), encoding="utf-8-sig")
+    required = {
+        "alias", "skill_id", "is_active", "primary_skill_id",
+        "ambiguity_flag",
+    }
+    missing = required - set(frame.columns)
+    if missing:
+        raise RuntimeError(
+            "A 级冻结 alias 文件缺字段: " + ", ".join(sorted(missing))
+        )
+    active = frame[frame.is_active.astype(str) == "1"].copy()
+    rows = [
+        (
+            str(r.alias),
+            str(r.skill_id),
+            None if pd.isna(r.primary_skill_id) else str(r.primary_skill_id),
+        )
+        for _, r in active.iterrows()
+    ]
+    resolved = _resolve_active_alias_rows(rows)
+    resolved_map = dict(resolved)
+
+    ambiguity: set[str] = set()
+    for _, row in active.iterrows():
+        alias = str(row.alias)
+        if resolved_map.get(alias) != str(row.skill_id):
+            continue
+        raw = str(row.ambiguity_flag).strip().lower()
+        if raw in {"1", "true", "yes"}:
+            ambiguity.add(unicodedata.normalize("NFKC", alias).lower())
+    return resolved, frozenset(ambiguity)
+
+
 def build_union_lexicon(
     include_legacy: bool = True,
     legacy_terms: list[str] | None = None,
     aliases: list[tuple[str, str]] | None = None,
     legacy_skill_ids: dict[str, str] | None = None,
+    ambiguous_alias_keys: frozenset[str] | set[str] | None = None,
 ) -> UnionLexicon:
     """构建 union 词表匹配器。
 
@@ -187,6 +235,7 @@ def build_union_lexicon(
             供离线单测）。
         legacy_skill_ids: 可选的规范化 legacy key → 最终 formal_skill_id。
             用于把经 §10.3.3 确认的别名直接映射回既有 A 级概念。
+        ambiguous_alias_keys: 冻结词典中 ambiguity_flag=1 的规范化表面键。
 
     Returns:
         UnionLexicon。
@@ -205,6 +254,7 @@ def build_union_lexicon(
         if alias in _AMBIGUOUS_AI_TERMS:
             homograph[sid] = _AMBIGUOUS_AI_TERMS[alias]
 
+    ambiguity_keys = set(ambiguous_alias_keys or ())
     n_atier = len(keys)
     n_legacy = 0
     overlap: list[str] = []
@@ -232,6 +282,7 @@ def build_union_lexicon(
             keys[key] = sid
             if term in _AMBIGUOUS_AI_TERMS:
                 homograph[sid] = _AMBIGUOUS_AI_TERMS[term]
+                ambiguity_keys.add(key)
             if sid.startswith(LEGACY_PREFIX):
                 n_legacy += 1
 
@@ -244,6 +295,7 @@ def build_union_lexicon(
                 n_atier, n_legacy, len(overlap), len(keys), len(homograph))
     return UnionLexicon(
         automaton=automaton, ascii_keys=ascii_keys, homograph=homograph,
+        ambiguity_keys=frozenset(ambiguity_keys),
         keys_map=keys, n_atier=n_atier, n_legacy=n_legacy,
         n_concepts=len(set(keys.values())), overlap_terms=tuple(overlap),
     )
