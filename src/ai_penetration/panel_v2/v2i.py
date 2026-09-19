@@ -43,7 +43,28 @@ from .reproducibility import write_run_manifest
 
 logger = logging.getLogger("ai_penetration.panel_v2.v2i")
 
+
 LEX_VERSION = "bilingual_a_frozen_v1.1+governed_v1.4"
+
+
+def require_handoff_manifests(paths) -> list[Path]:
+    """正式 v2i 发布前必须有真实执行产生的上游合规凭证。"""
+    required = [
+        paths.report_dir / "model_benchmark_technical_manifest_v1.json",
+        paths.report_dir / "model_benchmark_prerun_manifest_v1.json",
+        paths.output_dir / "dictionary" / "formal_discovery_manifest_v1.json",
+        paths.output_dir / "dictionary" / "skill_legacy_governance_manifest_v3.json",
+    ]
+    for path in required:
+        if not path.exists():
+            raise RuntimeError(f"缺少原始交接必需 manifest: {path}")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        expected = "complete" if path.name == "skill_legacy_governance_manifest_v3.json" else "formal_pass"
+        if payload.get("status") != expected:
+            raise RuntimeError(
+                f"上游 manifest 未通过: {path.name} status={payload.get('status')!r}"
+            )
+    return required
 
 
 def filter_longs(rel2: Path, codes: np.ndarray,
@@ -119,6 +140,7 @@ def main() -> None:
     paths = get_project_paths()
     setup_logging(paths.log_dir / "panel_v2_v2i.log")
     t0 = datetime.now()
+    handoff_manifests = require_handoff_manifests(paths)
     rel_src = paths.output_dir / "release" / "panel_v2"
     rel2 = paths.output_dir / "release" / "panel_v2_handoff_scan"  # 新扫描输入
     rel3 = paths.output_dir / "release" / "panel_v2i"  # 新正式发布
@@ -168,6 +190,13 @@ def main() -> None:
 
     # 5) 装配：§18 正式词典必须与实际 matcher 同一 A/B/C 概念集合。
     base_concepts = pd.read_parquet(rel_src / "skill_concept_v1.parquet")
+    pending = base_concepts.translation_status.fillna("").astype(str).isin(
+        ["", "pending_codex_zh"]
+    )
+    if pending.any():
+        raise RuntimeError(
+            f"A级基础词典仍有 {int(pending.sum())} 个未完成中文化概念，拒绝 v2i"
+        )
     base_aliases = pd.read_parquet(rel_src / "skill_alias_v1.parquet")
     resolved = {
         normalize_term(r.alias): r.skill_id
@@ -246,6 +275,7 @@ def main() -> None:
     manifest_inputs += [rel_src / "skill_concept_v1.parquet",
                         rel_src / "skill_alias_v1.parquet", gcsv,
                         governance_manifest, vocab_path]
+    manifest_inputs += handoff_manifests
     manifest_outputs = [rel3 / name for name, _, _ in specs]
     manifest = write_run_manifest(
         rel3,
