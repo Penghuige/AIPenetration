@@ -32,6 +32,62 @@ _ASCII_RE = re.compile(r"^[\x00-\x7f]+$")
 LEGACY_PREFIX = "legacy:"
 
 
+@dataclass(frozen=True)
+class AliasRecord:
+    """正式激活别名的一条可审计记录。"""
+
+    alias: str
+    skill_id: str
+    primary_skill_id: str = ""
+    ambiguity_flag: int = 0
+
+
+@dataclass(frozen=True)
+class SkillMatch:
+    """岗位—技能唯一匹配证据（指南 §11.1/§11.3）。"""
+
+    skill_id: str
+    surface_form: str
+    start: int
+    end: int
+    mention_count: int
+    match_method: str
+    ambiguity_flag: int
+
+
+def _norm_key(text: str) -> str:
+    return unicodedata.normalize("NFKC", str(text)).lower()
+
+
+def resolve_active_alias_records(rows: list[AliasRecord]) -> list[AliasRecord]:
+    """按 §11.1.3 把激活歧义别名解析到唯一主概念。"""
+    grouped: dict[str, list[AliasRecord]] = {}
+    for row in rows:
+        grouped.setdefault(_norm_key(row.alias), []).append(row)
+    resolved: list[AliasRecord] = []
+    for key in sorted(grouped):
+        group = grouped[key]
+        skill_ids = {r.skill_id for r in group}
+        primaries = {r.primary_skill_id for r in group if r.primary_skill_id}
+        if len(skill_ids) == 1:
+            target = next(iter(skill_ids))
+        elif len(primaries) == 1 and next(iter(primaries)) in skill_ids:
+            target = next(iter(primaries))
+        else:
+            raise RuntimeError(
+                "激活别名存在多概念但无唯一 primary_skill_id: "
+                f"{key!r} -> skills={sorted(skill_ids)} primaries={sorted(primaries)}"
+            )
+        candidates = [r for r in group if r.skill_id == target]
+        chosen = sorted(candidates, key=lambda r: (r.alias, r.skill_id))[0]
+        resolved.append(AliasRecord(
+            alias=chosen.alias,
+            skill_id=target,
+            primary_skill_id=target if len(skill_ids) > 1 else chosen.primary_skill_id,
+            ambiguity_flag=max(int(r.ambiguity_flag) for r in group),
+        ))
+    return resolved
+
 def _is_ascii_alnum(ch: str) -> bool:
     """ASCII 字母数字判定（§12.6.4 边界语义；中文不是 ASCII alnum）。"""
     return ("a" <= ch <= "z") or ("A" <= ch <= "Z") or ("0" <= ch <= "9")
@@ -45,6 +101,7 @@ class UnionLexicon:
     ascii_keys: frozenset[str] = frozenset()
     homograph: dict[str, re.Pattern] = field(default_factory=dict)
     keys_map: dict[str, str] = field(default_factory=dict)  # match键→skill_id
+    ambiguous_keys: frozenset[str] = frozenset()
     n_atier: int = 0
     n_legacy: int = 0
     n_concepts: int = 0
