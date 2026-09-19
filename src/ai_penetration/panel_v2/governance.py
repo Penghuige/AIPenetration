@@ -172,6 +172,46 @@ def materialize_source_skill_records(
     return out.reset_index(drop=True)
 
 
+def materialize_dictionary_changelog(
+    grades: pd.DataFrame,
+    dictionary_version: str,
+) -> pd.DataFrame:
+    """物化 §10.4 词典变更账本；不修改任何分级结果。"""
+    required = {"term", "final_grade", "final_skill_id"}
+    missing = required - set(grades.columns)
+    if missing:
+        raise ValueError("治理表缺列: " + ", ".join(sorted(missing)))
+    rows = []
+    for row in grades.itertuples(index=False):
+        data = row._asdict()
+        grade = str(data.get("final_grade", ""))
+        rows.append({
+            "term": str(data.get("term", "")),
+            "final_skill_id": _text(data.get("final_skill_id")),
+            "final_grade": grade,
+            "dictionary_status": (
+                "formal" if grade in {"A", "B", "C"} else "candidate_d"
+            ),
+            "mapping_action": _text(data.get("mapping_action")),
+            "source": _text(data.get("source"), "legacy_governance_v3"),
+            "df_unique_description": data.get(
+                "df_freq", data.get("df_unique_description", pd.NA)
+            ),
+            "candidate_anchor_cooc": data.get(
+                "cand_cooc", data.get("candidate_anchor_cooc", pd.NA)
+            ),
+            "first_year": data.get("first_year", pd.NA),
+            "demote_reason": _text(data.get("demote_reason")),
+            "dictionary_version": dictionary_version,
+        })
+    out = pd.DataFrame(rows)
+    if out.term.astype(str).map(normalize_term).duplicated().any():
+        raise ValueError("词典 changelog term 不唯一")
+    return out.sort_values(
+        ["dictionary_status", "final_grade", "term"], kind="stable"
+    ).reset_index(drop=True)
+
+
 def materialize_formal_dictionary(
     base_concepts: pd.DataFrame,
     base_aliases: pd.DataFrame,
