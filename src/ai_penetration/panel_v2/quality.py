@@ -97,29 +97,50 @@ def _rerun_drift(prev: dict, stats: dict) -> list[str]:
 def _check_span_evidence(path: Path) -> tuple[int, set[str]]:
     """流式校验 §11/§17.6 的岗位技能证据字段与跨度内部一致性。"""
     required = {
-        "surface_form", "start", "end", "mention_count",
-        "match_method", "ambiguity_flag",
+        "skill_id", "surface_form", "start", "end", "mention_count",
+        "match_method", "ambiguity_flag", "confidence_tier",
+        "dictionary_version",
     }
     pf = pq.ParquetFile(path)
     missing = required - set(pf.schema_arrow.names)
     if missing:
         return 0, missing
     bad = 0
-    for rb in pf.iter_batches(
-        batch_size=1_000_000,
-        columns=["surface_form", "start", "end", "mention_count"],
-    ):
-        surface_len = pc.utf8_length(rb.column(0)).to_numpy(
-            zero_copy_only=False
-        )
-        starts = rb.column(1).to_numpy(zero_copy_only=False)
-        ends = rb.column(2).to_numpy(zero_copy_only=False)
-        mentions = rb.column(3).to_numpy(zero_copy_only=False)
+    columns = [
+        "skill_id", "surface_form", "start", "end", "mention_count",
+        "confidence_tier", "dictionary_version",
+    ]
+    for rb in pf.iter_batches(batch_size=1_000_000, columns=columns):
+        skill_len = pc.fill_null(
+            pc.utf8_length(rb.column(0)), -1
+        ).to_numpy(zero_copy_only=False)
+        surface_len = pc.fill_null(
+            pc.utf8_length(rb.column(1)), -1
+        ).to_numpy(zero_copy_only=False)
+        starts = pc.fill_null(
+            rb.column(2), -1
+        ).to_numpy(zero_copy_only=False)
+        ends = pc.fill_null(
+            rb.column(3), -1
+        ).to_numpy(zero_copy_only=False)
+        mentions = pc.fill_null(
+            rb.column(4), -1
+        ).to_numpy(zero_copy_only=False)
+        tier_len = pc.fill_null(
+            pc.utf8_length(rb.column(5)), -1
+        ).to_numpy(zero_copy_only=False)
+        version_len = pc.fill_null(
+            pc.utf8_length(rb.column(6)), -1
+        ).to_numpy(zero_copy_only=False)
         invalid = (
-            (starts < 0)
+            (skill_len <= 0)
+            | (surface_len <= 0)
+            | (starts < 0)
             | (ends <= starts)
             | (mentions < 1)
             | (surface_len != (ends - starts))
+            | (tier_len <= 0)
+            | (version_len <= 0)
         )
         bad += int(np.count_nonzero(invalid))
     return bad, set()
