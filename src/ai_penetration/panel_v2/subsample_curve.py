@@ -39,7 +39,33 @@ def curve_frame(cls: pd.DataFrame, score: pd.DataFrame,
         DataFrame[year, n, zero_skill_rate, r005_all, r005_matched,
         hi030_all, hi030_matched]。
     """
-    df = cls.merge(score, on="job_id", how="inner")
+    required_cls = {
+        "job_id", "year", "zero_skill_override", "aijob_main_annual_raw_005"
+    }
+    required_score = {"job_id", "ai_score"}
+    missing_cls = required_cls - set(cls.columns)
+    missing_score = required_score - set(score.columns)
+    if missing_cls or missing_score:
+        raise ValueError(
+            f"子样本曲线输入字段缺失: cls={sorted(missing_cls)} "
+            f"score={sorted(missing_score)}"
+        )
+    if cls.job_id.duplicated().any() or score.job_id.duplicated().any():
+        raise ValueError("子样本曲线要求 classification/score 的 job_id 均唯一")
+
+    df = cls.merge(
+        score[["job_id", "ai_score"]],
+        on="job_id",
+        how="left",
+        validate="one_to_one",
+    )
+    if df.ai_score.isna().ne(df.zero_skill_override.astype(bool)).any():
+        bad = int(
+            df.ai_score.isna().ne(df.zero_skill_override.astype(bool)).sum()
+        )
+        raise ValueError(
+            f"score 与 zero_skill_override 不一致（{bad} 岗位）；拒绝静默删行/补零"
+        )
     df["hi030"] = (df.ai_score > 0.30).astype(float)
     rows = []
     for y, sub in df[df.year >= y_min].groupby("year"):
