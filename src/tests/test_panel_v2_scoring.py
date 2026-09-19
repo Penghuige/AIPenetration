@@ -102,8 +102,10 @@ def test_scoring_end_to_end(tmp_path):
     s5 = score[(score.job_id == 5) & (score.anchor_version == "main")
                & (score.window_type == "annual") & (score.score_type == "raw")]
     assert np.isnan(s5.ai_score.iloc[0])
-    # 得分表行数 = 5 jobs × 9 单元 × 2 类型
+    # 得分表行数 = 5 jobs × 9 单元 × 2 类型；§15.5 必须保留岗位年
     assert len(score) == 5 * 9 * 2
+    assert "year" in score.columns
+    assert set(score[score.job_id == 1].year) == {2014}
     # coverage 恒 1（有技能岗位，weighted 实测非硬编码）
     assert (score[score.matched_skill_count > 0]
             .score_skill_coverage == 1.0).all()
