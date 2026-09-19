@@ -220,29 +220,50 @@ def _bigram_index(aliases: list[str]) -> dict[str, list[int]]:
 
 
 def candidates_t2() -> list[dict]:
-    """legacy 全键 + 确定性 top-10 已有词条（§10.3.4 检索段）。"""
+    """legacy 全键 + 与正式 matcher 同一 A 级消歧别名 Top-10。"""
     import pandas as pd
     paths = get_project_paths()
-    lg = pd.read_csv(paths.output_dir / "dictionary" / "legacy_df_freq_v1.csv",
-                     encoding="utf-8-sig")
-    ali = pd.read_parquet(paths.output_dir / "release" / "panel_v2"
-                          / "skill_alias_v1.parquet")
-    aliases = sorted({_norm_key(a) for a in ali.alias.astype(str)
-                      if len(_norm_key(str(a))) >= 2})
+    lg = pd.read_csv(
+        paths.output_dir / "dictionary" / "legacy_df_freq_v1.csv",
+        encoding="utf-8-sig",
+    )
+    required = {
+        "match_key", "df_unique_text",
+        "main_anchor_unique_text", "candidate_anchor_cooc",
+    }
+    missing = required - set(lg.columns)
+    if missing:
+        raise RuntimeError(
+            "legacy_df_freq_v1.csv 尚未按 handoff 频数协议重算: "
+            + ", ".join(sorted(missing))
+        )
+
+    from .lexicon import _load_atier_alias_records
+    resolved = _load_atier_alias_records()
+    aliases = sorted({_norm_key(r.alias) for r in resolved if _norm_key(r.alias)})
     aidx = _bigram_index(aliases)
     out = []
-    for i, key in enumerate(lg.match_key):
-        key = str(key)
-        bgs = {_norm_key(key)[k:k + 2] for k in range(len(key) - 1)}
+    for i, row in enumerate(lg.itertuples(index=False)):
+        key = _norm_key(str(row.match_key))
+        bgs = {key[k:k + 2] for k in range(len(key) - 1)}
         score: dict[int, int] = {}
         for bg in bgs:
             for j in aidx.get(bg, ()):
                 score[j] = score.get(j, 0) + 1
-        top = [aliases[j] for j, _ in
-               sorted(score.items(), key=lambda kv: (-kv[1], kv[0]))[:10]]
-        out.append({"id": i, "term": key,
-                    "df": int(lg.df_unique_text.iloc[i]),
-                    "cand": top})
+        top = [
+            aliases[j] for j, _ in
+            sorted(
+                score.items(),
+                key=lambda kv: (-kv[1], aliases[kv[0]], kv[0]),
+            )[:10]
+        ]
+        out.append({
+            "id": i,
+            "term": key,
+            "df": int(row.df_unique_text),
+            "cand_cooc": float(row.candidate_anchor_cooc),
+            "cand": top,
+        })
     return out
 
 
@@ -262,6 +283,46 @@ def run_t2(limit: int = 0, workers: int = 3) -> None:
                          f'(语料频次{it["df"]}) 已有相近: {cands}')
         return "\n".join(lines)
     batch_review(items, SYS_T2, user, out, workers=workers)
+
+
+def _legacy_first_year() -> dict[str, int]:
+    """从当前旧 union 全量 annual counts 恢复 legacy 技能首次出现年份。
+
+    这里只借用“该 term 在哪个年份出现过”这一事实，不继承旧 B/C grade。
+    """
+    import pandas as pd
+    paths = get_project_paths()
+    counts_path = (
+        paths.output_dir / "release" / "panel_v2"
+        / "skill_ai_counts.parquet"
+    )
+    vocab_path = (
+        paths.output_dir / "panel_v2" / "pass2" / "skill_vocab.json"
+    )
+    if not counts_path.exists() or not vocab_path.exists():
+        raise RuntimeError(
+            "缺少历史全量 annual counts/vocab，无法为 B/C UUID 确定首次发现年份"
+        )
+    counts = pd.read_parquet(
+        counts_path,
+        columns=[
+            "skill_code", "anchor_version", "window_type",
+            "year", "n_skill",
+        ],
+    )
+    annual = counts[
+        (counts.anchor_version == "main")
+        & (counts.window_type == "annual")
+        & (counts.n_skill > 0)
+    ]
+    vocab = json.loads(vocab_path.read_text(encoding="utf-8"))
+    code2sid = {int(code): str(sid) for sid, code in vocab.items()}
+    out: dict[str, int] = {}
+    for code, group in annual.groupby("skill_code"):
+        sid = code2sid.get(int(code))
+        if sid and sid.startswith("legacy:"):
+            out[sid] = int(group.year.min())
+    return out
 
 
 # ------------------------------------------------------------------ 合并
@@ -322,7 +383,7 @@ def merge_final() -> None:
     t1_cat: dict[str, str] = {}
     t1_rows: list[dict] = []
     covered: set[int] = set()
-    for rec in load_jsonl("t1_stopword.jsonl"):
+    for rec in load_jsonl("t1_stopword_v2.jsonl"):
         iid = int(rec["id"])
         it = id2t1.get(iid)
         if it is None:
@@ -343,7 +404,7 @@ def merge_final() -> None:
 
     t2_by_term: dict[str, dict] = {}
     covered_t2: set[int] = set()
-    for rec in load_jsonl("t2_legacy_review.jsonl"):
+    for rec in load_jsonl("t2_legacy_review_v2.jsonl"):
         iid = int(rec["id"])
         it = id2t2.get(iid)
         if it is None:
@@ -361,29 +422,40 @@ def merge_final() -> None:
     if covered_t2 != set(id2t2):
         raise RuntimeError(f"T2 覆盖不齐 {len(covered_t2)}/{len(id2t2)}")
 
-    g = pd.read_csv(
-        dic / "skill_legacy_graded_BCD_v1.csv", encoding="utf-8-sig"
+    freq = pd.read_csv(
+        dic / "legacy_df_freq_v1.csv", encoding="utf-8-sig"
     )
-    required_v1 = {"term", "skill_id", "df_freq", "grade", "first_year"}
-    if not required_v1.issubset(g.columns):
+    required_freq = {
+        "match_key", "skill_id", "df_unique_text",
+        "candidate_anchor_cooc",
+    }
+    missing_freq = required_freq - set(freq.columns)
+    if missing_freq:
         raise RuntimeError(
-            "v1 分级表缺少生成稳定概念ID所需字段: "
-            + ", ".join(sorted(required_v1 - set(g.columns)))
+            "legacy_df_freq_v1.csv 缺当前分级所需字段: "
+            + ", ".join(sorted(missing_freq))
         )
+    freq["term"] = freq.match_key.astype(str).map(_norm_key)
+    if freq.term.duplicated().any():
+        raise RuntimeError("legacy_df_freq_v1 term 不唯一")
+    first_year = _legacy_first_year()
 
     rows = []
-    for _, row in g.iterrows():
+    for row in freq.itertuples(index=False):
         term = str(row.term)
+        source_sid = str(row.skill_id)
         r2 = t2_by_term.get(term)
         item = t2_item_by_term.get(term)
         if r2 is None or item is None:
             raise RuntimeError(f"T2 未覆盖 legacy 词: {term!r}")
         c1 = t1_cat.get(term)
-        final = str(row.grade)
+        df = int(row.df_unique_text)
+        cand_cooc = float(row.candidate_anchor_cooc)
+        relation = int(r2["r"])
         reasons: list[str] = []
         mapping_action = ""
         final_skill_id = ""
-        relation = int(r2["r"])
+        final = "D"
 
         if r2.get("s") is False:
             reasons.append("t2_not_skill")
@@ -393,45 +465,65 @@ def merge_final() -> None:
             reasons.append("t2_not_skill_relation")
         if relation == -2:
             reasons.append("t2_ambiguous")
-        if r2.get("a") is True and int(row.tautological) == 1:
-            reasons.append("ambig_taut")
 
-        if reasons or final == "D":
-            final = "D"
+        if reasons:
             mapping_action = "REJECT_D"
         elif relation >= 0:
             cands = list(item.get("cand") or [])
             if relation >= len(cands):
                 raise RuntimeError(
-                    f"T2 选择越界 term={term!r}: r={relation}, candidates={len(cands)}"
+                    f"T2 选择越界 term={term!r}: "
+                    f"r={relation}, candidates={len(cands)}"
                 )
             alias = _norm_key(cands[relation])
             final_skill_id = alias_to_sid.get(alias, "")
             if not final_skill_id:
                 raise RuntimeError(
-                    f"T2 MATCH_EXISTING 无法解析 A 级 skill_id: {term!r} -> {alias!r}"
+                    f"T2 MATCH_EXISTING 无法解析 A 级 skill_id: "
+                    f"{term!r} -> {alias!r}"
                 )
             final = "A"
             mapping_action = "MATCH_EXISTING"
         elif relation == -1:
-            if final not in {"B", "C"}:
-                raise RuntimeError(
-                    f"NEW_CONCEPT 但基础分级不是 B/C: {term!r} grade={final!r}"
-                )
-            final_skill_id = stable_bc_skill_id(term, int(row.first_year))
-            mapping_action = "NEW_CONCEPT"
+            # §10.3.1：B/C 只由全量不同文本频数、候选主锚点共现率和
+            # Qwen new_tech 语义条件决定；不继承旧 proxy grade。
+            if df >= 100:
+                final = "B"
+            elif 10 <= df < 100:
+                final = "C"
+            elif df >= 5 and (
+                cand_cooc >= 0.50 or bool(r2.get("n"))
+            ):
+                final = "C"
+            else:
+                final = "D"
+                reasons.append("below_BC_admission")
+            mapping_action = (
+                "NEW_CONCEPT" if final in {"B", "C"} else "REJECT_D"
+            )
+            if final in {"B", "C"}:
+                fy = first_year.get(source_sid)
+                if fy is None:
+                    raise RuntimeError(
+                        f"正式 B/C 候选缺首次出现年份: "
+                        f"{term!r} sid={source_sid!r}"
+                    )
+                final_skill_id = stable_bc_skill_id(term, fy)
         else:
-            raise RuntimeError(f"未知 T2 relation: term={term!r}, r={relation}")
+            raise RuntimeError(
+                f"未知 T2 relation: term={term!r}, r={relation}"
+            )
 
+        fy = first_year.get(source_sid, 9999)
         rows.append({
             "term": term,
-            "source_skill_id": str(row.skill_id),
+            "source_skill_id": source_sid,
             "final_skill_id": final_skill_id,
-            "df_freq": int(row.df_freq),
-            "cand_cooc": row.get("cand_cooc", pd.NA),
-            "first_year": int(row.first_year),
-            "taut": int(row.tautological),
-            "v2e_grade": str(row.grade),
+            "df_freq": df,
+            "cand_cooc": cand_cooc,
+            "first_year": int(fy),
+            "taut": 0,
+            "v2e_grade": "",
             "t1_cat": c1,
             "t2_skill": r2.get("s"),
             "t2_cat": r2.get("c"),
@@ -441,6 +533,7 @@ def merge_final() -> None:
             "mapping_action": mapping_action,
             "final_grade": final,
             "demote_reason": "|".join(reasons),
+            "source": "legacy_full_corpus_governance_v3",
         })
 
     out = pd.DataFrame(rows).sort_values(
@@ -485,6 +578,9 @@ def merge_final() -> None:
                 json.dumps(t2_items, ensure_ascii=False, sort_keys=True).encode("utf-8")
             ).hexdigest(),
         },
+        "frequency_input_sha256": sha256_path(
+            dic / "legacy_df_freq_v1.csv"
+        ),
         "review_output_sha256": {
             "t1": sha256_path(rd / "t1_stopword_v2.jsonl"),
             "t2": sha256_path(rd / "t2_legacy_review_v2.jsonl"),
