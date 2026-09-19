@@ -123,12 +123,12 @@ def export_master(out_dir: Path) -> None:
     logger.info("master npy 导出: %d 条 / company %d", n, len(comps))
 
 
-def build_skill_vocab(out_dir: Path, grade_path: Path) -> None:
+def build_skill_vocab(out_dir: Path, grade_path: Path, a_alias_path: Path) -> None:
     """用最终 A/B/C 分级构建 formal matcher，并绑定 grade SHA。"""
     from .lexicon import (
-        _load_atier_aliases,
         build_union_lexicon,
         load_formal_legacy_spec,
+        load_frozen_atier_aliases,
     )
     from .reproducibility import sha256_file
 
@@ -136,23 +136,26 @@ def build_skill_vocab(out_dir: Path, grade_path: Path) -> None:
     spec_path = out_dir / "formal_legacy_spec.json"
     stamp_path = out_dir / "skill_vocab.stamp.json"
     grade_sha = sha256_file(grade_path)
+    a_alias_sha = sha256_file(a_alias_path)
 
     if path.exists() and spec_path.exists() and stamp_path.exists():
         stamp = json.loads(stamp_path.read_text(encoding="utf-8"))
         if (
             stamp.get("scan_version") == SCAN_VERSION
             and stamp.get("grade_sha256") == grade_sha
+            and stamp.get("a_alias_sha256") == a_alias_sha
         ):
             logger.info("formal skill_vocab 复用（grade sha 一致）")
             return
         logger.warning("formal skill_vocab 版本/grade 已变化，重建")
 
     terms, sid_by_key, tier_by_sid = load_formal_legacy_spec(grade_path)
-    aliases = _load_atier_aliases()
+    aliases, ambiguity_keys = load_frozen_atier_aliases(a_alias_path)
     lex = build_union_lexicon(
         legacy_terms=terms,
         aliases=aliases,
         legacy_skill_ids=sid_by_key,
+        ambiguous_alias_keys=ambiguity_keys,
     )
     sids = sorted(set(lex.keys_map.values()))
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -170,6 +173,8 @@ def build_skill_vocab(out_dir: Path, grade_path: Path) -> None:
             "terms": terms,
             "sid_by_key": sid_by_key,
             "tier_by_sid": tier_by_sid,
+            "a_alias_path": str(a_alias_path.resolve()),
+            "a_alias_sha256": a_alias_sha,
         }, ensure_ascii=False),
         encoding="utf-8",
     )
@@ -181,6 +186,7 @@ def build_skill_vocab(out_dir: Path, grade_path: Path) -> None:
             "scan_version": SCAN_VERSION,
             "grade_file": str(grade_path),
             "grade_sha256": grade_sha,
+            "a_alias_sha256": a_alias_sha,
             "n_vocab": len(sids),
             "n_formal_legacy_terms": len(terms),
         }, ensure_ascii=False, indent=1),
@@ -197,16 +203,21 @@ def _init_worker(npy_dir: str) -> None:
     """worker：mmap master + 词表一致性断言（B3）。"""
     _WORKER["m"] = {n: np.load(Path(npy_dir) / f"{n}.npy", mmap_mode="r")
                     for n in ("key", "job_id", "year", "company", "thash")}
-    from .lexicon import _load_atier_aliases, build_union_lexicon
+    from .lexicon import build_union_lexicon, load_frozen_atier_aliases
+    from .reproducibility import sha256_file
     base = Path(npy_dir).parent
     spec = json.loads(
         (base / "formal_legacy_spec.json").read_text(encoding="utf-8")
     )
-    aliases = _load_atier_aliases()
+    a_alias_path = Path(spec["a_alias_path"])
+    if sha256_file(a_alias_path) != spec["a_alias_sha256"]:
+        raise RuntimeError("A 级冻结 alias 文件 SHA 与 formal spec 不一致")
+    aliases, ambiguity_keys = load_frozen_atier_aliases(a_alias_path)
     lex = build_union_lexicon(
         legacy_terms=list(spec["terms"]),
         aliases=aliases,
         legacy_skill_ids={str(k): str(v) for k, v in spec["sid_by_key"].items()},
+        ambiguous_alias_keys=ambiguity_keys,
     )
     vocab_path = base / "skill_vocab.json"
     vocab = json.loads(vocab_path.read_text(encoding="utf-8"))
@@ -555,12 +566,14 @@ def main() -> None:
     grade_path = (
         paths.output_dir / "dictionary" / "skill_legacy_graded_BCD_v2.csv"
     )
-    if not grade_path.exists():
-        raise RuntimeError(
-            "缺少最终语义分级 skill_legacy_graded_BCD_v2.csv；"
-            "先运行 panel_v2.lexicon_llm merge"
-        )
-    build_skill_vocab(out_dir, grade_path)
+    a_alias_path = (
+        paths.output_dir / "dictionary"
+        / "skill_alias_active_bilingual_a_frozen_v1.1.csv"
+    )
+    for required in (grade_path, a_alias_path):
+        if not required.exists():
+            raise RuntimeError(f"正式扫描输入缺失: {required}")
+    build_skill_vocab(out_dir, grade_path, a_alias_path)
     npy_dir = str(out_dir / "master_npy")
     tasks = _plan(args.slices)
     if args.bench:
