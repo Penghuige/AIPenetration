@@ -83,6 +83,27 @@ def verify(results_dir: Path, pattern: str) -> Path:
             f"expected={EXPECTED_TOTAL}"
         )
 
+    out_dir = get_project_paths().output_dir / "dictionary"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    log_path = out_dir / "external_translation_log_v1.jsonl"
+    with log_path.open("w", encoding="utf-8") as log_fh:
+        for batch_rec in records:
+            batch = int(batch_rec["batch"])
+            batch_path = Path(batch_rec["file"])
+            for line_no, line in enumerate(
+                batch_path.read_text(encoding="utf-8").splitlines(), 1
+            ):
+                if not line.strip():
+                    continue
+                payload = json.loads(line)
+                log_fh.write(json.dumps({
+                    "batch": batch,
+                    "line_no": line_no,
+                    "source_result_file": str(batch_path),
+                    "source_result_sha256": batch_rec["sha256"],
+                    "result": payload,
+                }, ensure_ascii=False) + "\n")
+
     manifest = {
         "status": "formal_pass",
         "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -92,6 +113,8 @@ def verify(results_dir: Path, pattern: str) -> Path:
         "unique_source_skill_ids": len(global_ids),
         "pattern": pattern,
         "batches": records,
+        "external_translation_log": str(log_path),
+        "external_translation_log_sha256": _sha(log_path),
     }
     out = (
         get_project_paths().output_dir
