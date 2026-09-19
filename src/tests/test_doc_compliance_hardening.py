@@ -12,7 +12,11 @@ import pandas as pd
 from config.paths import get_project_paths
 from src.ai_penetration.common import setup_logging
 from src.ai_penetration.panel_v2.anchors import ANCHOR_VERSIONS
-from src.ai_penetration.panel_v2.quality import _rerun_drift, _sha_stats
+from src.ai_penetration.panel_v2.quality import (
+    _persist_quality_stats,
+    _rerun_drift,
+    _sha_stats,
+)
 from src.ai_penetration.panel_v2.relevance import MIN_FIT_N
 from src.ai_penetration.panel_v2.reproducibility import write_run_manifest
 from src.ai_penetration.panel_v2.scoring import THRESHOLDS, VERSIONS, WINDOWS
@@ -36,6 +40,27 @@ def test_rerun_drift_blocks_key_stat_changes():
     assert set(_rerun_drift(prev, changed)) == {
         "n_pairs", "main_annual_raw_005_rate"
     }
+
+
+
+
+def test_failed_quality_run_does_not_advance_baseline(tmp_path: Path):
+    """失败运行只能写旁路快照，不能覆盖上一轮成功 baseline。"""
+    stats_path = tmp_path / "quality_stats.json"
+    baseline = {"n_jobs": 100, "checksum_flags": "old"}
+    stats_path.write_text(json.dumps(baseline), encoding="utf-8")
+
+    failed = _persist_quality_stats(
+        stats_path,
+        {"n_jobs": 101, "checksum_flags": "new"},
+        ["§17.6.10 drift"],
+    )
+
+    assert json.loads(stats_path.read_text(encoding="utf-8")) == baseline
+    assert failed != stats_path and failed.exists()
+    failed_payload = json.loads(failed.read_text(encoding="utf-8"))
+    assert failed_payload["n_jobs"] == 101
+    assert failed_payload["checksum_flags"] == "new"
 
 
 def test_sha_stats_is_order_sensitive_but_repeatable():
