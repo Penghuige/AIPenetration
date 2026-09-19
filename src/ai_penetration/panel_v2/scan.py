@@ -123,8 +123,8 @@ def export_master(out_dir: Path) -> None:
     logger.info("master npy 导出: %d 条 / company %d", n, len(comps))
 
 
-def _load_governed_legacy_map() -> tuple[dict[str, str], str]:
-    """读取 §10 治理后的正式 A/B/C legacy 表，并返回内容哈希。"""
+def _load_governed_legacy_map() -> tuple[dict[str, str], set[str], str]:
+    """读取 §10 治理后的正式 A/B/C map、歧义键与内容哈希。"""
     import hashlib
     import pandas as pd
     from .governance import governed_skill_map
@@ -141,15 +141,20 @@ def _load_governed_legacy_map() -> tuple[dict[str, str], str]:
         )
     grades = pd.read_csv(path, encoding="utf-8-sig")
     mapping = governed_skill_map(grades)
+    formal = grades[grades.final_grade.isin(["A", "B", "C"])].copy()
+    ambiguous = {
+        str(term).lower() for term, flag in zip(formal.term, formal.t2_ambig)
+        if str(flag).strip().lower() in {"1", "true", "yes"}
+    }
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
-    return mapping, digest
+    return mapping, ambiguous, digest
 
 
 def build_skill_vocab(out_dir: Path) -> None:
     """用最终 A/B/C 概念映射构建 skill_code 词表并绑定治理表哈希。"""
     path = out_dir / "skill_vocab.json"
     stamp = out_dir / "skill_vocab.stamp.json"
-    governed, governance_hash = _load_governed_legacy_map()
+    governed, ambiguous, governance_hash = _load_governed_legacy_map()
     if path.exists() and stamp.exists():
         meta = json.loads(stamp.read_text(encoding="utf-8"))
         if (
@@ -163,6 +168,7 @@ def build_skill_vocab(out_dir: Path) -> None:
         legacy_terms=sorted(governed),
         aliases=aliases,
         legacy_id_map=governed,
+        legacy_ambiguous_keys=ambiguous,
     )
     sids = sorted(set(lex.keys_map.values()))
     tmp = out_dir / "_vocab.json.tmp"
