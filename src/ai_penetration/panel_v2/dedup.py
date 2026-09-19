@@ -652,10 +652,12 @@ def verify_invariants(metas: list[dict] | None = None) -> None:
                (SELECT count(*) FROM public.{TABLE_STAGE} WHERE yr = 0),
                (SELECT count(*) FROM public.{TABLE_STAGE} WHERE plat = 255),
                (SELECT count(*) FROM public.{TABLE_MASTER}
-                WHERE latest_day - earliest_day > 30 AND records_collapsed > 1)
+                WHERE latest_day - earliest_day > 30 AND records_collapsed > 1),
+               (SELECT count(*) - count(DISTINCT job_id)
+                FROM public.{TABLE_MASTER})
     """)
     (stage, map_n, master, collapsed, dup_groups, rid_dups, bad_years,
-     unk_plat_stage, span_over_groups) = cur.fetchone()
+     unk_plat_stage, span_over_groups, stable_id_collisions) = cur.fetchone()
     conn.close()
     rule1_sum = stage - map_n
     problems: list[str] = []
@@ -674,6 +676,9 @@ def verify_invariants(metas: list[dict] | None = None) -> None:
                             f"（须清理源数据后重跑）")
     if span_over_groups:
         problems.append(f"{span_over_groups} 组跨度>30 天（桶规则违例，实现缺陷）")
+    if stable_id_collisions:
+        problems.append(
+            f"稳定 job_id 发生 {stable_id_collisions} 个 SHA256-63 碰撞，拒绝发布")
     if collapsed != map_n:
         problems.append(f"分桶守恒失败: Σcollapsed {collapsed} != groupmap {map_n}")
     if rule1_sum > stage * 0.02:
