@@ -32,7 +32,7 @@ from config.paths import get_project_paths
 from ..common import eps_conn_params, setup_logging
 from ..skill_ai_anchor import load_merged_skills
 from .anchors import anchor_dictionary_rows
-from .lexicon import LEGACY_PREFIX, build_union_lexicon
+from .lexicon import LEGACY_PREFIX, _resolve_active_alias_rows, build_union_lexicon
 
 logger = logging.getLogger("ai_penetration.panel_v2.export")
 
@@ -76,6 +76,254 @@ def _meta(p: Path, run_id: str, primary_key: str, source_files: str,
     }
     p.with_suffix(p.suffix + ".metadata.json").write_text(
         json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+
+_T2_TYPE_TO_GUIDE = {
+    "method": "method_algorithm",
+    "tool": "software_tool",
+    "software": "software_tool",
+    "model": "method_algorithm",
+    "framework": "platform_framework_library",
+    "data": "data_database",
+    "language": "programming_language",
+    "other": "other_skill",
+}
+
+
+def _legacy_alias_id(skill_id: str, term: str) -> str:
+    """为 legacy/映射别名生成稳定 alias_id。"""
+    raw = f"{skill_id}\0{term}".encode("utf-8")
+    return "legacy_alias:" + hashlib.sha256(raw).hexdigest()[:24]
+
+
+def _alias_language(term: str) -> str:
+    has_ascii = any("a" <= ch.lower() <= "z" for ch in term)
+    has_non_ascii = any(ord(ch) > 127 for ch in term)
+    if has_ascii and has_non_ascii:
+        return "mixed"
+    return "en" if has_ascii else "zh"
+
+
+def build_final_dictionary_frames(
+    a_concepts: pd.DataFrame,
+    a_aliases: pd.DataFrame,
+    grade: pd.DataFrame,
+    *,
+    dictionary_version: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """按指南 §10/§18 组装 A+B+C 正式词典与 D 候选。
+
+    A 级来自冻结外部词典；最终 grade=A 的 legacy 表面只作为既有 A 概念别名；
+    grade=B/C 建立正式概念；grade=D 仅进入候选表。
+    """
+    required_grade = {
+        "term", "skill_id", "final_grade", "formal_skill_id",
+        "t2_type", "t2_ambig",
+    }
+    missing = required_grade - set(grade.columns)
+    if missing:
+        raise RuntimeError(
+            "最终分级缺少 §10 发布字段: " + ", ".join(sorted(missing))
+        )
+    if not set(grade.final_grade.dropna().astype(str)).issubset({"A", "B", "C", "D"}):
+        raise RuntimeError("final_grade 存在 A/B/C/D 之外取值")
+
+    # A aliases 必须与正式 matcher 使用同一 primary_skill_id 解析规则。
+    alias_rows = [
+        (str(r.alias), str(r.skill_id),
+         None if pd.isna(r.primary_skill_id) else str(r.primary_skill_id))
+        for _, r in a_aliases.iterrows()
+    ]
+    resolved = dict(_resolve_active_alias_rows(alias_rows))
+    kept_a = a_aliases[
+        a_aliases.apply(
+            lambda r: resolved.get(str(r.alias)) == str(r.skill_id), axis=1
+        )
+    ].copy()
+    kept_a = kept_a.sort_values("alias_id", kind="stable").drop_duplicates(
+        ["alias", "skill_id"], keep="first"
+    )
+    # 与 matcher 一样，NFKC/lower 后不能指向多个概念。
+    import unicodedata
+    norm_sid: dict[str, str] = {}
+    for _, row in kept_a.iterrows():
+        key = unicodedata.normalize("NFKC", str(row.alias)).lower()
+        sid = str(row.skill_id)
+        if key in norm_sid and norm_sid[key] != sid:
+            raise RuntimeError(
+                f"A 级规范化别名键 {key!r} 仍映射多个概念"
+            )
+        norm_sid[key] = sid
+
+    formal = grade[grade.final_grade.isin(["A", "B", "C"])].copy()
+    d_frame = grade[grade.final_grade == "D"].copy().reset_index(drop=True)
+
+    concept_cols = [
+        "skill_id", "canonical_zh", "canonical_en", "skill_type",
+        "skill_category", "definition", "source", "source_version",
+        "source_id", "valid_from", "valid_to", "confidence_tier",
+        "dictionary_version",
+    ]
+    concepts = a_concepts.copy()
+    for col in concept_cols:
+        if col not in concepts.columns:
+            concepts[col] = pd.NA
+    concepts = concepts[concept_cols]
+
+    extra_concepts: list[dict] = []
+    extra_aliases: list[dict] = []
+    a_ids = set(concepts.skill_id.astype(str))
+    for _, row in formal.iterrows():
+        term = str(row.term)
+        sid = str(row.formal_skill_id)
+        tier = str(row.final_grade)
+        if not sid or sid == "nan":
+            raise RuntimeError(f"正式词条 {term!r} formal_skill_id 为空")
+
+        if tier in {"B", "C"}:
+            if sid in a_ids:
+                raise RuntimeError(
+                    f"{tier} 级词条 {term!r} 错误复用 A 级 skill_id {sid}"
+                )
+            extra_concepts.append({
+                "skill_id": sid,
+                "canonical_zh": term if _alias_language(term) != "en" else "",
+                "canonical_en": term if _alias_language(term) == "en" else "",
+                "skill_type": _T2_TYPE_TO_GUIDE.get(
+                    str(row.t2_type), "other_skill"
+                ),
+                "skill_category": "china_job_legacy",
+                "definition": "",
+                "source": "china_job_legacy",
+                "source_version": "legacy_grade_v2",
+                "source_id": term,
+                "valid_from": (
+                    int(row.first_year)
+                    if "first_year" in row and not pd.isna(row.first_year)
+                    else pd.NA
+                ),
+                "valid_to": pd.NA,
+                "confidence_tier": tier,
+                "dictionary_version": dictionary_version,
+            })
+        elif sid not in a_ids:
+            raise RuntimeError(
+                f"grade=A 的词条 {term!r} 未映射到现有 A 概念: {sid}"
+            )
+
+        key = unicodedata.normalize("NFKC", term).lower()
+        if key in norm_sid and norm_sid[key] != sid:
+            raise RuntimeError(
+                f"正式别名 {term!r} 与已有 A 别名概念冲突"
+            )
+        norm_sid[key] = sid
+        extra_aliases.append({
+            "alias_id": _legacy_alias_id(sid, term),
+            "skill_id": sid,
+            "alias": term,
+            "alias_normalized": key,
+            "language": _alias_language(term),
+            "source": "china_job_legacy",
+            "matching_rule": (
+                "ascii_alnum_boundary"
+                if all(ord(ch) < 128 for ch in term)
+                else "substring"
+            ),
+            "ambiguity_flag": int(bool(row.t2_ambig)),
+            "confidence_tier": (
+                tier if tier in {"B", "C"}
+                else concepts.set_index("skill_id")
+                    .get("confidence_tier", pd.Series(dtype=object))
+                    .get(sid, "A")
+            ),
+            "dictionary_version": dictionary_version,
+            "is_active": "1",
+            "primary_skill_id": sid,
+            "boundary_rule": (
+                "ascii_alnum" if all(ord(ch) < 128 for ch in term) else ""
+            ),
+            "case_sensitive": "0",
+            "activation_reason": f"final_grade_{tier}",
+        })
+
+    if extra_concepts:
+        concepts = pd.concat(
+            [concepts, pd.DataFrame(extra_concepts)[concept_cols]],
+            ignore_index=True,
+        )
+    if concepts.skill_id.astype(str).duplicated().any():
+        raise RuntimeError("skill_concept_v1 出现重复 skill_id")
+
+    alias_cols = [
+        "alias_id", "skill_id", "alias", "alias_normalized", "language",
+        "source", "matching_rule", "ambiguity_flag", "confidence_tier",
+        "dictionary_version", "is_active", "primary_skill_id",
+        "boundary_rule", "case_sensitive", "activation_reason",
+    ]
+    for col in alias_cols:
+        if col not in kept_a.columns:
+            kept_a[col] = pd.NA
+    aliases = kept_a[alias_cols]
+    if extra_aliases:
+        aliases = pd.concat(
+            [aliases, pd.DataFrame(extra_aliases)[alias_cols]],
+            ignore_index=True,
+        )
+    if aliases.alias_id.astype(str).duplicated().any():
+        raise RuntimeError("skill_alias_v1 出现重复 alias_id")
+
+    return (
+        concepts.sort_values("skill_id", kind="stable").reset_index(drop=True),
+        aliases.sort_values(["alias", "skill_id"], kind="stable").reset_index(drop=True),
+        d_frame.sort_values("term", kind="stable").reset_index(drop=True),
+    )
+
+
+def export_final_dictionaries(
+    rel: Path,
+    grade_path: Path,
+    *,
+    dictionary_version: str,
+) -> None:
+    """从冻结 A 级 DB + 最终语义分级组装指南 §18 的正式三件。"""
+    conn = psycopg2.connect(**eps_conn_params())
+    try:
+        concepts = pd.read_sql(
+            """SELECT skill_id, canonical_zh, canonical_en, skill_type,
+                      skill_category,
+                      coalesce(definition_en, description_en, '') AS definition,
+                      source_primary AS source,
+                      source_version_primary AS source_version,
+                      source_id_primary AS source_id,
+                      valid_from, valid_to, confidence_tier, dictionary_version
+               FROM ai_dict.skill_concepts""",
+            conn,
+        )
+        aliases = pd.read_sql(
+            """SELECT alias_id, skill_id, alias, alias_normalized, language,
+                      source, matching_rule, ambiguity_flag, confidence_tier,
+                      dictionary_version, is_active, primary_skill_id,
+                      boundary_rule, case_sensitive, activation_reason
+               FROM ai_dict.skill_aliases
+               WHERE is_active='1'
+               ORDER BY alias, skill_id""",
+            conn,
+        )
+    finally:
+        conn.close()
+
+    grade = pd.read_csv(grade_path, encoding="utf-8-sig")
+    concepts, aliases, d_frame = build_final_dictionary_frames(
+        concepts, aliases, grade, dictionary_version=dictionary_version
+    )
+    concepts.to_parquet(rel / "skill_concept_v1.parquet", index=False)
+    aliases.to_parquet(rel / "skill_alias_v1.parquet", index=False)
+    d_frame.to_parquet(rel / "skill_candidate_d_v1.parquet", index=False)
+    logger.info(
+        "§18 正式词典: concepts=%d aliases=%d D=%d",
+        len(concepts), len(aliases), len(d_frame),
+    )
 
 
 def export_dictionaries(rel: Path) -> None:
