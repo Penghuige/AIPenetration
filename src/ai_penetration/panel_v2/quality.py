@@ -450,6 +450,33 @@ def warning_checks(rel: Path) -> tuple[list[str], dict]:
         "year")["aijob_main_annual_raw_015"].mean().round(5).to_dict()
     info["exposure_005_by_year"] = cls.groupby(
         "year")["aijob_main_annual_raw_005"].mean().round(5).to_dict()
+    robust_path = rel / "job_ai_score_robustness.parquet"
+    if not robust_path.exists():
+        warns.append(
+            "缺 §19.2 exclude-C / remove-anchor-skills 稳健性结果"
+        )
+    else:
+        robust = pq.read_table(
+            robust_path,
+            columns=[
+                "job_id",
+                "flip_vs_primary005_exclude_c",
+                "flip_vs_primary005_remove_anchor_skills",
+            ],
+        ).to_pandas()
+        if len(robust) != len(cls) or robust.job_id.duplicated().any():
+            fails = "robustness job_id 行数/唯一性异常"
+            warns.append(fails)
+        info["robustness_flip_rate"] = {
+            "exclude_c": round(
+                float(robust.flip_vs_primary005_exclude_c.mean()), 6
+            ),
+            "remove_anchor_skills": round(
+                float(
+                    robust.flip_vs_primary005_remove_anchor_skills.mean()
+                ), 6
+            ),
+        }
 
     if "confidence_tier" in longs.columns:
         tier_detail = (
