@@ -94,6 +94,17 @@ if ROW_DTYPE.itemsize != 72:
     raise RuntimeError(f"ROW_DTYPE 尺寸异常: {ROW_DTYPE.itemsize} != 72")
 
 
+def _stable_job_id_sha256(platform: str, raw_job_id: str) -> str:
+    """指南 §3.2 的完整稳定岗位编号。"""
+    import hashlib
+    payload = (
+        str(platform or "").strip()
+        + "\x1f"
+        + str(raw_job_id or "").strip()
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _stable_job_id(platform: str, raw_job_id: str) -> int:
     """SHA256(source_platform | job_id_raw) 的 63-bit 计算代理键。
 
