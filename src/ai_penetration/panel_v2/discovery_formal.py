@@ -175,30 +175,19 @@ def incremental_round(df: pd.DataFrame, selected_ids: set,
 
 
 def saturation_pass(metrics: pd.DataFrame) -> bool:
-    """8/24 handoff：覆盖率只监测，不作为正式停止条件。
+    """8/24 handoff：连续两轮新增有效标准概念 <5 即满足饱和。
 
-    连续两轮要求：
-    - 每 1 万条新增有效标准概念 <5；
-    - 年份/主要行业覆盖已完成；
-    - 主锚点未覆盖比例不再明显下降。
-    coverage_gain_pp 仍必须记录用于报告，但不参与 pass/fail。
+    coverage_gain_pp 仍保存为监测指标，但任何覆盖率派生条件都不参与停止。
+    年份×行业抽样完整性由 finalize 直接从 frame/selected 验证。
     """
-    required = {
-        "round", "new_standard_concepts", "coverage_gain_pp",
-        "all_years_major_industries_covered", "anchor_uncovered_stable",
-    }
+    required = {"round", "new_standard_concepts", "coverage_gain_pp"}
     missing = required - set(metrics.columns)
     if missing:
         raise ValueError("round metrics 缺列: " + ", ".join(sorted(missing)))
     if len(metrics) < 2:
         return False
     last = metrics.sort_values("round").tail(2)
-    ok = (
-        (last.new_standard_concepts < 5)
-        & last.all_years_major_industries_covered.astype(bool)
-        & last.anchor_uncovered_stable.astype(bool)
-    )
-    return bool(ok.all())
+    return bool((last.new_standard_concepts < 5).all())
 
 
 def finalize(
@@ -217,6 +206,30 @@ def finalize(
     metrics = pd.read_csv(metrics_path)
     passed = saturation_pass(metrics)
 
+    # 后期 handoff 的基准规则是每个 year×industry 单元都进入样本。
+    frame_units = {
+        (int(y), str(i).strip() or "INDUSTRY_MISSING")
+        for y, i in zip(
+            df.year,
+            df.industry.fillna("INDUSTRY_MISSING"),
+        )
+    }
+    if not {"year", "industry"}.issubset(selected.columns):
+        raise ValueError("selected sample 缺 year/industry，无法验收分层覆盖")
+    selected_units = {
+        (int(y), str(i).strip() or "INDUSTRY_MISSING")
+        for y, i in zip(
+            selected.year,
+            selected.industry.fillna("INDUSTRY_MISSING"),
+        )
+    }
+    missing_units = frame_units - selected_units
+    if missing_units:
+        raise ValueError(
+            "基准发现样本未覆盖全部 year×industry 单元: "
+            + ", ".join(map(str, sorted(missing_units)[:10]))
+        )
+
     audit = pd.read_csv(candidate_audit_path)
     required_audit = {
         "term", "final_grade", "final_skill_id",
@@ -228,6 +241,24 @@ def finalize(
             "candidate audit 缺列: " + ", ".join(sorted(missing))
         )
     if not set(audit.final_grade.astype(str)) <= {"A", "B", "C", "D"}:
+    if {"decision", "source_round"}.issubset(audit.columns):
+        derived = (
+            audit[
+                (audit.decision.astype(str) == "NEW_CONCEPT")
+                & audit.final_grade.isin(["B", "C"])
+            ]
+            .groupby("source_round")
+            .size()
+            .to_dict()
+        )
+        for row in metrics.itertuples(index=False):
+            expected_new = int(derived.get(int(row.round), 0))
+            if int(row.new_standard_concepts) != expected_new:
+                raise ValueError(
+                    f"round {int(row.round)} new_standard_concepts="
+                    f"{int(row.new_standard_concepts)} != audit-derived "
+                    f"{expected_new}"
+                )
         raise ValueError("candidate audit 含未知 final_grade")
     formal = audit[audit.final_grade.isin(["A", "B", "C"])].copy()
     if (formal.evidence_count <= 0).any() or not formal.span_valid.astype(bool).all():
@@ -275,6 +306,8 @@ def finalize(
         "n_formal_candidates": len(formal),
         "rounds": int(metrics["round"].max()) if len(metrics) else 0,
         "required_strata": STRATA,
+        "year_industry_units": len(frame_units),
+        "coverage_gain_role": "monitor_only_not_stop_or_admission",
     }
     out = (
         get_project_paths().output_dir
