@@ -8,6 +8,7 @@ from src.ai_penetration.panel_v2.lexicon import (
     LEGACY_PREFIX,
     _resolve_active_alias_rows,
     build_union_lexicon,
+    load_frozen_atier_aliases,
 )
 from src.ai_penetration.text_clean import (
     clean_description,
@@ -160,3 +161,27 @@ def test_normalize_position_strips_noise():
     # 同企业编号噪声归并（去重目的），但字母内容保留（保守规则）
     assert normalize_position("软件工程师（HS0287）") == normalize_position("软件工程师（HS0277）")
     assert normalize_position("AI 算法工程师") == "ai算法工程师"
+
+
+
+def test_frozen_alias_file_uses_primary_and_keeps_ambiguity(tmp_path):
+    frame = pd.DataFrame([
+        {
+            "alias": "ABAP", "skill_id": "uuid-b", "is_active": "1",
+            "primary_skill_id": "uuid-a", "ambiguity_flag": "1",
+        },
+        {
+            "alias": "ABAP", "skill_id": "uuid-a", "is_active": "1",
+            "primary_skill_id": "uuid-a", "ambiguity_flag": "1",
+        },
+        {
+            "alias": "Python", "skill_id": "uuid-python", "is_active": "1",
+            "primary_skill_id": "", "ambiguity_flag": "0",
+        },
+    ])
+    path = tmp_path / "aliases.csv"
+    frame.to_csv(path, index=False, encoding="utf-8-sig")
+    aliases, ambiguity = load_frozen_atier_aliases(path)
+    assert dict(aliases)["ABAP"] == "uuid-a"
+    assert dict(aliases)["Python"] == "uuid-python"
+    assert "abap" in ambiguity
