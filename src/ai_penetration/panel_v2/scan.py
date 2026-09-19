@@ -365,7 +365,7 @@ def merge_parts(out_dir: Path, rel_dir: Path) -> None:
          "job_id"),
         ("job_skill_long", "parts_long",
          "job_id int8, year int, skill_code int, surface_form text,"
-         " start int, end int, mention_count int, match_method text,"
+         " start int, \"end\" int, mention_count int, match_method text,"
          " ambiguity_flag smallint",
          "job_id, skill_code"),
         ("job_firm", "parts_firm", "job_id int8, year int, company_code int",
@@ -438,7 +438,7 @@ def merge_parts(out_dir: Path, rel_dir: Path) -> None:
             read_options=pcsv.ReadOptions(block_size=1 << 24),
             convert_options=pcsv.ConvertOptions(
                 column_types={c: t for c, t in zip(
-                    [x.split()[0] for x in cols.split(", ")],
+                    [x.split()[0].strip('"') for x in cols.split(", ")],
                     _arrow_types(name))}))
         pq.write_table(tbl, rel_dir / f"{name}.parquet", compression="zstd")
         csv_tmp.unlink(missing_ok=True)
@@ -452,10 +452,15 @@ def merge_parts(out_dir: Path, rel_dir: Path) -> None:
 def _arrow_types(name: str) -> list:
     import pyarrow as pa
     if name == "job_anchor_flag":
-        return [pa.int64(), pa.int32(), pa.int16(), pa.int16(), pa.int16(),
-                pa.int16()]
+        return [
+            pa.int64(), pa.int32(), pa.int16(), pa.int16(), pa.int16(),
+            pa.int16(), pa.string(), pa.string(),
+        ]
     if name == "job_skill_long":
-        return [pa.int64(), pa.int32(), pa.int32()]
+        return [
+            pa.int64(), pa.int32(), pa.int32(), pa.string(),
+            pa.int32(), pa.int32(), pa.int32(), pa.string(), pa.int16(),
+        ]
     return [pa.int64(), pa.int32(), pa.int32()]
 
 
