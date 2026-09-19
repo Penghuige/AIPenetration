@@ -12,8 +12,8 @@
    ``ADMISSION_WHERE`` 单源定义，scan 阶段复用防漂移），Python 侧算
    match 文本 hash、pos_norm_hash、日期、描述长度、**字段完整度**
    （education/work_type/experience/recruit_count/age_req 非空数——评审代理
-   定义，§6.2.2.2 的可辩护实现）；年份/日期不可解析**不丢行**（yr=0/day=-1
-   隔离标记）；rid 超 32 字节**硬失败**（防定长槽静默截断）；定长 64B 窄行
+   定义，§6.2.2.2 的可辩护实现）；年份/日期不可解析先保留在 stage，随后进入
+   `dedup_invalid_date_gzsz` 隔离表，不进入正式 master；rid 超 32 字节**硬失败**；定长窄行
    分片落盘，断点复用校验 MASTER_VERSION+切片范围。
 3. ``copy_stage``：文本 COPY 进常规 WAL stage 表（启动时强制
    ``SET LOGGED``——`CREATE IF NOT EXISTS` 不改变既有表持久性，审计实证
@@ -68,6 +68,7 @@ TABLE_SORTED = "dedup_sorted_gzsz"
 TABLE_MASTER = "job_master_gzsz"
 TABLE_GROUPMAP = "dup_group_map_gzsz"
 TABLE_ENTMAP = "ent_company_map"
+TABLE_ISOLATED = "dedup_invalid_date_gzsz"
 SHARDS = (("广州市", "job_p0387", 0), ("深圳市", "job_p0389", 1))
 _EPOCH_DAYS = 14610  # date(2010,1,1).toordinal()
 _YEAR_RE = re.compile(r"^\s*(\d{4})")
@@ -577,6 +578,14 @@ def build_master() -> tuple[int, int]:
             cur.execute(f"DROP TABLE public.{TABLE_SORTED}")
             sorted_exists = False
     if not sorted_exists:
+        # §3.1：无法完整解析日期的记录进入隔离表，不参与正式按年样本。
+        cur.execute(f"DROP TABLE IF EXISTS public.{TABLE_ISOLATED}")
+        cur.execute(f"""
+            CREATE TABLE public.{TABLE_ISOLATED} AS
+            SELECT * FROM public.{TABLE_STAGE}
+            WHERE yr NOT BETWEEN 2014 AND 2025 OR day < 0
+        """)
+        conn.commit()
         # 段一：规则1（§6.2.1.1 平台+编号唯一记录，跨城重复折叠并计数）
         # + join ent 城市内映射；一 rid 多司不任意裁决，NULL/冲突→哨兵
         cur.execute(f"""
@@ -595,6 +604,7 @@ def build_master() -> tuple[int, int]:
                     GROUP BY city, recruit_id
                 ) e
                   ON e.city = s.city AND e.recruit_id = s.rid
+                WHERE s.yr BETWEEN 2014 AND 2025 AND s.day >= 0
             ), rid_rank AS (
                 SELECT *,
                        row_number() OVER (
@@ -704,6 +714,7 @@ def verify_invariants(metas: list[dict] | None = None) -> None:
     #   Σmaster.records_collapsed = groupmap 行数（分桶守恒）
     cur.execute(f"""
         SELECT (SELECT count(*) FROM public.{TABLE_STAGE}),
+               (SELECT count(*) FROM public.{TABLE_ISOLATED}),
                (SELECT count(*) FROM public.{TABLE_GROUPMAP}),
                (SELECT count(*) FROM public.{TABLE_MASTER}),
                (SELECT sum(records_collapsed) FROM public.{TABLE_MASTER}),
@@ -718,10 +729,11 @@ def verify_invariants(metas: list[dict] | None = None) -> None:
                (SELECT count(*) - count(DISTINCT job_id)
                 FROM public.{TABLE_MASTER})
     """)
-    (stage, map_n, master, collapsed, dup_groups, rid_dups, bad_years,
+    (stage, isolated, map_n, master, collapsed, dup_groups, rid_dups, bad_years,
      unk_plat_stage, span_over_groups, stable_id_collisions) = cur.fetchone()
     conn.close()
-    rule1_sum = stage - map_n
+    eligible_stage = stage - isolated
+    rule1_sum = eligible_stage - map_n
     problems: list[str] = []
     if rule1_sum < 0:
         problems.append(f"groupmap {map_n} > stage {stage}（不可能状态）")
@@ -743,21 +755,28 @@ def verify_invariants(metas: list[dict] | None = None) -> None:
             f"稳定 job_id 发生 {stable_id_collisions} 个 SHA256-63 碰撞，拒绝发布")
     if collapsed != map_n:
         problems.append(f"分桶守恒失败: Σcollapsed {collapsed} != groupmap {map_n}")
-    if rule1_sum > stage * 0.02:
-        problems.append(f"规则1折叠 {rule1_sum} 超 stage 2%（rid 重复异常）")
+    if rule1_sum > eligible_stage * 0.02:
+        problems.append(
+            f"规则1折叠 {rule1_sum} 超 eligible stage 2%（rid 重复异常）"
+        )
     logger.info("规则1折叠行数（stage-groupmap）: %d", rule1_sum)
     if dup_groups != 0:
         problems.append(f"{dup_groups} 组出现多 canonical")
     if rid_dups != 0:
         problems.append(f"{rid_dups} 个 (platform_hash,rid) 出现多 canonical")
-    if bad_years / max(stage, 1) > BAD_YEAR_THRESHOLD:
-        problems.append(f"年份不可解析 {bad_years}/{stage} 超阻断线 {BAD_YEAR_THRESHOLD:.1%}")
+    if bad_years > isolated:
+        problems.append(
+            f"yr=0 行 {bad_years} 大于日期隔离行 {isolated}（隔离逻辑异常）"
+        )
     if problems:
         for p in problems:
             logger.error("不变量: %s", p)
         raise SystemExit(2)
-    logger.info("M2 不变量通过: stage=%d collapsed=%s 组唯一 canonical=%d",
-                stage, collapsed, master)
+    logger.info(
+        "M2 不变量通过: stage=%d isolated_date=%d eligible=%d "
+        "collapsed=%s canonical=%d",
+        stage, isolated, eligible_stage, collapsed, master,
+    )
 
 
 def main() -> None:
