@@ -194,6 +194,7 @@ def build_union_lexicon(
     include_legacy: bool = True,
     legacy_terms: list[str] | None = None,
     aliases: list[tuple[str, str] | AliasRecord] | None = None,
+    legacy_id_map: dict[str, str] | None = None,
 ) -> UnionLexicon:
     """构建 union 词表匹配器。
 
@@ -236,15 +237,28 @@ def build_union_lexicon(
         terms = legacy_terms if legacy_terms is not None \
             else load_merged_skills(include_llm=True)
         for term in terms:
-            key = unicodedata.normalize("NFKC", term).lower()
+            key = _norm_key(term)
             if len(key) < 2:
                 continue
+            if legacy_id_map is not None:
+                # handoff-compliant 正式扫描只允许治理表中的 A/B/C。
+                target_sid = legacy_id_map.get(key)
+                if not target_sid:
+                    continue
+            else:
+                target_sid = LEGACY_PREFIX + key
             if key in keys:
                 overlap.append(term)
-                continue  # A 级已覆盖（同形键），概念空间优先
-            keys[key] = LEGACY_PREFIX + key
+                if legacy_id_map is not None and keys[key] != target_sid:
+                    raise RuntimeError(
+                        f"治理映射与 A 级同形键冲突: {key!r} -> "
+                        f"{keys[key]!r}/{target_sid!r}"
+                    )
+                continue
+            keys[key] = target_sid
             if term in _AMBIGUOUS_AI_TERMS:
                 homograph[keys[key]] = _AMBIGUOUS_AI_TERMS[term]
+                ambiguous_keys.add(key)
             n_legacy += 1
 
     automaton = ahocorasick.Automaton()
