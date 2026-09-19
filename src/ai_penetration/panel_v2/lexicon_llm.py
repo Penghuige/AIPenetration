@@ -16,10 +16,12 @@ JSONL 断点续跑（按 item id 去重）、解析失败单条重试一轮后�
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import re
 import threading
+from datetime import datetime
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -31,7 +33,12 @@ from src.model_platform.llm import create_llm_client
 
 logger = logging.getLogger("ai_penetration.panel_v2.lexicon_llm")
 
-NO_THINK = {"chat_template_kwargs": {"enable_thinking": False}}
+REVIEW_SEED = 20260822
+REVIEW_PROTOCOL_VERSION = "handoff_v2_20260919"
+NO_THINK = {
+    "chat_template_kwargs": {"enable_thinking": False},
+    "seed": REVIEW_SEED,
+}
 BUDGET_CHARS = 2600          # 请求字符预算（留 reply+模板余量）
 _LOCK = threading.Lock()
 
@@ -193,7 +200,7 @@ def candidates_t1() -> list[dict]:
 def run_t1(workers: int = 3) -> None:
     paths = get_project_paths()
     items = candidates_t1()
-    out = paths.output_dir / "llm_review" / "t1_stopword.jsonl"
+    out = paths.output_dir / "llm_review" / "t1_stopword_v2.jsonl"
     out.parent.mkdir(parents=True, exist_ok=True)
 
     def user(batch: list[dict]) -> str:
@@ -244,7 +251,7 @@ def run_t2(limit: int = 0, workers: int = 3) -> None:
     items = candidates_t2()
     if limit:
         items = items[:limit]
-    out = paths.output_dir / "llm_review" / "t2_legacy_review.jsonl"
+    out = paths.output_dir / "llm_review" / "t2_legacy_review_v2.jsonl"
     out.parent.mkdir(parents=True, exist_ok=True)
 
     def user(batch: list[dict]) -> str:
@@ -446,6 +453,48 @@ def merge_final() -> None:
         dic / "skill_legacy_graded_BCD_v3.csv",
         index=False,
         encoding="utf-8-sig",
+    )
+
+    def sha256_path(path: Path) -> str:
+        h = hashlib.sha256()
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    from config.paths import load_config_yaml
+    model_cfg = load_config_yaml("model_runtime.yaml")
+    llm_cfg = model_cfg.get("llm", {}) if isinstance(model_cfg, dict) else {}
+    manifest = {
+        "protocol_version": REVIEW_PROTOCOL_VERSION,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "model": str(llm_cfg.get("model", "")),
+        "base_url_recorded": str(llm_cfg.get("base_url", "")),
+        "temperature": 0.0,
+        "seed": REVIEW_SEED,
+        "thinking": False,
+        "prompt_sha256": {
+            "t1": hashlib.sha256(SYS_T1.encode("utf-8")).hexdigest(),
+            "t2": hashlib.sha256(SYS_T2.encode("utf-8")).hexdigest(),
+        },
+        "candidate_frame_sha256": {
+            "t1": hashlib.sha256(
+                json.dumps(t1_items, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest(),
+            "t2": hashlib.sha256(
+                json.dumps(t2_items, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest(),
+        },
+        "review_output_sha256": {
+            "t1": sha256_path(rd / "t1_stopword_v2.jsonl"),
+            "t2": sha256_path(rd / "t2_legacy_review_v2.jsonl"),
+        },
+        "output_sha256": sha256_path(dic / "skill_legacy_graded_BCD_v3.csv"),
+        "status": "complete",
+    }
+    (dic / "skill_legacy_governance_manifest_v3.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
     )
 
     fc = out.final_grade.value_counts()
