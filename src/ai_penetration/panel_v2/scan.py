@@ -249,6 +249,8 @@ def _flush_parts(out: Path, task: str, part: int,
             "match_method": pa.array(cols[8], pa.string()),
             "ambiguity_flag": pa.array(cols[9], pa.int8()),
             "span_verified": pa.array(cols[10], pa.int8()),
+            "covered_candidate_count": pa.array(cols[11], pa.int32()),
+            "covered_candidates": pa.array(cols[12], pa.string()),
         }), out / "parts_long" / f"{task}_{part:04d}.parquet",
                        compression="zstd")
     if text_buf:
@@ -365,6 +367,8 @@ def scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str) -> dict
                         match.start, match.end, match.mention_count,
                         match.match_method, match.ambiguity_flag,
                         int(match_txt[match.start:match.end] == match.surface_form),
+                        match.covered_candidate_count,
+                        match.covered_candidates,
                     ))
                 firm_buf.append((job_id, yr, int(m["company"][idx])))
                 text_buf.append((
@@ -438,7 +442,8 @@ def merge_parts(out_dir: Path, rel_dir: Path) -> None:
         ("job_skill_long", "parts_long",
          "job_id int8, year int, skill_code int, skill_id text, surface_form text,"
          " match_start int, match_end int, mention_count int, match_method text,"
-         " ambiguity_flag smallint, span_verified smallint",
+         " ambiguity_flag smallint, span_verified smallint,"
+         " covered_candidate_count int, covered_candidates text",
          "job_id, skill_code"),
         ("job_firm", "parts_firm", "job_id int8, year int, company_code int",
          "job_id"),
@@ -531,7 +536,7 @@ def _arrow_types(name: str) -> list:
     if name == "job_skill_long":
         return [pa.int64(), pa.int32(), pa.int32(), pa.string(), pa.string(),
                 pa.int32(), pa.int32(), pa.int32(), pa.string(), pa.int16(),
-                pa.int16()]
+                pa.int16(), pa.int32(), pa.string()]
     if name == "job_text_clean":
         return [pa.int64(), pa.string(), pa.string(), pa.string(), pa.int32(),
                 pa.string(), pa.string(), pa.string(), pa.int64()]
