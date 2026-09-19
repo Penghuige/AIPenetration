@@ -350,10 +350,9 @@ def merge_parts(out_dir: Path, rel_dir: Path) -> None:
 
     2026-09-07 教训：2 亿行 pandas concat+drop_duplicates 内存洪峰疑似
     压垮同机 PG（UNLOGGED 表被重启清空）——大表 dedup 是 PG 的本职，
-    Python 端只做流式 CSV→parquet 转换。跨切片重复命中（rid 在 raw 有
-    真重复行）由 DISTINCT ON keep-first 仲裁；"同 canonical 识别等价"
-    是假设而非前提（审计 D4），此处逐 job 实测冲突数并披露（flag/firm
-    多值即冲突；long 表 keep-first 天然吸收集合差异，不可从此路测量）。
+    Python 端只做流式 CSV→parquet 转换。扫描阶段已用 master 的 canonical
+    text_hash 精确绑定原文；因此同一 job_id 的重复 raw 拷贝若产生不同识别
+    结果属于阻断性不变量错误，不再由 keep-first 任意裁决。
     """
     import pyarrow.csv as pcsv
     import pyarrow.parquet as pq
@@ -361,10 +360,13 @@ def merge_parts(out_dir: Path, rel_dir: Path) -> None:
     specs = (
         ("job_anchor_flag", "parts_flags",
          "job_id int8, year int, anchor_main smallint, anchor_cn_paper smallint,"
-         " anchor_babina smallint, groups_main_bits int",
+         " anchor_babina smallint, groups_main_bits int,"
+         " matched_anchor_groups_main text, matched_anchor_terms_main text",
          "job_id"),
         ("job_skill_long", "parts_long",
-         "job_id int8, year int, skill_code int",
+         "job_id int8, year int, skill_code int, surface_form text,"
+         " start int, end int, mention_count int, match_method text,"
+         " ambiguity_flag smallint",
          "job_id, skill_code"),
         ("job_firm", "parts_firm", "job_id int8, year int, company_code int",
          "job_id"),
@@ -381,20 +383,27 @@ def merge_parts(out_dir: Path, rel_dir: Path) -> None:
         cur.execute(f"DROP TABLE IF EXISTS public.{fin} CASCADE")
         cur.execute(f"CREATE TABLE public.{stg} ({cols})")
         files = sorted((out_dir / sub).glob("*.parquet"))
-        assert files, f"{sub} 无分片"
+        if not files:
+            raise RuntimeError(f"{sub} 无分片")
         for f in files:
             bio = _table_to_csv_buf(f)
             cur.copy_expert(
                 f"COPY public.{stg} FROM STDIN WITH (FORMAT csv)", bio)
         conn.commit()
-        # keep-first 等价假设实测（审计 D4）：同一 job_id 的多拷贝行若识别
-        # 结果不同，即存在"扫的描述≠定群描述"的真实分歧面
         conflict = 0
         if name == "job_anchor_flag":
             cur.execute(
                 f"SELECT count(*) FROM (SELECT job_id FROM public.{stg} "
                 "GROUP BY job_id HAVING count(DISTINCT (year, anchor_main,"
-                " anchor_cn_paper, anchor_babina, groups_main_bits)) > 1) x")
+                " anchor_cn_paper, anchor_babina, groups_main_bits,"
+                " matched_anchor_groups_main, matched_anchor_terms_main)) > 1) x")
+            conflict = cur.fetchone()[0]
+        elif name == "job_skill_long":
+            cur.execute(
+                f"SELECT count(*) FROM (SELECT job_id, skill_code FROM public.{stg} "
+                "GROUP BY job_id, skill_code HAVING count(DISTINCT "
+                "(year, surface_form, start, "end", mention_count, match_method,"
+                " ambiguity_flag)) > 1) x")
             conflict = cur.fetchone()[0]
         elif name == "job_firm":
             cur.execute(
@@ -402,11 +411,17 @@ def merge_parts(out_dir: Path, rel_dir: Path) -> None:
                 f"GROUP BY job_id HAVING count(DISTINCT company_code) > 1) x")
             conflict = cur.fetchone()[0]
         if conflict:
-            logger.warning("keep-first 冲突披露 %s: %d 个 job 多拷贝识别不等价"
-                           "（受影响行由 ctid 序 keep-first 裁决，跨运行可翻转）",
-                           name, conflict)
-        cur.execute(f"CREATE TABLE public.{fin} AS SELECT DISTINCT ON ({dedup_key}) *"
-                    f" FROM public.{stg} ORDER BY {dedup_key}, job_id")
+            raise RuntimeError(
+                f"canonical 重复拷贝识别不一致 {name}: {conflict} 个键"
+            )
+        order_tail = (
+            ", start, "end", surface_form"
+            if name == "job_skill_long" else ", job_id"
+        )
+        cur.execute(
+            f"CREATE TABLE public.{fin} AS SELECT DISTINCT ON ({dedup_key}) * "
+            f"FROM public.{stg} ORDER BY {dedup_key}{order_tail}"
+        )
         conn.commit()
         cur.execute(f"SELECT count(*) FROM public.{stg}")
         before = cur.fetchone()[0]
