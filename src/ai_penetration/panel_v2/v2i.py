@@ -163,7 +163,7 @@ def main() -> None:
     rel3 = release_root / f".panel_v2i_{args.run_id}.tmp"
 
     scan_inputs = ("job_anchor_flag.parquet", "job_skill_long.parquet",
-                   "job_firm.parquet")
+                   "job_firm.parquet", "job_text_clean.parquet")
     preflight_files = [rel2 / f for f in scan_inputs]
     preflight_files += [
         frozen_concepts,
@@ -303,6 +303,8 @@ def main() -> None:
         ("job_skill_long.parquet", "job_id+skill_id",
          "panel_v2/scan.py(longest-match+span evidence)"),
         ("job_firm.parquet", "job_id", "panel_v2/scan.py"),
+        ("job_text_clean.parquet", "job_id",
+         "panel_v2/scan.py(raw/clean/match §6.1)"),
         ("skill_ai_counts.parquet", "skill+ver+win+year", "panel_v2/counts.py"),
         ("skill_ai_relevance.parquet", "skill+ver+win+year", "panel_v2/relevance.py"),
         ("job_ai_score.parquet", "job+ver+win+stype", "panel_v2/scoring.py"),
