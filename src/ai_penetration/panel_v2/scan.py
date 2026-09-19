@@ -6,13 +6,11 @@ output/panel_v2/pass2/。审计修复版（B1/B3/M9）：
 - master 导出为**裸 .npy + np.load(mmap_mode="r")**（npz 成员不真 mmap，
   实证每 worker 会私载全量——已修正），按 key=blake2b-63(recruit_id) 排序；
   目录含 .stamp.json 版号戳（MASTER_VERSION+n），复用前校验。
-- 命中键最终定稿 **rid-only**（master rid 实证全局唯一）：同一 rid 的多份
-  raw 拷贝全部映射到同一 job_id，跨切片重复由 worker hit_seen 片内去重 +
-  merge 端 PG DISTINCT ON 仲裁；keep-first 的"多拷贝识别等价"假设由
-  merge_parts 冲突计数**实测披露**（flag/firm 逐 job 多值计数），全国重跑
-  预检须复核该计数（审计 D4）。
-- skill 词表由**主进程单点构建**并原子落盘（含 ORDER BY 的别名查询消除
-  36 个实证碰撞键的跨 worker 分歧），worker 读文件 + 一致性断言。
+- rid-only 仅用于定位 master 候选；真正进入识别的 raw 行还必须满足
+  canonical text_hash 与 job_master.thash 一致，因此技能/锚点严格绑定
+  去重阶段选中的 canonical 文本，不再依赖 ctid keep-first 假设。
+- skill 词表由**主进程单点构建**并原子落盘；正式扫描只加载最终语义分级
+  A/B/C（D 不进入 matcher），并把分级文件 SHA 与 SCAN_VERSION 写入 stamp。
 - 产物**按批落盘为 parquet dataset 分区**（flags/long/firm 三目录），
   不在内存累积全量行。
 - 守恒断言：Σcanonical == job_master 行数。
@@ -125,34 +123,92 @@ def export_master(out_dir: Path) -> None:
     logger.info("master npy 导出: %d 条 / company %d", n, len(comps))
 
 
-def build_skill_vocab(out_dir: Path) -> None:
-    """主进程单点构建 union 词表并原子落盘（B3：ORDER BY 确定性）。"""
+def build_skill_vocab(out_dir: Path, grade_path: Path) -> None:
+    """用最终 A/B/C 分级构建 formal matcher，并绑定 grade SHA。"""
+    from .lexicon import (
+        _load_atier_aliases,
+        build_union_lexicon,
+        load_formal_legacy_spec,
+    )
+    from .reproducibility import sha256_file
+
     path = out_dir / "skill_vocab.json"
-    if path.exists():
-        return
-    from ..skill_ai_anchor import load_merged_skills
-    from .lexicon import _load_atier_aliases, build_union_lexicon
-    aliases = _load_atier_aliases()   # 查询已 ORDER BY，first-wins 确定
-    lex = build_union_lexicon(legacy_terms=load_merged_skills(include_llm=True),
-                              aliases=aliases)
+    spec_path = out_dir / "formal_legacy_spec.json"
+    stamp_path = out_dir / "skill_vocab.stamp.json"
+    grade_sha = sha256_file(grade_path)
+
+    if path.exists() and spec_path.exists() and stamp_path.exists():
+        stamp = json.loads(stamp_path.read_text(encoding="utf-8"))
+        if (
+            stamp.get("scan_version") == SCAN_VERSION
+            and stamp.get("grade_sha256") == grade_sha
+        ):
+            logger.info("formal skill_vocab 复用（grade sha 一致）")
+            return
+        logger.warning("formal skill_vocab 版本/grade 已变化，重建")
+
+    terms, sid_by_key, tier_by_sid = load_formal_legacy_spec(grade_path)
+    aliases = _load_atier_aliases()
+    lex = build_union_lexicon(
+        legacy_terms=terms,
+        aliases=aliases,
+        legacy_skill_ids=sid_by_key,
+    )
     sids = sorted(set(lex.keys_map.values()))
+    out_dir.mkdir(parents=True, exist_ok=True)
+
     tmp = out_dir / "_vocab.json.tmp"
-    tmp.write_text(json.dumps({s: i for i, s in enumerate(sids)},
-                              ensure_ascii=False), encoding="utf-8")
-    tmp.rename(path)
-    logger.info("skill_vocab 落盘: %d skill", len(sids))
+    tmp.write_text(
+        json.dumps({s: i for i, s in enumerate(sids)}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    tmp.replace(path)
+
+    spec_tmp = out_dir / "_formal_legacy_spec.json.tmp"
+    spec_tmp.write_text(
+        json.dumps({
+            "terms": terms,
+            "sid_by_key": sid_by_key,
+            "tier_by_sid": tier_by_sid,
+        }, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    spec_tmp.replace(spec_path)
+
+    stamp_tmp = out_dir / "_skill_vocab.stamp.json.tmp"
+    stamp_tmp.write_text(
+        json.dumps({
+            "scan_version": SCAN_VERSION,
+            "grade_file": str(grade_path),
+            "grade_sha256": grade_sha,
+            "n_vocab": len(sids),
+            "n_formal_legacy_terms": len(terms),
+        }, ensure_ascii=False, indent=1),
+        encoding="utf-8",
+    )
+    stamp_tmp.replace(stamp_path)
+    logger.info(
+        "formal skill_vocab 落盘: %d concepts / %d formal legacy aliases",
+        len(sids), len(terms),
+    )
 
 
 def _init_worker(npy_dir: str) -> None:
     """worker：mmap master + 词表一致性断言（B3）。"""
     _WORKER["m"] = {n: np.load(Path(npy_dir) / f"{n}.npy", mmap_mode="r")
                     for n in ("key", "job_id", "year", "company", "thash")}
-    from ..skill_ai_anchor import load_merged_skills
     from .lexicon import _load_atier_aliases, build_union_lexicon
+    base = Path(npy_dir).parent
+    spec = json.loads(
+        (base / "formal_legacy_spec.json").read_text(encoding="utf-8")
+    )
     aliases = _load_atier_aliases()
-    lex = build_union_lexicon(legacy_terms=load_merged_skills(include_llm=True),
-                              aliases=aliases)
-    vocab_path = Path(npy_dir).parent / "skill_vocab.json"
+    lex = build_union_lexicon(
+        legacy_terms=list(spec["terms"]),
+        aliases=aliases,
+        legacy_skill_ids={str(k): str(v) for k, v in spec["sid_by_key"].items()},
+    )
+    vocab_path = base / "skill_vocab.json"
     vocab = json.loads(vocab_path.read_text(encoding="utf-8"))
     built = sorted(set(lex.keys_map.values()))
     if not (
@@ -496,7 +552,15 @@ def main() -> None:
     t0 = datetime.now()
 
     export_master(out_dir)
-    build_skill_vocab(out_dir)
+    grade_path = (
+        paths.output_dir / "dictionary" / "skill_legacy_graded_BCD_v2.csv"
+    )
+    if not grade_path.exists():
+        raise RuntimeError(
+            "缺少最终语义分级 skill_legacy_graded_BCD_v2.csv；"
+            "先运行 panel_v2.lexicon_llm merge"
+        )
+    build_skill_vocab(out_dir, grade_path)
     npy_dir = str(out_dir / "master_npy")
     tasks = _plan(args.slices)
     if args.bench:
