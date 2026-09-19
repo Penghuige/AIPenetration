@@ -129,6 +129,9 @@ def main() -> None:
 
     # 2) v1.3 D 级过滤
     gcsv = paths.output_dir / "dictionary" / "skill_legacy_graded_BCD_v3.csv"
+    governance_manifest = paths.output_dir / "dictionary" / "skill_legacy_governance_manifest_v3.json"
+    if not governance_manifest.exists():
+        raise RuntimeError("缺少 T1/T2 治理 provenance manifest；请重新运行 lexicon_llm merge")
     grade = pd.read_csv(gcsv, encoding="utf-8-sig")
     pass2b = paths.output_dir / "panel_v2" / "pass2b"
     vocab_path = pass2b / "skill_vocab.json"
@@ -185,6 +188,7 @@ def main() -> None:
         encoding="utf-8-sig",
     )
     shutil.copy2(gcsv, rel3 / gcsv.name)
+    shutil.copy2(governance_manifest, rel3 / governance_manifest.name)
 
     # 6) 正式词典、长表、得分全部到位后再跑 §17 质量门。
     quality.run(rel3)
@@ -205,6 +209,8 @@ def main() -> None:
         ("skill_candidate_d_v1.parquet", "term", "governance.py(D only)"),
         ("skill_legacy_graded_BCD_v3.csv", "term",
          "panel_v2/lexicon_llm.py(T1/T2 concept mapping)"),
+        ("skill_legacy_governance_manifest_v3.json", "-",
+         "panel_v2/lexicon_llm.py(provenance)"),
         ("ai_anchor_dictionary_v1.csv", "anchor_version+keyword",
          "panel_v2/anchors.py(规则 20260909_b)"),
         ("job_anchor_flag.parquet", "job_id", "panel_v2/scan.py(canonical+terms)"),
@@ -235,7 +241,8 @@ def main() -> None:
     # 7) 指南 §4.2：把本次正式运行的代码/配置、输入、输出绑定成一个总账。
     manifest_inputs = [rel2 / f for f in scan_inputs]
     manifest_inputs += [rel_src / "skill_concept_v1.parquet",
-                        rel_src / "skill_alias_v1.parquet", gcsv, vocab_path]
+                        rel_src / "skill_alias_v1.parquet", gcsv,
+                        governance_manifest, vocab_path]
     manifest_outputs = [rel3 / name for name, _, _ in specs]
     manifest = write_run_manifest(
         rel3,
