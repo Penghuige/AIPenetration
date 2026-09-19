@@ -250,6 +250,19 @@ def main() -> None:
         encoding="utf-8-sig",
     )
     shutil.copy2(gcsv, rel3 / gcsv.name)
+    changelog_cols = [
+        c for c in (
+            "term", "skill_id", "formal_skill_id", "v2e_grade",
+            "final_grade", "mapped_existing_skill_id", "t2_relation",
+            "t2_type", "t2_new_tech", "t2_ambig", "demote_reason",
+        )
+        if c in grade.columns
+    ]
+    grade[changelog_cols].to_csv(
+        rel3 / "skill_dictionary_changelog_v1.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
 
     single = rel3 / "job_ai_score.parquet"
     files = sorted((rel3 / "job_ai_score").glob("*.parquet"))
@@ -262,9 +275,14 @@ def main() -> None:
                 w.write_table(pa.Table.from_batches([rb]))
 
     specs = [
-        ("skill_concept_v1.parquet", "skill_id", "ai_dict.skill_concepts"),
-        ("skill_alias_v1.parquet", "alias_id", "ai_dict.skill_aliases(active)"),
-        ("skill_candidate_d_v1.parquet", "term", "pass2b/skill_vocab.json"),
+        ("skill_concept_v1.parquet", "skill_id",
+         "frozen_A + final semantic A/B/C grade"),
+        ("skill_alias_v1.parquet", "alias_id",
+         "frozen_A aliases + final semantic A/B/C aliases"),
+        ("skill_candidate_d_v1.parquet", "term",
+         "skill_legacy_graded_BCD_v2.csv(final_grade=D)"),
+        ("skill_dictionary_changelog_v1.csv", "term",
+         "skill_legacy_graded_BCD_v2.csv semantic transitions"),
         ("skill_legacy_v1.parquet", "term", "panel_v2/lexicon.py(union构建处置)"),
         ("skill_legacy_graded_BCD_v2.csv", "skill_id",
          "panel_v2/lexicon_llm.py(T1∧T2 合并分级)"),
