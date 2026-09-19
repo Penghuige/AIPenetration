@@ -39,7 +39,7 @@ from ..common import eps_conn_params, setup_logging
 from ..text_clean import clean_description, text_hash, to_match
 from .anchors import ANCHOR_RULES_VERSION, match_all_versions
 from .dedup import (ADMISSION_WHERE, MASTER_VERSION, SHARDS, _blocks,
-                    _stable_job_id)
+                    _stable_job_id, _stable_job_id_sha256)
 
 logger = logging.getLogger("ai_penetration.panel_v2.scan")
 
@@ -255,11 +255,14 @@ def _flush_parts(out: Path, task: str, part: int,
         cols = list(zip(*text_buf))
         pq.write_table(pa.table({
             "job_id": pa.array(cols[0], pa.int64()),
-            "year": pa.array(cols[1], pa.int32()),
-            "job_description_raw": pa.array(cols[2], pa.string()),
-            "job_description_clean": pa.array(cols[3], pa.string()),
-            "job_description_match": pa.array(cols[4], pa.string()),
-            "text_hash": pa.array(cols[5], pa.int64()),
+            "job_id_sha256": pa.array(cols[1], pa.string()),
+            "job_id_raw": pa.array(cols[2], pa.string()),
+            "source_platform": pa.array(cols[3], pa.string()),
+            "year": pa.array(cols[4], pa.int32()),
+            "job_description_raw": pa.array(cols[5], pa.string()),
+            "job_description_clean": pa.array(cols[6], pa.string()),
+            "job_description_match": pa.array(cols[7], pa.string()),
+            "text_hash": pa.array(cols[8], pa.int64()),
         }), out / "parts_text" / f"{task}_{part:04d}.parquet",
                        compression="zstd")
     if firm_buf:
@@ -364,8 +367,12 @@ def scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str) -> dict
                         int(match_txt[match.start:match.end] == match.surface_form),
                     ))
                 firm_buf.append((job_id, yr, int(m["company"][idx])))
-                text_buf.append((job_id, yr, raw_txt, clean_txt, match_txt,
-                                 int(m["thash"][idx])))
+                text_buf.append((
+                    job_id,
+                    _stable_job_id_sha256(str(platform or ""), str(rid)),
+                    str(rid), str(platform or ""), yr, raw_txt, clean_txt,
+                    match_txt, int(m["thash"][idx]),
+                ))
                 n_pairs += len(matches)
                 if len(flags_buf) >= FLUSH_ROWS:
                     _flush_parts(out, task, part, flags_buf, long_buf, firm_buf, text_buf)
@@ -436,8 +443,9 @@ def merge_parts(out_dir: Path, rel_dir: Path) -> None:
         ("job_firm", "parts_firm", "job_id int8, year int, company_code int",
          "job_id"),
         ("job_text_clean", "parts_text",
-         "job_id int8, year int, job_description_raw text,"
-         " job_description_clean text, job_description_match text, text_hash int8",
+         "job_id int8, job_id_sha256 text, job_id_raw text, source_platform text,"
+         " year int, job_description_raw text, job_description_clean text,"
+         " job_description_match text, text_hash int8",
          "job_id"),
     )
     conn = _results_conn()
@@ -477,7 +485,8 @@ def merge_parts(out_dir: Path, rel_dir: Path) -> None:
             cur.execute(
                 f"SELECT count(*) FROM (SELECT job_id FROM public.{stg} "
                 f"GROUP BY job_id HAVING count(DISTINCT "
-                f"(year, text_hash, job_description_match)) > 1) x")
+                f"(job_id_sha256, job_id_raw, source_platform, year, text_hash,"
+                f" job_description_match)) > 1) x")
             conflict = cur.fetchone()[0]
         if conflict:
             raise RuntimeError(
@@ -524,8 +533,8 @@ def _arrow_types(name: str) -> list:
                 pa.int32(), pa.int32(), pa.int32(), pa.string(), pa.int16(),
                 pa.int16()]
     if name == "job_text_clean":
-        return [pa.int64(), pa.int32(), pa.string(), pa.string(), pa.string(),
-                pa.int64()]
+        return [pa.int64(), pa.string(), pa.string(), pa.string(), pa.int32(),
+                pa.string(), pa.string(), pa.string(), pa.int64()]
     return [pa.int64(), pa.int32(), pa.int32()]
 
 
