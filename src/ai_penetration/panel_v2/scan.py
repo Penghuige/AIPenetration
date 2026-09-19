@@ -104,7 +104,8 @@ def export_master(out_dir: Path) -> None:
         thash[i] = int(hash_value)
     order = np.argsort(key, kind="stable")
     k_sorted = key[order]
-    assert not np.any(k_sorted[1:] == k_sorted[:-1]), "canonical key 哈希碰撞"
+    if np.any(k_sorted[1:] == k_sorted[:-1]):
+        raise RuntimeError("canonical key 哈希碰撞")
     npy_dir.mkdir(parents=True, exist_ok=True)
     tmp = out_dir / "_master_tmp"
     tmp.mkdir(parents=True, exist_ok=True)
@@ -113,7 +114,7 @@ def export_master(out_dir: Path) -> None:
                       ("city", city[order]), ("thash", thash[order])):
         p = tmp / f"{name}.npy"
         np.save(p, arr)
-        p.rename(npy_dir / f"{name}.npy")   # 原子发布
+        p.replace(npy_dir / f"{name}.npy")   # 原子发布
     stamp.write_text(json.dumps({
         "version": MASTER_VERSION, "scan_pipeline_version": SCAN_PIPELINE_VERSION,
         "n": n}), encoding="utf-8")
@@ -364,7 +365,7 @@ def scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str) -> dict
             "noncanonical_copies": noncanonical_copies}
     tmp = out / f".{task}.done.tmp"
     tmp.write_text(json.dumps(stat), encoding="utf-8")
-    tmp.rename(done)
+    tmp.replace(done)
     logger.info("pass2 切片完成 %s: canonical=%d pairs=%d", task, n_canon, n_pairs)
     return stat
 
