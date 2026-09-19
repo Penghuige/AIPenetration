@@ -107,29 +107,58 @@ class UnionLexicon:
     n_concepts: int = 0
     overlap_terms: tuple[str, ...] = ()
 
-    def extract(self, match_text: str) -> set[str]:
-        """从 match 态文本抽取技能 id 集合（岗位内去重）。
-
-        Args:
-            match_text: normalize_desc/NFKC+lower 后的描述文本。
-
-        Returns:
-            skill_id 集合（uuid 或 legacy:<term>）。
-        """
-        hits: set[str] = set()
-        for end, (sid, key) in self.automaton.iter(match_text):
+    def extract_matches(self, match_text: str) -> list[SkillMatch]:
+        """执行 §11.1.1 longest-match，并保留可回填的匹配证据。"""
+        candidates: list[tuple[int, int, str, str]] = []
+        for end_inclusive, (sid, key) in self.automaton.iter(match_text):
+            start = end_inclusive - len(key) + 1
+            end = end_inclusive + 1
             if key in self.ascii_keys:
-                start = end - len(key) + 1
                 before = match_text[start - 1] if start > 0 else ""
-                after = match_text[end + 1] if end + 1 < len(match_text) else ""
+                after = match_text[end] if end < len(match_text) else ""
                 if _is_ascii_alnum(before) or _is_ascii_alnum(after):
                     continue
-            hits.add(sid)
-        for sid, ctx in self.homograph.items():
-            if sid in hits and not ctx.search(match_text):
-                hits.discard(sid)
-        return hits
+            ctx = self.homograph.get(sid)
+            if ctx is not None and not ctx.search(match_text):
+                continue
+            candidates.append((start, end, sid, key))
 
+        # 指南 §11.1.1：先按跨度长短排序，任何与已接收较长跨度重叠的
+        # 候选均不再进入主匹配；并列使用确定性次序。
+        accepted: list[tuple[int, int, str, str]] = []
+        for cand in sorted(
+            candidates, key=lambda x: (-(x[1] - x[0]), x[0], x[2], x[3])
+        ):
+            start, end, _sid, _key = cand
+            if any(not (end <= a0 or start >= a1)
+                   for a0, a1, _as, _ak in accepted):
+                continue
+            accepted.append(cand)
+
+        # 同一 skill_id 多次出现只保留首次跨度，同时记录 mention_count。
+        by_sid: dict[str, list[tuple[int, int, str, str]]] = {}
+        for item in accepted:
+            by_sid.setdefault(item[2], []).append(item)
+        out: list[SkillMatch] = []
+        for sid, mentions in by_sid.items():
+            mentions.sort(key=lambda x: (x[0], -(x[1] - x[0]), x[3]))
+            start, end, _sid, key = mentions[0]
+            surface = match_text[start:end]
+            if surface != key:
+                raise RuntimeError(
+                    f"匹配跨度无法回填: key={key!r} surface={surface!r} "
+                    f"span=({start},{end})"
+                )
+            out.append(SkillMatch(
+                skill_id=sid, surface_form=surface, start=start, end=end,
+                mention_count=len(mentions), match_method="aho_longest",
+                ambiguity_flag=1 if key in self.ambiguous_keys else 0,
+            ))
+        return sorted(out, key=lambda m: (m.start, m.end, m.skill_id))
+
+    def extract(self, match_text: str) -> set[str]:
+        """兼容旧调用方：返回 longest-match 后岗位内唯一 skill_id 集合。"""
+        return {m.skill_id for m in self.extract_matches(match_text)}
 
 def _load_atier_alias_records() -> list[AliasRecord]:
     """读 A 级激活别名，并按 primary_skill_id 解析多概念同形词。"""
