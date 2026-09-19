@@ -150,6 +150,14 @@ def main() -> None:
     handoff_manifests = require_handoff_manifests(paths)
     release_root = paths.output_dir / "release"
     rel_src = release_root / "panel_v2"
+    frozen_concepts = (
+        paths.output_dir / "dictionary"
+        / "skill_concept_bilingual_a_frozen_v1.1.csv"
+    )
+    frozen_aliases = (
+        paths.output_dir / "dictionary"
+        / "skill_alias_active_bilingual_a_frozen_v1.1.csv"
+    )
     rel2 = release_root / "panel_v2_handoff_scan"  # 新扫描输入
     target = release_root / "panel_v2i"
     rel3 = release_root / f".panel_v2i_{args.run_id}.tmp"
@@ -158,8 +166,8 @@ def main() -> None:
                    "job_firm.parquet")
     preflight_files = [rel2 / f for f in scan_inputs]
     preflight_files += [
-        rel_src / "skill_concept_v1.parquet",
-        rel_src / "skill_alias_v1.parquet",
+        frozen_concepts,
+        frozen_aliases,
         paths.output_dir / "dictionary" / "skill_legacy_graded_BCD_v3.csv",
         paths.output_dir / "panel_v2" / "pass2_handoff_scan" / "skill_vocab.json",
     ]
@@ -226,7 +234,7 @@ def main() -> None:
     scoring.run(rel3)
 
     # 5) 装配：§18 正式词典必须与实际 matcher 同一 A/B/C 概念集合。
-    base_concepts = pd.read_parquet(rel_src / "skill_concept_v1.parquet")
+    base_concepts = pd.read_csv(frozen_concepts, encoding="utf-8-sig", dtype=str)
     pending = base_concepts.translation_status.fillna("").astype(str).isin(
         ["", "pending_codex_zh"]
     )
@@ -234,7 +242,7 @@ def main() -> None:
         raise RuntimeError(
             f"A级基础词典仍有 {int(pending.sum())} 个未完成中文化概念，拒绝 v2i"
         )
-    base_aliases = pd.read_parquet(rel_src / "skill_alias_v1.parquet")
+    base_aliases = pd.read_csv(frozen_aliases, encoding="utf-8-sig", dtype=str)
     resolved = {
         normalize_term(r.alias): r.skill_id
         for r in _load_atier_alias_records()
@@ -309,8 +317,7 @@ def main() -> None:
 
     # 7) 指南 §4.2：把本次正式运行的代码/配置、输入、输出绑定成一个总账。
     manifest_inputs = [rel2 / f for f in scan_inputs]
-    manifest_inputs += [rel_src / "skill_concept_v1.parquet",
-                        rel_src / "skill_alias_v1.parquet", gcsv,
+    manifest_inputs += [frozen_concepts, frozen_aliases, gcsv,
                         governance_manifest, vocab_path]
     manifest_inputs += handoff_manifests
     manifest_outputs = [rel3 / name for name, _, _ in specs]
