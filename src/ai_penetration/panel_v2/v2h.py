@@ -40,32 +40,61 @@ logger = logging.getLogger("ai_penetration.panel_v2.v2h")
 LEX_VERSION = "bilingual_a_frozen_v1.1+legacy_grade_v2"
 
 
-def filter_longs(rel2: Path, codes: np.ndarray) -> None:
-    """按 v1.3 D 级码流式过滤 job_skill_long（B1 内存纪律）。
-
-    注意（自锁 bug 修复 2026-09-10）：pyarrow 的 ParquetFile 会持续持有读
-    句柄——必须先 close() + gc 释放，才能对同一路径做删除/改名（此前两次
-    "文件被占用" PermissionError 即此自锁，非外部干扰）。
-    """
+def filter_longs(rel2: Path, codes: np.ndarray,
+                 grade_by_sid: dict[str, str]) -> None:
+    """按最终 B/C/D 分级过滤并补齐指南 §11.3 的正式长表字段。"""
     target = rel2 / "job_skill_long.parquet"
     tmp = rel2 / "_job_skill_long_filtered.parquet"
     src = pq.ParquetFile(target)
+    required = {
+        "job_id", "year", "skill_code", "skill_id", "surface_form",
+        "match_start", "match_end", "mention_count", "match_method",
+        "ambiguity_flag", "span_verified",
+    }
+    missing = required - set(src.schema_arrow.names)
+    if missing:
+        src.close()
+        raise RuntimeError(
+            "pass2 仍是旧版无证据长表，必须按 handoff-compliant scan 重扫: "
+            + ", ".join(sorted(missing))
+        )
     keep = drop = 0
+    writer = None
     try:
-        with pq.ParquetWriter(tmp, src.schema_arrow, compression="zstd") as w:
-            for rb in src.iter_batches(batch_size=4_000_000,
-                                       columns=["job_id", "year", "skill_code"]):
-                t = pa.Table.from_batches([rb])
-                sc = t["skill_code"].to_numpy()
-                m = ~np.isin(sc, codes)
-                keep += int(m.sum())
-                drop += int((~m).sum())
-                w.write_table(t.filter(pa.array(m)))
+        for rb in src.iter_batches(batch_size=2_000_000):
+            t = pa.Table.from_batches([rb])
+            sc = t["skill_code"].to_numpy()
+            m = ~np.isin(sc, codes)
+            keep += int(m.sum())
+            drop += int((~m).sum())
+            t = t.filter(pa.array(m))
+            if len(t) == 0:
+                continue
+            names = [
+                "start" if n == "match_start" else
+                "end" if n == "match_end" else n
+                for n in t.column_names
+            ]
+            t = t.rename_columns(names)
+            sids = t["skill_id"].to_pylist()
+            tiers = [grade_by_sid.get(str(sid), "A") for sid in sids]
+            t = t.append_column("confidence_tier", pa.array(tiers, pa.string()))
+            t = t.append_column(
+                "dictionary_version",
+                pa.array([LEX_VERSION] * len(t), pa.string()),
+            )
+            if writer is None:
+                writer = pq.ParquetWriter(tmp, t.schema, compression="zstd")
+            writer.write_table(t)
     finally:
         src.close()
+        if writer is not None:
+            writer.close()
+    if writer is None:
+        raise RuntimeError("D 级过滤后 job_skill_long 为空，拒绝发布")
     import gc
     import time
-    gc.collect()  # 释放 pyarrow 底层文件句柄
+    gc.collect()
     for attempt in range(5):
         try:
             target.unlink(missing_ok=True)
@@ -75,8 +104,7 @@ def filter_longs(rel2: Path, codes: np.ndarray) -> None:
             if attempt == 4:
                 raise
             time.sleep(3)
-    logger.info("longs 过滤: 保留 %d，剔除 %d", keep, drop)
-
+    logger.info("longs 过滤/证据补齐: 保留 %d，剔除 D 级 %d", keep, drop)
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="v2h 规则 b 一致版重算")
@@ -102,10 +130,11 @@ def main() -> None:
     pass2b = paths.output_dir / "panel_v2" / "pass2b"
     vocab_path = pass2b / "skill_vocab.json"
     vocab = json.loads(vocab_path.read_text(encoding="utf-8"))
-    d_ids = set(grade[grade.final_grade == "D"].skill_id)
+    d_ids = set(grade[grade.final_grade == "D"].skill_id.astype(str))
+    grade_by_sid = dict(zip(grade.skill_id.astype(str), grade.final_grade.astype(str)))
     codes = np.array(sorted(vocab[s] for s in d_ids if s in vocab), np.int32)
     logger.info("D 级排除 %d 码", len(codes))
-    filter_longs(rel3, codes)
+    filter_longs(rel3, codes, grade_by_sid)
 
     # 3) counts（新 flag）→ relevance
     counts = compute_counts(rel3)
