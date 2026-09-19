@@ -1,11 +1,11 @@
 # 面板 v2 主管线配置（指南 §19.2；口径变更须同步 docs/panel_v2_设计.md）
 # 定位声明（2026-09-09 审计）：本文件是**口径登记文档**（唯一权威参数清单），
-# 运行时代码**不读取**它（各模块用代码内常量/CLI 参数实现同值语义）；其内容
+# 运行时代码**不直接读取**全部字段（各模块仍有常量/CLI 参数）；其内容
 # 经发布 metadata 的 config_hash 背书。新增参数或改语义时须同步三处：
 # 本文件、对应模块常量、设计文档。运行期真正生效的绑定在代码（如
 # dedup.ADMISSION_WHERE、scoring.THRESHOLDS）。
-panel_version: v2a
-dictionary_version: bilingual_a_frozen_v1.1+legacy_union_v1
+panel_version: v2i
+dictionary_version: bilingual_a_frozen_v1.1+governed_v1.4
 
 scope:
   cities: [广州市, 深圳市]      # v2a 先广深；全国由用户排窗后扩
