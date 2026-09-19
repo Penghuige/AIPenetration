@@ -1,8 +1,8 @@
 """v2e：legacy 词 df_unique_description 频数扫描（指南 §10.3.2 分级通道补课）。
 
 背景（docs/10 F1 + 原预案核对）：自建词当年未过 §10 B/C/D 分级；分级须用
-频率语料的 `COUNT(DISTINCT text_hash)` 口径（zh_alias_freq 对 A 级用的
-platform×text_hash 键，比指南文本口径更保守——沿用同键并披露）。本模块只扫
+频率语料严格使用指南 §10.3.2 的 `COUNT(DISTINCT text_hash)` 口径；
+同一规范化描述跨平台重复时只计一次。本模块只扫
 legacy 层 6,328 键，匹配语义对齐生产 union 词表（ASCII 词边界守卫，A 级管线
 无守卫不适用英文词）。eps 只读；结果写 ai_dict.legacy_term_freq（词典治理
 合法 schema）+ 本地 CSV 治理件。
@@ -26,7 +26,7 @@ import psycopg2
 from config.paths import get_project_paths
 
 from ..common import eps_conn_params, setup_logging
-from ..zh_alias_freq import aggregate_counts, platform_id
+from ..zh_alias_freq import FREQ_PROTOCOL_VERSION, aggregate_counts, text_key
 from .anchors import normalize_desc
 from .dedup import SHARDS, _blocks
 from .lexicon import LEGACY_PREFIX, _is_ascii_alnum, build_union_lexicon
@@ -73,7 +73,7 @@ def scan_slice(table: str, b_start: int, b_end: int, tmp_dir: str,
     """
     auto, idx, n = _W["auto"], _W["idx"], _W["n"]
     ascii_keys = _W["ascii"]
-    task = f"lg_{tag[:6]}_{table}_{b_start}_{b_end}"  # tag 隔离多词表断点
+    task = f"lg_{FREQ_PROTOCOL_VERSION}_{tag[:6]}_{table}_{b_start}_{b_end}"
     kf = Path(tmp_dir) / f"{task}.keys.bin"
     af = Path(tmp_dir) / f"{task}.aids.bin"
     hb = Path(tmp_dir) / f"{task}.hb.json"
@@ -134,7 +134,7 @@ def scan_slice(table: str, b_start: int, b_end: int, tmp_dir: str,
         cur.itersize = 50000
         # 语料谓词与 A 级频率管线一致（词典语料面，非主样本准入面）
         cur.execute(
-            f"SELECT platform, job_description FROM public.{table} "
+            f"SELECT job_description FROM public.{table} "
             "WHERE ctid >= '(%s,0)'::tid AND ctid < '(%s,0)'::tid "
             "AND job_description IS NOT NULL AND job_description != '' "
             "AND position IS NOT NULL AND position != ''",
@@ -143,14 +143,12 @@ def scan_slice(table: str, b_start: int, b_end: int, tmp_dir: str,
             batch = cur.fetchmany(50000)
             if not batch:
                 break
-            for platform, desc in batch:
+            for (desc,) in batch:
                 rows += 1
-                # 文本面=生产匹配语义（NFKC+lower+空白折叠），多词英文键可配；
-                # 去重键结构同 A 级 (platform, 规范化文本)（口径差异在 QC 披露）
+                # 匹配文本与生产 matcher 同义；文档频数键严格按指南 §10.3.2
+                # 使用纯规范化 text_hash，不再把 platform 拼入 distinct key。
                 norm = normalize_desc(str(desc))
-                h48 = int.from_bytes(blake2b(norm.encode(), digest_size=6).digest(),
-                                     "big")
-                key = (platform_id(str(platform)) << 48) | h48
+                key = text_key(str(desc))
                 for end, k in auto.iter(norm):
                     if k in ascii_keys:
                         s0 = end - len(k) + 1
