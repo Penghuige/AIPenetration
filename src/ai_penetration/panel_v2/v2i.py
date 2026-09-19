@@ -36,7 +36,11 @@ from ..common import setup_logging
 from . import quality, scoring
 from .counts import compute_counts
 from .anchors import anchor_dictionary_rows
-from .governance import materialize_formal_dictionary, normalize_term
+from .governance import (
+    materialize_formal_dictionary,
+    materialize_source_skill_records,
+    normalize_term,
+)
 from .lexicon import _load_atier_alias_records
 from .export_release import _meta
 from .relevance import compute_relevance, decode_skill_ids
@@ -277,9 +281,15 @@ def main() -> None:
     concepts, aliases, d_candidates = materialize_formal_dictionary(
         base_concepts, base_aliases, grade, LEX_VERSION
     )
+    source_records = materialize_source_skill_records(
+        base_concepts, LEX_VERSION
+    )
     concepts.to_parquet(rel3 / "skill_concept_v1.parquet", index=False)
     aliases.to_parquet(rel3 / "skill_alias_v1.parquet", index=False)
     d_candidates.to_parquet(rel3 / "skill_candidate_d_v1.parquet", index=False)
+    source_records.to_parquet(
+        rel3 / "source_skill_record_v1.parquet", index=False
+    )
     pd.DataFrame(anchor_dictionary_rows()).to_csv(
         rel3 / "ai_anchor_dictionary_v1.csv",
         index=False,
@@ -305,6 +315,9 @@ def main() -> None:
         ("skill_concept_v1.parquet", "skill_id", "governance.py(A/B/C formal)"),
         ("skill_alias_v1.parquet", "alias_id", "governance.py(A/B/C aliases)"),
         ("skill_candidate_d_v1.parquet", "term", "governance.py(D only)"),
+        ("source_skill_record_v1.parquet",
+         "source_name+source_skill_id+internal_skill_id",
+         "governance.py(external source crosswalk)"),
         ("skill_governed_ABCD_v4.csv", "term",
          "panel_v2/discovery_review.py(v3 legacy + formal discovery)"),
         ("formal_discovery_review_manifest_v1.json", "-",
