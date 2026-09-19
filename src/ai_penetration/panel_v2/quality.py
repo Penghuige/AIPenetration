@@ -302,9 +302,20 @@ def warning_checks(rel: Path) -> tuple[list[str], dict]:
     cls = pq.read_table(rel / "job_ai_classification.parquet").to_pandas()
     rel_df = pq.read_table(rel / "skill_ai_relevance.parquet").to_pandas()
 
-    info["zero_skill_by_year"] = (
-        cls.groupby("year").zero_skill_override.mean().round(4).to_dict()
+    zero_by_year = (
+        cls.groupby("year", as_index=False)
+        .agg(n_jobs=("job_id", "size"),
+             zero_skill_rate=("zero_skill_override", "mean"))
     )
+    zero_by_year.to_csv(
+        rel / "quality_detail_zero_skill_by_year.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    info["zero_skill_by_year"] = dict(zip(
+        zero_by_year.year.astype(int),
+        zero_by_year.zero_skill_rate.round(4),
+    ))
     raw_s = pq.read_table(
         rel / "job_ai_score" / "main_annual_raw.parquet",
         columns=["job_id", "ai_score"],
@@ -321,17 +332,30 @@ def warning_checks(rel: Path) -> tuple[list[str], dict]:
         if col in cls.columns:
             rates[ver] = round(float(cls[col].mean()), 5)
     info["exposure_rate_by_anchor"] = rates
+    pd.DataFrame(
+        [{"anchor_version": k, "main_005_rate": v} for k, v in rates.items()]
+    ).to_csv(
+        rel / "quality_detail_anchor_rates.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
     if rates:
         lo, hi = min(rates.values()), max(rates.values())
         if lo > 0 and (hi - lo) / lo > 1.0:
             warns.append(f"锚点口径 AI 率差异过大 main/cn/babina={rates}")
 
-    rare01 = rel_df[
+    rare01_rows = rel_df[
         (rel_df.window_type == "annual")
         & (rel_df.n_skill < 10)
         & ((rel_df.ai_rate_raw < 1e-9)
            | ((1 - rel_df.ai_rate_raw).abs() < 1e-9))
-    ].skill_code.nunique()
+    ].copy()
+    rare01_rows.to_csv(
+        rel / "quality_detail_rare01_skills.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    rare01 = rare01_rows.skill_code.nunique()
     info["rare01_skills"] = int(rare01)
     if int(rare01) > rel_df.skill_code.nunique() * 0.5:
         warns.append(f"低频 0/1 原始权重技能占比 {rare01} 偏高")
@@ -344,6 +368,32 @@ def warning_checks(rel: Path) -> tuple[list[str], dict]:
         "year")["aijob_main_annual_raw_015"].mean().round(5).to_dict()
     info["exposure_005_by_year"] = cls.groupby(
         "year")["aijob_main_annual_raw_005"].mean().round(5).to_dict()
+
+    if "confidence_tier" in longs.columns:
+        tier_detail = (
+            longs.groupby(["year", "confidence_tier"], as_index=False)
+            .size().rename(columns={"size": "matched_pairs"})
+        )
+        tier_detail.to_csv(
+            rel / "quality_detail_tier_contribution.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        info["tier_pair_share"] = (
+            longs.confidence_tier.value_counts(normalize=True).round(4).to_dict()
+        )
+    else:
+        warns.append("§17 警告明细不完整：job_skill_long 缺 confidence_tier，无法输出 A/B/C 构成")
+
+    # 指南没有给这两类 warning 的自动阈值；不得擅自伪造判据。
+    warns.append(
+        "§17 待人工判据：歧义锚点×非技术行业集中度尚无“非技术行业”正式定义；"
+        "需在 job_context/行业口径冻结后执行"
+    )
+    warns.append(
+        "§17 待人工判据：年度 AI 比例“无法由覆盖变化解释的断点”未给数值阈值；"
+        "已输出年度 AI 率与 zero-skill 明细供判读"
+    )
     return warns, info
 
 
