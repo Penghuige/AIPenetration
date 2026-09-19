@@ -260,7 +260,7 @@ def load_formal_legacy_spec(grade_path) -> tuple[list[str], dict[str, str], dict
     import pandas as pd
 
     frame = pd.read_csv(Path(grade_path), encoding="utf-8-sig")
-    required = {"term", "final_grade"}
+    required = {"term", "final_grade", "formal_skill_id", "t2_relation"}
     missing = required - set(frame.columns)
     if missing:
         raise RuntimeError(
@@ -273,13 +273,10 @@ def load_formal_legacy_spec(grade_path) -> tuple[list[str], dict[str, str], dict
     for _, row in formal.iterrows():
         term = str(row.term)
         key = unicodedata.normalize("NFKC", term).lower()
-        sid = str(
-            row.get("formal_skill_id")
-            or row.get("mapped_existing_skill_id")
-            or row.get("skill_id")
-        )
-        if not sid or sid == "nan":
+        raw_sid = row.get("formal_skill_id")
+        if pd.isna(raw_sid) or not str(raw_sid).strip():
             raise RuntimeError(f"正式词条 {term!r} 缺 formal_skill_id")
+        sid = str(raw_sid).strip()
         if key in sid_by_key and sid_by_key[key] != sid:
             raise RuntimeError(
                 f"正式 legacy 键 {key!r} 映射多个概念: "
