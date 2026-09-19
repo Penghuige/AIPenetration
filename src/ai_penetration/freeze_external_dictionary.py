@@ -27,6 +27,7 @@ from datetime import datetime
 from pathlib import Path
 
 import psycopg2
+import pandas as pd
 
 from config.paths import get_project_paths
 
@@ -192,6 +193,53 @@ ALIAS_COLUMNS = [
 ]
 
 
+def export_translation_delivery(out_dir: Path) -> dict[str, tuple[int, str]]:
+    """物化指南 §7.6.7 的三个 Parquet；log 由 translation_completion 生成。"""
+    conn = psycopg2.connect(**eps_conn_params())
+    try:
+        concepts = pd.read_sql_query(
+            "SELECT * FROM ai_dict.skill_concepts ORDER BY skill_id",
+            conn,
+        )
+        aliases = pd.read_sql_query(
+            """SELECT * FROM ai_dict.skill_aliases
+               WHERE language IN ('zh','mixed')
+               ORDER BY alias_id""",
+            conn,
+        )
+        cur = conn.cursor()
+        cur.execute("SELECT to_regclass('ai_dict.alias_ambiguity')")
+        ambiguity_exists = cur.fetchone()[0] is not None
+        if ambiguity_exists:
+            ambiguous = pd.read_sql_query(
+                """SELECT s.*
+                   FROM ai_dict.skill_aliases s
+                   LEFT JOIN ai_dict.alias_ambiguity a
+                     ON a.alias = s.alias
+                   WHERE s.ambiguity_flag='1' OR a.alias IS NOT NULL
+                   ORDER BY s.alias_id""",
+                conn,
+            )
+        else:
+            ambiguous = aliases[
+                aliases.ambiguity_flag.astype(str) == "1"
+            ].copy()
+    finally:
+        conn.close()
+
+    files = {
+        "external_skill_translation_v1.parquet": concepts,
+        "external_skill_alias_zh_v1.parquet": aliases,
+        "external_skill_ambiguous_v1.parquet": ambiguous,
+    }
+    result: dict[str, tuple[int, str]] = {}
+    for name, df in files.items():
+        path = out_dir / name
+        df.to_parquet(path, index=False, compression="zstd")
+        result[str(path)] = (len(df), _sha256_file(path))
+    return result
+
+
 def export_and_report(stamp: str) -> dict[str, str]:
     """导出两表 + 生成 QC 报告。
 
@@ -224,6 +272,9 @@ def export_and_report(stamp: str) -> dict[str, str]:
     )
     sha = {str(concept_csv): _sha256_file(concept_csv), str(alias_csv): _sha256_file(alias_csv)}
     ok, bad, notes = check_invariants()
+    delivery = {} if bad else export_translation_delivery(out_dir)
+    for p, (_n, digest) in delivery.items():
+        sha[p] = digest
     lang_stats = stats_by_language()
     manifest = _latest_activation_manifest(paths.report_dir)
 
@@ -248,6 +299,13 @@ def export_and_report(stamp: str) -> dict[str, str]:
     ]
     for lang, active, cnt in lang_stats:
         lines.append(f"| {lang} | {active} | {cnt} |")
+    if delivery:
+        lines += ["", "## §7.6.7 中文化交付件", "", "| 文件 | 行数 | SHA-256 |",
+                  "|---|---:|---|"]
+        for p, (n_rows, digest) in delivery.items():
+            lines.append(
+                f"| {Path(p).name} | {n_rows} | `{digest[:16]}…` |"
+            )
     if manifest:
         lines += [
             "",
