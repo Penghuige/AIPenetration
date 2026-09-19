@@ -158,11 +158,10 @@ def gate_checks(rel: Path) -> tuple[list[str], dict]:
         fails.append(
             f"job_text_clean 行数 {len(texts)} != job_anchor_flag {len(flags)}")
 
-    # 2 (job, skill) 唯一：int64 复合键全局查重（4 亿规模内存可行）
-    ck = (longs.job_id.to_numpy(np.int64) << 32) | longs.skill_code.to_numpy(np.int64)
-    if np.unique(ck).size != ck.size:
+    # 2 (job, skill) 唯一：job_id 为稳定 63-bit 哈希，禁止位移打包
+    # （左移会 int64 溢出并制造伪碰撞/漏碰撞）。
+    if longs.duplicated(["job_id", "skill_code"]).any():
         fails.append("(job_id, skill_code) 不唯一")
-    del ck
 
     # 3 原文跨度回填：指南 §11.1.4/§17.6 为阻断项，不允许 waiver。
     evidence_cols = {
