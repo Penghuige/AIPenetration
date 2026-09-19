@@ -232,7 +232,7 @@ def export_and_report(stamp: str) -> dict[str, str]:
         "",
         f"- 运行时间: {datetime.now():%Y-%m-%d %H:%M:%S}",
         f"- 发布状态: `complete_candidate_not_frozen` → `a_level_frozen_{VERSION}`",
-        "- 语料依据: eps 广深 2014–2024，去重口径 COUNT(DISTINCT platform×规范化text_hash)",
+        "- 语料依据: eps 广深 2014–2024，激活频数口径 COUNT(DISTINCT 规范化text_hash)",
         "",
         "## 导出",
         "",
