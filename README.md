@@ -103,7 +103,7 @@ Qwen 技术基准/1万条预运行、正式分层候选发现饱和、T1/T2 治�
 formal manifest 后才允许发布。
 
 ```bash
-python -m src.ai_penetration.panel_v2.data_audit
+python -m src.ai_penetration.panel_v2.source_audit --snapshot-id <固定数据快照ID>
 python -m src.ai_penetration.translation_completion --results-dir <历史170批目录>
 python -m src.ai_penetration.panel_v2.model_benchmark --phase technical --sample-file <1000条基准jsonl>
 python -m src.ai_penetration.panel_v2.model_benchmark --phase prerun --sample-file <10000条预运行jsonl>
