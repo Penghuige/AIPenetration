@@ -172,8 +172,8 @@ def run(rel_dir: Path, bench: bool = False) -> None:
     # job → company 映射（firm 每 job 一行，按 job_id 对齐，防行序错配）
     company_of_job = np.zeros(len(jobs), np.int32)
     firm_job_arr = firm.job_id.to_numpy()
-    assert np.array_equal(np.sort(firm_job_arr), np.unique(firm_job_arr)), \
-        "firm 表 job 重复"
+    if not np.array_equal(np.sort(firm_job_arr), np.unique(firm_job_arr)):
+        raise RuntimeError("firm 表 job 重复")
     company_of_job[np.searchsorted(jobs, firm_job_arr)] = \
         firm.company_code.to_numpy(np.int32)
 
@@ -194,7 +194,8 @@ def run(rel_dir: Path, bench: bool = False) -> None:
 
     # B1：每个 (ver,win,scoretype) 单元即算即落盘（dataset 分区），
     # 不累积 18 个全量帧；B2：weighted/coverage 由 isfinite 实测。
-    assert n_y <= 16, "留一 triple 键打包假设 yidx<16（M1 防扩年后静默错配）"
+    if n_y > 16:
+        raise RuntimeError("留一 triple 键打包假设 yidx<16（防扩年后静默错配）")
     score_dir = rel_dir / "job_ai_score"
     score_dir.mkdir(parents=True, exist_ok=True)
     cls = pd.DataFrame({"job_id": jobs, "year": job_year + ymin})
@@ -211,8 +212,10 @@ def run(rel_dir: Path, bench: bool = False) -> None:
                                  minlength=n_jobs)
                 weighted = np.bincount(j_of[finite], minlength=n_jobs)
                 bad = (matched > 0) & (weighted != matched)
-                assert not bad.any(), \
-                    f"§15.3.2 阻断：{ver}/{win}/{st} 有 {int(bad.sum())} 岗位技能权重缺失"
+                if bad.any():
+                    raise RuntimeError(
+                        f"§15.3.2 阻断：{ver}/{win}/{st} 有 "
+                        f"{int(bad.sum())} 岗位技能权重缺失")
                 cov = np.divide(sw, weighted, out=np.full(n_jobs, np.nan),
                                 where=weighted > 0)
                 pq.write_table(
