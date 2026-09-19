@@ -180,7 +180,14 @@ def saturation_pass(metrics: pd.DataFrame) -> bool:
     return bool(ok.all())
 
 
-def finalize(frame_path: Path, selected_path: Path, metrics_path: Path) -> Path:
+def finalize(
+    frame_path: Path,
+    selected_path: Path,
+    metrics_path: Path,
+    candidate_audit_path: Path,
+    governance_path: Path,
+) -> Path:
+    """只有“抽样饱和 + 候选已接入最终治理表”同时满足才 formal_pass。"""
     df = pd.read_parquet(frame_path)
     validate_frame(df)
     selected = pd.read_csv(selected_path)
@@ -188,6 +195,50 @@ def finalize(frame_path: Path, selected_path: Path, metrics_path: Path) -> Path:
         raise ValueError("候选发现样本存在重复 job_id")
     metrics = pd.read_csv(metrics_path)
     passed = saturation_pass(metrics)
+
+    audit = pd.read_csv(candidate_audit_path)
+    required_audit = {
+        "term", "final_grade", "final_skill_id",
+        "source_round", "evidence_count", "span_valid",
+    }
+    missing = required_audit - set(audit.columns)
+    if missing:
+        raise ValueError(
+            "candidate audit 缺列: " + ", ".join(sorted(missing))
+        )
+    if not set(audit.final_grade.astype(str)) <= {"A", "B", "C", "D"}:
+        raise ValueError("candidate audit 含未知 final_grade")
+    formal = audit[audit.final_grade.isin(["A", "B", "C"])].copy()
+    if (formal.evidence_count <= 0).any() or not formal.span_valid.astype(bool).all():
+        raise ValueError("A/B/C 候选存在无有效原文证据记录")
+    if formal.final_skill_id.isna().any() or (
+        formal.final_skill_id.astype(str).str.len() == 0
+    ).any():
+        raise ValueError("A/B/C 候选存在空 final_skill_id")
+
+    governance = pd.read_csv(governance_path, encoding="utf-8-sig")
+    req_g = {"term", "final_grade", "final_skill_id"}
+    if not req_g <= set(governance.columns):
+        raise ValueError("最终治理表缺 term/final_grade/final_skill_id")
+    joined = formal.merge(
+        governance[list(req_g)],
+        on="term",
+        how="left",
+        suffixes=("_audit", "_gov"),
+        validate="one_to_one",
+    )
+    mismatch = (
+        joined.final_grade_gov.isna()
+        | (joined.final_grade_audit.astype(str) != joined.final_grade_gov.astype(str))
+        | (joined.final_skill_id_audit.astype(str)
+           != joined.final_skill_id_gov.astype(str))
+    )
+    if mismatch.any():
+        bad = joined.loc[mismatch, "term"].astype(str).head(10).tolist()
+        raise ValueError(
+            "正式发现的 A/B/C 候选未正确接入最终治理表: " + ", ".join(bad)
+        )
+
     manifest = {
         "status": "formal_pass" if passed else "incomplete",
         "seed": SEED,
@@ -195,14 +246,24 @@ def finalize(frame_path: Path, selected_path: Path, metrics_path: Path) -> Path:
         "frame_sha256": _sha(frame_path),
         "selected_sha256": _sha(selected_path),
         "round_metrics_sha256": _sha(metrics_path),
+        "candidate_audit_sha256": _sha(candidate_audit_path),
+        "governance_sha256": _sha(governance_path),
         "n_frame": len(df),
         "n_selected": len(selected),
+        "n_candidates_audited": len(audit),
+        "n_formal_candidates": len(formal),
         "rounds": int(metrics["round"].max()) if len(metrics) else 0,
         "required_strata": STRATA,
     }
-    out = get_project_paths().output_dir / "dictionary" / "formal_discovery_manifest_v1.json"
+    out = (
+        get_project_paths().output_dir
+        / "dictionary"
+        / "formal_discovery_manifest_v1.json"
+    )
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    out.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
     if not passed:
         raise SystemExit(2)
     return out
@@ -223,6 +284,8 @@ def main() -> None:
     f.add_argument("--frame", type=Path, required=True)
     f.add_argument("--selected", type=Path, required=True)
     f.add_argument("--metrics", type=Path, required=True)
+    f.add_argument("--candidate-audit", type=Path, required=True)
+    f.add_argument("--governance", type=Path, required=True)
     args = ap.parse_args()
 
     if args.cmd == "baseline":
@@ -237,7 +300,8 @@ def main() -> None:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         out.to_csv(args.out, index=False, encoding="utf-8-sig")
     else:
-        finalize(args.frame, args.selected, args.metrics)
+        finalize(args.frame, args.selected, args.metrics,
+                 args.candidate_audit, args.governance)
 
 
 if __name__ == "__main__":
