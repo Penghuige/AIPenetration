@@ -62,7 +62,7 @@ logger = logging.getLogger("ai_penetration.panel_v2.dedup")
 
 # b 版：规则1 跨城 rid 去重 + 组首锚定 30 天桶（链式语义超披露线修正）
 # c 版：2022 数据治理——描述有效长度 >=10 准入（blank 率 18.3% 污染修复）
-MASTER_VERSION = "main_v2a_20260919d_stableid"
+MASTER_VERSION = "main_v2a_20260919e_platformhash"
 TABLE_STAGE = "dedup_stage_gzsz"
 TABLE_SORTED = "dedup_sorted_gzsz"
 TABLE_MASTER = "job_master_gzsz"
@@ -86,12 +86,12 @@ PLATFORM_SAMPLE_SEED = 42
 
 # 定长窄行（64B）：rid32 + plat/city + yr2 + day4 + posh8 + thash8 + dlen2 + comp1 + pad2
 ROW_DTYPE = np.dtype([
-    ("rid", "S32"), ("jid", "i8"), ("plat", "u1"), ("city", "u1"),
+    ("rid", "S32"), ("jid", "i8"), ("phash", "i8"), ("plat", "u1"), ("city", "u1"),
     ("yr", "u2"), ("day", "i4"), ("posh", "i8"), ("thash", "i8"),
     ("dlen", "u2"), ("comp", "u1"), ("pad", "S5"),
 ])
-if ROW_DTYPE.itemsize != 72:
-    raise RuntimeError(f"ROW_DTYPE 尺寸异常: {ROW_DTYPE.itemsize} != 72")
+if ROW_DTYPE.itemsize != 80:
+    raise RuntimeError(f"ROW_DTYPE 尺寸异常: {ROW_DTYPE.itemsize} != 80")
 
 
 def _stable_job_id_sha256(platform: str, raw_job_id: str) -> str:
@@ -125,6 +125,11 @@ def _h63(s: str) -> int:
     from hashlib import blake2b
     return int.from_bytes(blake2b(s.encode("utf-8"), digest_size=8).digest(),
                           "big") & 0x7FFF_FFFF_FFFF_FFFF
+
+
+def _stable_platform_hash(platform: str) -> int:
+    """平台真实字符串的稳定 63-bit 标识；去重语义不依赖采样字典。"""
+    return _h63("platform\x1f" + str(platform or "").strip())
 
 
 def _day_of(y: int, mo: int, d: int) -> int:
@@ -224,6 +229,7 @@ def _scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str,
                         srid = srid[:32]
                     r["rid"] = srid
                     r["jid"] = _stable_job_id(pkey, str(rid))
+                    r["phash"] = _stable_platform_hash(pkey)
                     r["plat"] = plats.get(pkey, 255)
                     r["city"] = city_id
                     r["yr"] = yr
@@ -396,7 +402,8 @@ def copy_stage(metas: list[dict], resume: bool) -> int:
     if not stage_exists:
         cur.execute(f"""
             CREATE TABLE public.{TABLE_STAGE} (
-                rid text NOT NULL, jid bigint NOT NULL, plat smallint, city smallint,
+                rid text NOT NULL, jid bigint NOT NULL, phash bigint NOT NULL,
+                plat smallint, city smallint,
                 yr int, day int, posh bigint, thash bigint, dlen int, comp smallint)""")
     _ensure_logged(cur, TABLE_STAGE)
     cur.execute(f"SELECT count(*) FROM public.{TABLE_STAGE}")
@@ -542,7 +549,7 @@ def build_master() -> tuple[int, int]:
         cur.execute(f"""
             CREATE TABLE public.{TABLE_SORTED} AS
             WITH joined AS (
-                SELECT s.rid, s.jid, s.plat, s.city, s.yr, s.day, s.posh, s.thash,
+                SELECT s.rid, s.jid, s.phash, s.plat, s.city, s.yr, s.day, s.posh, s.thash,
                        s.dlen, s.comp,
                        coalesce(e.company_id, 'UNK:' || s.rid) AS company_id,
                        (e.company_id IS NULL) AS company_unmatched
@@ -552,12 +559,12 @@ def build_master() -> tuple[int, int]:
                        ON e.recruit_id = s.rid
             ), rid_rank AS (
                 SELECT *,
-                       row_number() OVER (PARTITION BY plat, rid
+                       row_number() OVER (PARTITION BY jid
                                           ORDER BY city, day, thash) AS rn_rid,
-                       count(*) OVER (PARTITION BY plat, rid) - 1 AS rule1_dups
+                       count(*) OVER (PARTITION BY jid) - 1 AS rule1_dups
                 FROM joined
             )
-            SELECT rid, jid, plat, city, yr, day, posh, thash, dlen, comp,
+            SELECT rid, jid, phash, plat, city, yr, day, posh, thash, dlen, comp,
                    company_id, company_unmatched, rule1_dups
             FROM rid_rank WHERE rn_rid = 1
         """)
@@ -603,7 +610,7 @@ def build_master() -> tuple[int, int]:
             WINDOW w AS (PARTITION BY company_id, posh, city, thash, yr, seg)
         )
         SELECT jid AS job_id,
-               rid AS job_id_raw, plat, city, yr AS year, company_id, thash,
+               rid AS job_id_raw, phash, plat, city, yr AS year, company_id, thash,
                (company_id || ':' || posh || ':' || city || ':' || thash || ':'
                 || yr || ':' || seg) AS duplicate_group_id,
                grp_n AS records_collapsed,
@@ -622,11 +629,11 @@ def build_master() -> tuple[int, int]:
         CREATE TABLE public.{TABLE_GROUPMAP} AS
         SELECT (company_id || ':' || posh || ':' || city || ':' || thash || ':'
                 || yr || ':' || seg) AS duplicate_group_id,
-               plat, rid AS job_id_raw, day, comp, dlen
+               phash AS platform_hash, plat, rid AS job_id_raw, day, comp, dlen
         FROM public.{TABLE_SEG}
     """)
     cur.execute("CREATE TABLE public.job_master_pc AS "
-                "SELECT duplicate_group_id, count(DISTINCT plat) AS platform_count "
+                "SELECT duplicate_group_id, count(DISTINCT platform_hash) AS platform_count "
                 "FROM public." + TABLE_GROUPMAP + " GROUP BY 1")
     cur.execute(f"ALTER TABLE public.{TABLE_MASTER} "
                 "ADD COLUMN platform_count int")
@@ -658,7 +665,7 @@ def verify_invariants(metas: list[dict] | None = None) -> None:
                (SELECT sum(records_collapsed) FROM public.{TABLE_MASTER}),
                (SELECT count(*) - count(DISTINCT duplicate_group_id) FROM public.{TABLE_MASTER}),
                (SELECT count(*) FROM (
-                   SELECT plat, job_id_raw FROM public.{TABLE_MASTER}
+                   SELECT phash, job_id_raw FROM public.{TABLE_MASTER}
                    GROUP BY 1,2 HAVING count(*)>1) z),
                (SELECT count(*) FROM public.{TABLE_STAGE} WHERE yr = 0),
                (SELECT count(*) FROM public.{TABLE_STAGE} WHERE plat = 255),
