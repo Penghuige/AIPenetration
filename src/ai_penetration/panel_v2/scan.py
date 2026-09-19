@@ -36,7 +36,7 @@ import psycopg2
 from config.paths import get_project_paths
 
 from ..common import eps_conn_params, setup_logging
-from ..text_clean import match_from_raw
+from ..text_clean import match_from_raw, text_hash
 from .anchors import ANCHOR_RULES_VERSION, match_all_versions
 from .dedup import ADMISSION_WHERE, MASTER_VERSION, SHARDS, _blocks, _h63
 
@@ -45,6 +45,7 @@ logger = logging.getLogger("ai_penetration.panel_v2.scan")
 GROUP_BITS = {"AI": 1, "ML": 2, "NLP": 4, "CVISION": 8,
               "CIMAGE": 16, "LLM": 32, "TRANS": 64}
 FLUSH_ROWS = 500_000  # 每子批落盘行数（B1：禁止全切片累积）
+SCAN_PIPELINE_VERSION = "handoff_v3_longest_span_primary_20260919"
 
 _WORKER: dict = {}
 
@@ -67,17 +68,18 @@ def export_master(out_dir: Path) -> None:
     """
     npy_dir = out_dir / "master_npy"
     stamp = npy_dir / ".stamp.json"
-    names = ("key", "job_id", "year", "company")
+    names = ("key", "job_id", "year", "company", "city", "thash")
     if all((npy_dir / f"{n}.npy").exists() for n in names) and stamp.exists():
         s = json.loads(stamp.read_text(encoding="utf-8"))
-        if s.get("version") == MASTER_VERSION:
+        if (s.get("version") == MASTER_VERSION
+                and s.get("scan_pipeline_version") == SCAN_PIPELINE_VERSION):
             logger.info("master npy 复用（%s，n=%d）", s["version"], s["n"])
             return
         logger.warning("master npy 版号不符（%s != %s），重建",
                        s.get("version"), MASTER_VERSION)
     conn = _results_conn()
     cur = conn.cursor()
-    cur.execute("SELECT job_id_raw, plat, job_id, city, year, company_id "
+    cur.execute("SELECT job_id_raw, plat, job_id, city, year, company_id, thash "
                 "FROM public.job_master_gzsz")
     rows = cur.fetchall()
     conn.close()
@@ -87,15 +89,19 @@ def export_master(out_dir: Path) -> None:
     job_id = np.empty(n, np.int64)
     year = np.empty(n, np.int32)
     company = np.empty(n, np.int32)
+    city = np.empty(n, np.int16)
+    thash = np.empty(n, np.int64)
     comps: dict[str, int] = {}
     # key = h63(rid)：master 的 rid 全局唯一（实证 0 重复组），跨切片/跨平台
     # 的重复命中由 worker hit_seen + PG 端 DISTINCT ON 仲裁（rid 复合平台编码
     # 会因映射覆盖缺口产生漏命中，2026-09-07 实证 9867 例，已弃用）
-    for i, (rid, _plat, jid, _city, y, comp) in enumerate(rows):
+    for i, (rid, _plat, jid, city_id, y, comp, hash_value) in enumerate(rows):
         key[i] = _h63(str(rid))
         job_id[i] = int(jid)
         year[i] = int(y)
         company[i] = comps.setdefault(str(comp), len(comps))
+        city[i] = int(city_id)
+        thash[i] = int(hash_value)
     order = np.argsort(key, kind="stable")
     k_sorted = key[order]
     assert not np.any(k_sorted[1:] == k_sorted[:-1]), "canonical key 哈希碰撞"
@@ -103,12 +109,14 @@ def export_master(out_dir: Path) -> None:
     tmp = out_dir / "_master_tmp"
     tmp.mkdir(parents=True, exist_ok=True)
     for name, arr in (("key", k_sorted), ("job_id", job_id[order]),
-                      ("year", year[order]), ("company", company[order])):
+                      ("year", year[order]), ("company", company[order]),
+                      ("city", city[order]), ("thash", thash[order])):
         p = tmp / f"{name}.npy"
         np.save(p, arr)
         p.rename(npy_dir / f"{name}.npy")   # 原子发布
-    stamp.write_text(json.dumps({"version": MASTER_VERSION, "n": n}),
-                     encoding="utf-8")
+    stamp.write_text(json.dumps({
+        "version": MASTER_VERSION, "scan_pipeline_version": SCAN_PIPELINE_VERSION,
+        "n": n}), encoding="utf-8")
     (out_dir / "company_vocab.json").write_text(
         json.dumps(comps), encoding="utf-8")
     logger.info("master npy 导出: %d 条 / company %d", n, len(comps))
@@ -135,7 +143,7 @@ def build_skill_vocab(out_dir: Path) -> None:
 def _init_worker(npy_dir: str) -> None:
     """worker：mmap master + 词表一致性断言（B3）。"""
     _WORKER["m"] = {n: np.load(Path(npy_dir) / f"{n}.npy", mmap_mode="r")
-                    for n in ("key", "job_id", "year", "company")}
+                    for n in ("key", "job_id", "year", "company", "city", "thash")}
     from ..skill_ai_anchor import load_merged_skills
     from .lexicon import _load_atier_aliases, build_union_lexicon
     aliases = _load_atier_aliases()
