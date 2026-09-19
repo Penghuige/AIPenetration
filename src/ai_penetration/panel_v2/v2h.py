@@ -31,13 +31,16 @@ from config.paths import get_project_paths
 from ..common import setup_logging
 from . import quality, scoring
 from .counts import compute_counts
+from .anchors import anchor_dictionary_rows
+from .governance import materialize_formal_dictionary, normalize_term
+from .lexicon import _load_atier_alias_records
 from .export_release import _meta
 from .relevance import _load_tier_map, compute_relevance, decode_skill_ids
 from .reproducibility import write_run_manifest
 
 logger = logging.getLogger("ai_penetration.panel_v2.v2h")
 
-LEX_VERSION = "bilingual_a_frozen_v1.1+legacy_grade_v2"
+LEX_VERSION = "bilingual_a_frozen_v1.1+governed_v1.4"
 
 
 def filter_longs(rel2: Path, codes: np.ndarray,
@@ -125,16 +128,20 @@ def main() -> None:
         shutil.copy2(rel2 / f, rel3 / f)
 
     # 2) v1.3 D 级过滤
-    gcsv = paths.output_dir / "dictionary" / "skill_legacy_graded_BCD_v2.csv"
+    gcsv = paths.output_dir / "dictionary" / "skill_legacy_graded_BCD_v3.csv"
     grade = pd.read_csv(gcsv, encoding="utf-8-sig")
     pass2b = paths.output_dir / "panel_v2" / "pass2b"
     vocab_path = pass2b / "skill_vocab.json"
     vocab = json.loads(vocab_path.read_text(encoding="utf-8"))
-    d_ids = set(grade[grade.final_grade == "D"].skill_id.astype(str))
-    grade_by_sid = dict(zip(grade.skill_id.astype(str), grade.final_grade.astype(str)))
-    codes = np.array(sorted(vocab[s] for s in d_ids if s in vocab), np.int32)
-    logger.info("D 级排除 %d 码", len(codes))
-    filter_longs(rel3, codes, grade_by_sid)
+    formal_grade = grade[grade.final_grade.isin(["A", "B", "C"])].copy()
+    if formal_grade.final_skill_id.isna().any():
+        raise RuntimeError("治理表 A/B/C 存在空 final_skill_id")
+    grade_by_sid = dict(zip(
+        formal_grade.final_skill_id.astype(str),
+        formal_grade.final_grade.astype(str),
+    ))
+    # handoff-compliant scan 已只加载 A/B/C；此处不再“先扫 D 后删除”。
+    filter_longs(rel3, np.array([], np.int32), grade_by_sid)
 
     # 3) counts（新 flag）→ relevance
     counts = compute_counts(rel3)
@@ -150,14 +157,30 @@ def main() -> None:
     scoring.run(rel3)
     quality.run(rel3)
 
-    # 5) 装配：字典/锚点/分级件 + metadata
-    copied_release_inputs = (
-        "skill_concept_v1.parquet", "skill_alias_v1.parquet",
-        "skill_candidate_d_v1.parquet", "skill_legacy_v1.parquet",
-        "ai_anchor_dictionary_v1.csv",
+    # 5) 装配：§18 正式词典必须与实际 matcher 同一 A/B/C 概念集合。
+    base_concepts = pd.read_parquet(rel_src / "skill_concept_v1.parquet")
+    base_aliases = pd.read_parquet(rel_src / "skill_alias_v1.parquet")
+    resolved = {
+        normalize_term(r.alias): r.skill_id
+        for r in _load_atier_alias_records()
+    }
+    base_aliases["_norm"] = base_aliases.alias.astype(str).map(normalize_term)
+    keep_base = [
+        resolved.get(key) == str(sid)
+        for key, sid in zip(base_aliases["_norm"], base_aliases.skill_id)
+    ]
+    base_aliases = base_aliases.loc[keep_base].drop(columns=["_norm"]).reset_index(drop=True)
+    concepts, aliases, d_candidates = materialize_formal_dictionary(
+        base_concepts, base_aliases, grade, LEX_VERSION
     )
-    for f in copied_release_inputs:
-        shutil.copy2(rel_src / f, rel3 / f)
+    concepts.to_parquet(rel3 / "skill_concept_v1.parquet", index=False)
+    aliases.to_parquet(rel3 / "skill_alias_v1.parquet", index=False)
+    d_candidates.to_parquet(rel3 / "skill_candidate_d_v1.parquet", index=False)
+    pd.DataFrame(anchor_dictionary_rows()).to_csv(
+        rel3 / "ai_anchor_dictionary_v1.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
     shutil.copy2(gcsv, rel3 / gcsv.name)
 
     single = rel3 / "job_ai_score.parquet"
@@ -171,25 +194,24 @@ def main() -> None:
                 w.write_table(pa.Table.from_batches([rb]))
 
     specs = [
-        ("skill_concept_v1.parquet", "skill_id", "ai_dict.skill_concepts"),
-        ("skill_alias_v1.parquet", "alias_id", "ai_dict.skill_aliases(active)"),
-        ("skill_candidate_d_v1.parquet", "term", "pass2b/skill_vocab.json"),
-        ("skill_legacy_v1.parquet", "term", "panel_v2/lexicon.py(union构建处置)"),
-        ("skill_legacy_graded_BCD_v2.csv", "skill_id",
-         "panel_v2/lexicon_llm.py(T1∧T2 合并分级)"),
+        ("skill_concept_v1.parquet", "skill_id", "governance.py(A/B/C formal)"),
+        ("skill_alias_v1.parquet", "alias_id", "governance.py(A/B/C aliases)"),
+        ("skill_candidate_d_v1.parquet", "term", "governance.py(D only)"),
+        ("skill_legacy_graded_BCD_v3.csv", "term",
+         "panel_v2/lexicon_llm.py(T1/T2 concept mapping)"),
         ("ai_anchor_dictionary_v1.csv", "anchor_version+keyword",
          "panel_v2/anchors.py(规则 20260909_b)"),
-        ("job_anchor_flag.parquet", "job_id", "panel_v2/scan.py(规则 b 重扫)"),
-        ("job_skill_long.parquet", "job_id+skill_code", "panel_v2/v2h.py(D 级过滤)"),
-        ("job_firm.parquet", "job_id", "panel_v2/scan.py(规则 b 重扫)"),
-        ("skill_ai_counts.parquet", "skill+ver+win+year", "panel_v2/counts.py(规则 b)"),
-        ("skill_ai_relevance.parquet", "skill+ver+win+year", "panel_v2/relevance.py(规则 b)"),
-        ("job_ai_score.parquet", "job+ver+win+stype", "panel_v2/scoring.py(v2h)"),
-        ("job_ai_classification.parquet", "job_id", "panel_v2/scoring.py(v2h)"),
-        ("job_ai_score_loo.parquet", "job_id", "panel_v2/scoring.py(§14.3 v2h)"),
-        ("quality_control_report.md", "-", "panel_v2/quality.py(v2h)"),
+        ("job_anchor_flag.parquet", "job_id", "panel_v2/scan.py(canonical+terms)"),
+        ("job_skill_long.parquet", "job_id+skill_id",
+         "panel_v2/scan.py(longest-match+span evidence)"),
+        ("job_firm.parquet", "job_id", "panel_v2/scan.py"),
+        ("skill_ai_counts.parquet", "skill+ver+win+year", "panel_v2/counts.py"),
+        ("skill_ai_relevance.parquet", "skill+ver+win+year", "panel_v2/relevance.py"),
+        ("job_ai_score.parquet", "job+ver+win+stype", "panel_v2/scoring.py"),
+        ("job_ai_classification.parquet", "job_id", "panel_v2/scoring.py"),
+        ("job_ai_score_loo.parquet", "job_id", "panel_v2/scoring.py(§14.3)"),
+        ("quality_control_report.md", "-", "panel_v2/quality.py"),
     ]
-
     missing = [name for name, _, _ in specs if not (rel3 / name).exists()]
     if missing:
         raise RuntimeError(
@@ -206,8 +228,8 @@ def main() -> None:
 
     # 6) 指南 §4.2：把本次正式运行的代码/配置、输入、输出绑定成一个总账。
     manifest_inputs = [rel2 / f for f in scan_inputs]
-    manifest_inputs += [rel_src / f for f in copied_release_inputs]
-    manifest_inputs += [gcsv, vocab_path]
+    manifest_inputs += [rel_src / "skill_concept_v1.parquet",
+                        rel_src / "skill_alias_v1.parquet", gcsv, vocab_path]
     manifest_outputs = [rel3 / name for name, _, _ in specs]
     manifest = write_run_manifest(
         rel3,
