@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "job_id",
+    "skills"
+  ],
+  "properties": {
+    "job_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "skills": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "surface",
+          "canonical_suggestion",
+          "skill_type",
+          "evidence",
+          "start",
+          "end",
+          "existing_skill_id"
+        ],
+        "properties": {
+          "surface": {
+            "type": "string",
+            "minLength": 1
+          },
+          "canonical_suggestion": {
+            "type": "string",
+            "minLength": 1
+          },
+          "skill_type": {
+            "type": "string",
+            "enum": [
+              "programming_language",
+              "method_algorithm",
+              "software_tool",
+              "platform_framework_library",
+              "data_database",
+              "hardware_equipment",
+              "domain_knowledge",
+              "business_management",
+              "general_work_skill",
+              "soft_skill",
+              "other_skill"
+            ]
+          },
+          "evidence": {
+            "type": "string",
+            "minLength": 1
+          },
+          "start": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "end": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "existing_skill_id": {
+            "oneOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      }
+    }
+  }
+}
