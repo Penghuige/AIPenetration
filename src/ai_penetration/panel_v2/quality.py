@@ -61,21 +61,31 @@ def _sha_stats(df: pd.DataFrame, cols: list[str]) -> str:
 
 
 def _rerun_drift(prev: dict, stats: dict) -> list[str]:
-    """返回 §17.6.10 同目录重跑发生漂移的关键统计项。"""
+    """返回 §17.6.10 真正的数据/结果漂移项。
+
+    checksum schema 升级本身不是数据漂移：若 schema 不同，只比较与算法无关
+    的行数和关键比例；这些相同则允许成功迁移到新 schema。
+    """
     if not prev:
         return []
-    if prev.get("checksum_schema_version") != stats.get("checksum_schema_version"):
-        return ["checksum_schema_version"]
-    keys = (
+    stable_keys = (
         "n_jobs",
         "n_pairs",
-        "checksum_flags",
-        "checksum_counts",
         "main_annual_raw_005_rate",
         "main_annual_raw_015_rate",
         "zero_skill_rate",
     )
-    return [k for k in keys if k in prev and k in stats and prev[k] != stats[k]]
+    stable_drift = [
+        k for k in stable_keys
+        if k in prev and k in stats and prev[k] != stats[k]
+    ]
+    if prev.get("checksum_schema_version") != stats.get("checksum_schema_version"):
+        return stable_drift
+    checksum_keys = ("checksum_flags", "checksum_counts")
+    return stable_drift + [
+        k for k in checksum_keys
+        if k in prev and k in stats and prev[k] != stats[k]
+    ]
 
 
 def gate_checks(rel: Path) -> tuple[list[str], dict]:
