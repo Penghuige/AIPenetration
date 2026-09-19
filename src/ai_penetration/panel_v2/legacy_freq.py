@@ -76,10 +76,12 @@ def scan_slice(table: str, b_start: int, b_end: int, tmp_dir: str,
     task = f"lg_{FREQ_PROTOCOL_VERSION}_{tag[:6]}_{table}_{b_start}_{b_end}"
     kf = Path(tmp_dir) / f"{task}.keys.bin"
     af = Path(tmp_dir) / f"{task}.aids.bin"
+    aikf = Path(tmp_dir) / f"{task}.ai_keys.bin"
+    aiaf = Path(tmp_dir) / f"{task}.ai_aids.bin"
     hb = Path(tmp_dir) / f"{task}.hb.json"
     wl = (Path(tmp_dir) / f"{task}.wlog.txt").open("a", encoding="utf-8")
 
-    if kf.exists() and af.exists():
+    if kf.exists() and af.exists() and aikf.exists() and aiaf.exists():
         wl.close()
         return json.loads((Path(tmp_dir) / f"{task}.json").read_text(encoding="utf-8"))
 
@@ -89,7 +91,10 @@ def scan_slice(table: str, b_start: int, b_end: int, tmp_dir: str,
     FLUSH = 1_000_000
     buf_k = np.empty(FLUSH, np.uint64)
     buf_a = np.empty(FLUSH, np.uint32)
+    buf_k_ai = np.empty(FLUSH, np.uint64)
+    buf_a_ai = np.empty(FLUSH, np.uint32)
     pos = seq = pairs = 0
+    pos_ai = seq_ai = ai_pairs = 0
 
     def spill() -> None:
         """溢出前桶内 (aid,key) 排序去重——模板相邻重复在桶级即消，
@@ -108,6 +113,22 @@ def scan_slice(table: str, b_start: int, b_end: int, tmp_dir: str,
         pairs += int(keep.sum())
         seq += 1
         pos = 0
+
+    def spill_ai() -> None:
+        """主锚点命中文本的 (aid,key) 独立有界溢出。"""
+        nonlocal pos_ai, seq_ai, ai_pairs
+        if not pos_ai:
+            return
+        kk, aa = buf_k_ai[:pos_ai], buf_a_ai[:pos_ai]
+        o = np.lexsort((kk, aa))
+        ks, as_ = kk[o], aa[o]
+        keep = np.ones(pos_ai, dtype=bool)
+        keep[1:] = (ks[1:] != ks[:-1]) | (as_[1:] != as_[:-1])
+        ks[keep].tofile(Path(tmp_dir) / f"{task}.mk{seq_ai:03d}.part")
+        as_[keep].tofile(Path(tmp_dir) / f"{task}.ma{seq_ai:03d}.part")
+        ai_pairs += int(keep.sum())
+        seq_ai += 1
+        pos_ai = 0
 
     def connect():
         last = None
@@ -149,6 +170,7 @@ def scan_slice(table: str, b_start: int, b_end: int, tmp_dir: str,
                 # 使用纯规范化 text_hash，不再把 platform 拼入 distinct key。
                 norm = match_from_raw(str(desc))
                 key = text_hash(norm)
+                main_ai = bool(match_all_versions(norm)["main"].flag)
                 for end, k in auto.iter(norm):
                     if k in ascii_keys:
                         s0 = end - len(k) + 1
@@ -156,21 +178,30 @@ def scan_slice(table: str, b_start: int, b_end: int, tmp_dir: str,
                         aft = norm[end + 1] if end + 1 < len(norm) else ""
                         if _is_ascii_alnum(bef) or _is_ascii_alnum(aft):
                             continue
+                    aid = idx[k]
                     buf_k[pos] = key
-                    buf_a[pos] = idx[k]
+                    buf_a[pos] = aid
                     pos += 1
                     if pos == FLUSH:
                         spill()
+                    if main_ai:
+                        buf_k_ai[pos_ai] = key
+                        buf_a_ai[pos_ai] = aid
+                        pos_ai += 1
+                        if pos_ai == FLUSH:
+                            spill_ai()
             hb.write_text(json.dumps({"phase": "scan", "rows": rows,
-                                      "pairs": pairs + pos}), encoding="utf-8")
+                                      "pairs": pairs + pos,
+                                      "ai_pairs": ai_pairs + pos_ai}), encoding="utf-8")
             if rows % 2_000_000 == 0:
-                wlog(f"rows={rows:,} pairs={pairs + pos:,}")
+                wlog(f"rows={rows:,} pairs={pairs + pos:,} ai_pairs={ai_pairs + pos_ai:,}")
         cur.close()
         conn.close()
         spill()
-        wlog(f"fetch done rows={rows:,} pairs={pairs:,}; merging")
+        spill_ai()
+        wlog(f"fetch done rows={rows:,} pairs={pairs:,} ai_pairs={ai_pairs:,}; merging")
         hb.write_text(json.dumps({"phase": "merge", "rows": rows,
-                                  "pairs": pairs}), encoding="utf-8")
+                                  "pairs": pairs, "ai_pairs": ai_pairs}), encoding="utf-8")
         parts = sorted(Path(tmp_dir).glob(f"{task}.k*.part"))
         if pairs:
             ka = np.concatenate([np.fromfile(p, dtype=np.uint64) for p in parts])
@@ -184,13 +215,29 @@ def scan_slice(table: str, b_start: int, b_end: int, tmp_dir: str,
             np.empty(0, np.uint64).tofile(kf)
             np.empty(0, np.uint32).tofile(af)
             n_uniq_local = 0
+        ai_key_parts = sorted(Path(tmp_dir).glob(f"{task}.mk*.part"))
+        ai_aid_parts = sorted(Path(tmp_dir).glob(f"{task}.ma*.part"))
+        if ai_pairs:
+            kai = np.concatenate([
+                np.fromfile(p, dtype=np.uint64) for p in ai_key_parts
+            ])
+            aai = np.concatenate([
+                np.fromfile(p, dtype=np.uint32) for p in ai_aid_parts
+            ])
+            kai.tofile(aikf)
+            aai.tofile(aiaf)
+            del kai, aai
+        else:
+            np.empty(0, np.uint64).tofile(aikf)
+            np.empty(0, np.uint32).tofile(aiaf)
         for p in Path(tmp_dir).glob(f"{task}.*.part"):
             p.unlink()
     finally:
         wl.close()
     meta = {"task": task, "rows": rows, "pairs": int(pairs),
-            "local_new": n_uniq_local,
-            "keys_file": str(kf), "aids_file": str(af)}
+            "ai_pairs": int(ai_pairs), "local_new": n_uniq_local,
+            "keys_file": str(kf), "aids_file": str(af),
+            "ai_keys_file": str(aikf), "ai_aids_file": str(aiaf)}
     (Path(tmp_dir) / f"{task}.json").write_text(json.dumps(meta), encoding="utf-8")
     hb.unlink(missing_ok=True)
     logger.info("legacy 切片 %s 完成: rows=%d pairs=%d", task, rows, pairs)
@@ -242,13 +289,44 @@ def main() -> None:
         for f in [pool.submit(scan_slice, t, lo, hi, str(tmp), args.tag)
                   for t, lo, hi in tasks]:
             metas.append(f.result())
-    freq = aggregate_counts(metas, tmp, n_alias=len(terms))
+    freq = aggregate_counts(
+        metas, tmp, n_alias=len(terms), cleanup=False
+    )
+    ai_metas = [
+        {
+            **m,
+            "pairs": int(m.get("ai_pairs", 0)),
+            "keys_file": m["ai_keys_file"],
+            "aids_file": m["ai_aids_file"],
+        }
+        for m in metas
+    ]
+    ai_freq = aggregate_counts(
+        ai_metas, tmp, n_alias=len(terms), cleanup=False
+    )
     order = sorted(terms)
-    rows = [(k, terms[k], int(freq[i])) for i, k in enumerate(order)]
+    rows = [
+        (
+            k, terms[k], int(freq[i]), int(ai_freq[i]),
+            float(ai_freq[i] / freq[i]) if freq[i] else 0.0,
+        )
+        for i, k in enumerate(order)
+    ]
     out_csv = paths.output_dir / "dictionary" / f"{args.tag}.csv"
     import pandas as pd
-    pd.DataFrame(rows, columns=["match_key", "skill_id", "df_unique_text"]
-                 ).to_csv(out_csv, index=False, encoding="utf-8-sig")
+    pd.DataFrame(
+        rows,
+        columns=[
+            "match_key", "skill_id", "df_unique_text",
+            "main_anchor_unique_text", "candidate_anchor_cooc",
+        ],
+    ).to_csv(out_csv, index=False, encoding="utf-8-sig")
+    for m in metas:
+        for name in (
+            "keys_file", "aids_file", "ai_keys_file", "ai_aids_file"
+        ):
+            Path(m[name]).unlink(missing_ok=True)
+        (tmp / f"{m['task']}.json").unlink(missing_ok=True)
     logger.info("legacy 频数落盘 %s（df>0: %d，df>=100: %d）", out_csv,
                 int((freq > 0).sum()), int((freq >= 100).sum()))
     # 治理结果表（eps ai_dict 唯一合法写入目标；仅默认 tag 写 PG——自定义
@@ -260,7 +338,8 @@ def main() -> None:
         c = conn.cursor()
         c.execute("DROP TABLE IF EXISTS ai_dict.legacy_term_freq")
         c.execute("""CREATE TABLE ai_dict.legacy_term_freq (
-            match_key text PRIMARY KEY, skill_id text, df_unique_text bigint)""")
+            match_key text PRIMARY KEY, skill_id text, df_unique_text bigint,
+            main_anchor_unique_text bigint, candidate_anchor_cooc double precision)""")
         from psycopg2.extras import execute_values
         execute_values(c, "INSERT INTO ai_dict.legacy_term_freq VALUES %s",
                        rows, page_size=5000)
