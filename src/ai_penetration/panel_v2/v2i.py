@@ -50,6 +50,7 @@ LEX_VERSION = "bilingual_a_frozen_v1.1+governed_v1.4"
 def require_handoff_manifests(paths) -> list[Path]:
     """正式 v2i 发布前必须有真实执行产生的上游合规凭证。"""
     required = [
+        paths.output_dir / "dictionary" / "external_translation_completion_manifest_v1.json",
         paths.report_dir / "model_benchmark_technical_manifest_v1.json",
         paths.report_dir / "model_benchmark_prerun_manifest_v1.json",
         paths.output_dir / "dictionary" / "formal_discovery_manifest_v1.json",
