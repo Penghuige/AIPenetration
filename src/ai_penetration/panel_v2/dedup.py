@@ -62,7 +62,7 @@ logger = logging.getLogger("ai_penetration.panel_v2.dedup")
 
 # b 版：规则1 跨城 rid 去重 + 组首锚定 30 天桶（链式语义超披露线修正）
 # c 版：2022 数据治理——描述有效长度 >=10 准入（blank 率 18.3% 污染修复）
-MASTER_VERSION = "main_v2a_20260908c"
+MASTER_VERSION = "main_v2a_20260919d_stableid"
 TABLE_STAGE = "dedup_stage_gzsz"
 TABLE_SORTED = "dedup_sorted_gzsz"
 TABLE_MASTER = "job_master_gzsz"
@@ -86,12 +86,28 @@ PLATFORM_SAMPLE_SEED = 42
 
 # 定长窄行（64B）：rid32 + plat/city + yr2 + day4 + posh8 + thash8 + dlen2 + comp1 + pad2
 ROW_DTYPE = np.dtype([
-    ("rid", "S32"), ("plat", "u1"), ("city", "u1"), ("yr", "u2"),
-    ("day", "i4"), ("posh", "i8"), ("thash", "i8"), ("dlen", "u2"),
-    ("comp", "u1"), ("pad", "S5"),
+    ("rid", "S32"), ("jid", "i8"), ("plat", "u1"), ("city", "u1"),
+    ("yr", "u2"), ("day", "i4"), ("posh", "i8"), ("thash", "i8"),
+    ("dlen", "u2"), ("comp", "u1"), ("pad", "S5"),
 ])
-if ROW_DTYPE.itemsize != 64:
-    raise RuntimeError(f"ROW_DTYPE 尺寸异常: {ROW_DTYPE.itemsize} != 64")
+if ROW_DTYPE.itemsize != 72:
+    raise RuntimeError(f"ROW_DTYPE 尺寸异常: {ROW_DTYPE.itemsize} != 72")
+
+
+def _stable_job_id(platform: str, raw_job_id: str) -> int:
+    """SHA256(source_platform | job_id_raw) 的 63-bit 计算代理键。
+
+    完整 SHA256 公式固定；截取 63 bit 仅为保持下游 int64 高效表示，
+    master 构建后必须做全量碰撞检查。
+    """
+    import hashlib
+    payload = (
+        str(platform or "").strip()
+        + "\x1f"
+        + str(raw_job_id or "").strip()
+    ).encode("utf-8")
+    digest = hashlib.sha256(payload).digest()
+    return int.from_bytes(digest[:8], "big") & 0x7FFF_FFFF_FFFF_FFFF
 
 
 def _h63(s: str) -> int:
@@ -196,6 +212,7 @@ def _scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str,
                         long_rid += 1   # 两条 rid 可同键致规则1误折叠
                         srid = srid[:32]
                     r["rid"] = srid
+                    r["jid"] = _stable_job_id(pkey, str(rid))
                     r["plat"] = plats.get(pkey, 255)
                     r["city"] = city_id
                     r["yr"] = yr
