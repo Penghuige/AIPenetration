@@ -71,7 +71,7 @@ logs/                 # 运行日志
 ## 外部技能词典冻结管线（exchange 交接·第二节四步）
 
 ```bash
-# 1. 频数计算（广深语料，去重口径 COUNT(DISTINCT platform×规范化text)，约1-2h）
+# 1. 频数计算（广深语料，分级/激活口径 COUNT(DISTINCT 规范化text_hash)）
 python -X utf8 -m src.ai_penetration.zh_alias_freq --force
 
 # 2-3. 阈值激活（先 dry-run 看候选，确认后 --apply）
@@ -96,10 +96,30 @@ python -m src.ai_penetration.freeze_external_dictionary
 
 写报告时请注明所用 `--method` 与 omega 快照时间戳。
 
+## 原始交接合规重跑（v2i）
+
+历史 v2h 保留不覆盖。v2i 只有在阶段一数据审计、170 批翻译完成性、
+Qwen 技术基准/1万条预运行、正式分层候选发现饱和、T1/T2 治理均生成
+formal manifest 后才允许发布。
+
+```bash
+python -m src.ai_penetration.panel_v2.data_audit
+python -m src.ai_penetration.translation_completion --results-dir <历史170批目录>
+python -m src.ai_penetration.panel_v2.model_benchmark --phase technical --sample-file <1000条基准jsonl>
+python -m src.ai_penetration.panel_v2.model_benchmark --phase prerun --sample-file <10000条预运行jsonl>
+# discovery_formal baseline/round/finalize 按指南 §9 完成至饱和
+python -m src.ai_penetration.panel_v2.lexicon_llm t1
+python -m src.ai_penetration.panel_v2.lexicon_llm t2
+python -m src.ai_penetration.panel_v2.lexicon_llm merge
+python -m src.ai_penetration.panel_v2.scan --out-tag _handoff_scan
+python -m src.ai_penetration.panel_v2.v2i --dry-run
+python -m src.ai_penetration.panel_v2.v2i --run-id YYYYMMDD_HHMM_v2i
+```
+
 ## 测试
 
 ```bash
-pytest src/tests/ -q          # 27 个离线单测，不需要数据库和 LLM
+pytest src/tests/ -q
 python -m compileall -q src config
 ```
 
