@@ -32,6 +32,15 @@ _T2_TYPE_MAP = {
 }
 
 
+
+def _text(value, default: str = "") -> str:
+    """CSV/DataFrame 空值安全转文本，避免 NaN 被写成字面量 'nan'。"""
+    if value is None or pd.isna(value):
+        return default
+    text = str(value).strip()
+    return text if text else default
+
+
 def normalize_term(term: str) -> str:
     """与正式 matcher 一致的概念名称规范化键。"""
     return unicodedata.normalize("NFKC", str(term)).lower().strip()
@@ -107,8 +116,8 @@ def materialize_source_skill_records(
         mapping_type: str,
         mapping_evidence: str,
     ) -> None:
-        source_name = str(source_name or "").strip()
-        source_skill_id = str(source_skill_id or "").strip()
+        source_name = _text(source_name)
+        source_skill_id = _text(source_skill_id)
         if not source_name or not source_skill_id:
             return
         key = (source_name, source_skill_id, sid)
@@ -117,7 +126,7 @@ def materialize_source_skill_records(
         seen.add(key)
         rows.append({
             "source_name": source_name,
-            "source_version": str(source_version or "UNKNOWN_LOCAL_SNAPSHOT"),
+            "source_version": _text(source_version, "UNKNOWN_LOCAL_SNAPSHOT"),
             "source_skill_id": source_skill_id,
             "source_label": label,
             "source_description": description,
@@ -130,31 +139,27 @@ def materialize_source_skill_records(
 
     for _, row in base_concepts.iterrows():
         sid = str(row.skill_id)
-        label = str(row.get("canonical_en") or row.get("canonical_zh") or "")
-        desc = str(
-            row.get("definition_en")
-            or row.get("description_en")
-            or ""
-        )
-        cat = str(row.get("skill_type") or "")
+        label = _text(row.get("canonical_en")) or _text(row.get("canonical_zh"))
+        desc = _text(row.get("definition_en")) or _text(row.get("description_en"))
+        cat = _text(row.get("skill_type"))
         add(
             sid,
-            str(row.get("source_primary") or ""),
-            str(row.get("source_version_primary") or "UNKNOWN_LOCAL_SNAPSHOT"),
-            str(row.get("source_id_primary") or ""),
+            _text(row.get("source_primary")),
+            _text(row.get("source_version_primary"), "UNKNOWN_LOCAL_SNAPSHOT"),
+            _text(row.get("source_id_primary")),
             label, desc, cat,
             "primary_source_record",
             "frozen_concept.source_primary/source_id_primary",
         )
         add(
-            sid, "ESCO", str(row.get("source_version_primary") or "UNKNOWN_LOCAL_SNAPSHOT"),
-            str(row.get("esco_uri") or ""), label, desc, cat,
+            sid, "ESCO", _text(row.get("source_version_primary"), "UNKNOWN_LOCAL_SNAPSHOT"),
+            _text(row.get("esco_uri")), label, desc, cat,
             "source_crosswalk",
             "frozen_concept.esco_uri",
         )
         add(
             sid, "O*NET", "UNKNOWN_LOCAL_SNAPSHOT",
-            str(row.get("onet_element_ids") or ""), label, desc, cat,
+            _text(row.get("onet_element_ids")), label, desc, cat,
             "source_crosswalk",
             "frozen_concept.onet_element_ids (preserved verbatim)",
         )
