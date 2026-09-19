@@ -203,14 +203,22 @@ def export_and_report(stamp: str) -> dict[str, str]:
     concept_csv = out_dir / f"skill_concept_{VERSION}.csv"
     alias_csv = out_dir / f"skill_alias_active_{VERSION}.csv"
 
+    concept_select = ", ".join(
+        f"'{VERSION}' AS dictionary_version" if col == "dictionary_version" else col
+        for col in CONCEPT_COLUMNS
+    )
+    alias_select = ", ".join(
+        f"'{VERSION}' AS dictionary_version" if col == "dictionary_version" else col
+        for col in ALIAS_COLUMNS
+    )
     n_concept = _copy_query_to_csv(
         "ai_dict",
-        f"SELECT {', '.join(CONCEPT_COLUMNS)} FROM ai_dict.skill_concepts ORDER BY skill_id",
+        f"SELECT {concept_select} FROM ai_dict.skill_concepts ORDER BY skill_id",
         concept_csv, CONCEPT_COLUMNS,
     )
     n_alias = _copy_query_to_csv(
         "ai_dict",
-        f"""SELECT {', '.join(ALIAS_COLUMNS)} FROM ai_dict.skill_aliases
+        f"""SELECT {alias_select} FROM ai_dict.skill_aliases
             WHERE is_active='1' ORDER BY alias_id""",
         alias_csv, ALIAS_COLUMNS,
     )
