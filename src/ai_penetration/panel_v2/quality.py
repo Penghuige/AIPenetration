@@ -41,6 +41,8 @@ from .anchors import ANCHOR_RULES_VERSION
 
 logger = logging.getLogger("ai_penetration.panel_v2.quality")
 
+CHECKSUM_SCHEMA_VERSION = 2
+
 
 def _sha_stats(df: pd.DataFrame, cols: list[str]) -> str:
     """对指定关键列做稳定的全行校验和。
@@ -62,6 +64,8 @@ def _rerun_drift(prev: dict, stats: dict) -> list[str]:
     """返回 §17.6.10 同目录重跑发生漂移的关键统计项。"""
     if not prev:
         return []
+    if prev.get("checksum_schema_version") != stats.get("checksum_schema_version"):
+        return ["checksum_schema_version"]
     keys = (
         "n_jobs",
         "n_pairs",
@@ -186,6 +190,7 @@ def gate_checks(rel: Path) -> tuple[list[str], dict]:
 
     # 10 重跑一致性：稳定关键统计落盘，run() 与同目录上一轮比较并阻断漂移
     stats["anchor_rules_version"] = ANCHOR_RULES_VERSION
+    stats["checksum_schema_version"] = CHECKSUM_SCHEMA_VERSION
     flags_sorted = flags.sort_values("job_id")
     stats["checksum_flags"] = _sha_stats(
         flags_sorted,
@@ -327,7 +332,19 @@ def run(rel: Path | None = None) -> None:
     (rel / "quality_control_report.md").write_text(
         "\n".join(report), encoding="utf-8"
     )
-    stats_path.write_text(json.dumps(stats, indent=1), encoding="utf-8")
+    if fails:
+        # 失败运行不得推进 §17.6.10 的成功基线。否则第一次真实漂移会把
+        # quality_stats.json 覆盖成新值，第二次原样重跑就会“新对新”误通过。
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        failed_stats = rel / f"quality_stats.failed_{stamp}.json"
+        failed_stats.write_text(json.dumps(stats, indent=1), encoding="utf-8")
+        logger.error(
+            "质量门失败；成功基线未更新。候选统计写入 %s", failed_stats.name
+        )
+    else:
+        tmp = rel / ".quality_stats.json.tmp"
+        tmp.write_text(json.dumps(stats, indent=1), encoding="utf-8")
+        tmp.replace(stats_path)
     logger.info("质量门: fail=%d warn=%d", len(fails), len(warns))
     if fails:
         raise SystemExit(2)
