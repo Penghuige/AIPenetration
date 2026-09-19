@@ -37,6 +37,7 @@ from . import quality, scoring
 from .counts import compute_counts
 from .anchors import anchor_dictionary_rows
 from .governance import (
+    materialize_dictionary_changelog,
     materialize_formal_dictionary,
     materialize_source_skill_records,
     normalize_term,
@@ -280,11 +281,16 @@ def main() -> None:
     source_records = materialize_source_skill_records(
         base_concepts, LEX_VERSION
     )
+    changelog = materialize_dictionary_changelog(grade, LEX_VERSION)
     concepts.to_parquet(rel3 / "skill_concept_v1.parquet", index=False)
     aliases.to_parquet(rel3 / "skill_alias_v1.parquet", index=False)
     d_candidates.to_parquet(rel3 / "skill_candidate_d_v1.parquet", index=False)
     source_records.to_parquet(
         rel3 / "source_skill_record_v1.parquet", index=False
+    )
+    changelog.to_csv(
+        rel3 / "skill_dictionary_changelog_v1.csv",
+        index=False, encoding="utf-8-sig"
     )
     pd.DataFrame(anchor_dictionary_rows()).to_csv(
         rel3 / "ai_anchor_dictionary_v1.csv",
@@ -314,6 +320,8 @@ def main() -> None:
         ("source_skill_record_v1.parquet",
          "source_name+source_skill_id+internal_skill_id",
          "governance.py(external source crosswalk)"),
+        ("skill_dictionary_changelog_v1.csv", "term",
+         "governance.py(dictionary change ledger)"),
         ("skill_governed_ABCD_v4.csv", "term",
          "panel_v2/discovery_review.py(v3 legacy + formal discovery)"),
         ("formal_discovery_review_manifest_v1.json", "-",
