@@ -265,100 +265,205 @@ NON_SKILL_CATS = {"task_fragment", "soft_trait", "edu_req", "exp_req",
                   "benefit", "job_title", "company", "goods_service", "other"}
 
 
-def merge_final() -> None:
-    """T1∧T2 信号合并进 v2e 分级 → 终版词表 v1.3（只出不进）。
+def _atier_alias_to_sid() -> dict[str, str]:
+    """返回已按 primary_skill_id 消歧的 A 级别名键 → skill_id。"""
+    from .lexicon import _load_atier_alias_records
+    out: dict[str, str] = {}
+    for rec in _load_atier_alias_records():
+        key = _norm_key(rec.alias)
+        if key in out and out[key] != rec.skill_id:
+            raise RuntimeError(
+                f"A级别名消歧后仍多概念: {key!r} -> {out[key]!r}/{rec.skill_id!r}"
+            )
+        out[key] = rec.skill_id
+    return out
 
-    降级规则（相对 v2e grade，任一命中即 D）：
-    ① T2 is_skill=false；② T1 类别 ∈ 非技能集；③ 真歧义 ∧ 同义反复
-    （裸锚点词如 ai：既被 T2 标 ambiguity 又在 taut 枚举——v2e 里它们靠 df
-    入了 B，正是 S6 带 46% 误判元凶，按用户"最准确结合"裁决清除）。
-    id→term 用 candidates_t1()/candidates_t2() 确定性重建（与评审运行同
-    输入同序）；评审 jsonl 与重建词表条数不一致即硬失败（防漂移）。
-    输出：skill_legacy_graded_BCD_v2.csv（final_grade/demote_reason 列）+
-    non_skill_stopword_v1.csv（B 表：T1 非技能类别全清单，含 A 级热词面）。
+
+def merge_final() -> None:
+    """把 T1/T2 真正落实到概念映射，生成 handoff-compliant v3 治理表。
+
+    与旧 v2 的关键区别：
+    - T2 r=0..9 的 MATCH_EXISTING 不再被忽略，而是映射回 A 级 skill_id；
+    - NEW_CONCEPT 的 B/C 技能按规范名+首次发现年份生成稳定 UUIDv5；
+    - AMBIGUOUS / 非技能 / 非技能停用表命中均降 D；
+    - 产物显式保存 final_skill_id / mapping_action / T2 类型与首次年份。
     """
     import pandas as pd
+    from .governance import stable_bc_skill_id
+
     paths = get_project_paths()
     rd = paths.output_dir / "llm_review"
     dic = paths.output_dir / "dictionary"
 
     def load_jsonl(name: str) -> list[dict]:
-        return [json.loads(ln) for ln in
-                (rd / name).read_text(encoding="utf-8").splitlines()]
+        path = rd / name
+        if not path.exists():
+            raise RuntimeError(f"缺少治理评审结果: {path}")
+        return [
+            json.loads(ln)
+            for ln in path.read_text(encoding="utf-8").splitlines()
+            if ln.strip()
+        ]
 
     t1_items = candidates_t1()
     t2_items = candidates_t2()
     id2t1 = {it["id"]: it for it in t1_items}
     id2t2 = {it["id"]: it for it in t2_items}
+    t2_item_by_term = {str(it["term"]): it for it in t2_items}
+    alias_to_sid = _atier_alias_to_sid()
+
     t1_cat: dict[str, str] = {}
     t1_rows: list[dict] = []
     covered: set[int] = set()
-    for r in load_jsonl("t1_stopword.jsonl"):
-        iid = int(r["id"])
+    for rec in load_jsonl("t1_stopword.jsonl"):
+        iid = int(rec["id"])
         it = id2t1.get(iid)
-        assert it is not None, "T1 结果含重建外 id（词表漂移？）"
+        if it is None:
+            raise RuntimeError("T1 结果含重建外 id（词表漂移）")
         covered.add(iid)
-        res = r.get("res") or {}
+        res = rec.get("res") or {}
+        if "error" in res:
+            raise RuntimeError(f"T1 存在失败记录 id={iid}: {res}")
         cat = res.get("c")
-        t1_cat[str(it["term"])] = str(cat)  # 跨层重复词同判，后写无害
-        t1_rows.append({"term": it["term"], "tier": it["tier"],
-                        "category": cat})
-    assert covered == set(id2t1), \
-        f"T1 覆盖不齐 {len(covered)}/{len(id2t1)}"
-    t2_by_term: dict[str, dict] = {}
-    for r in load_jsonl("t2_legacy_review.jsonl"):
-        it = id2t2.get(int(r["id"]))
-        assert it is not None, "T2 结果含重建外 id"
-        t2_by_term[str(it["term"])] = r.get("res") or {}
-    assert len(t2_by_term) == len(t2_items), "T2 覆盖不齐"
+        if cat is None:
+            raise RuntimeError(f"T1 缺类别 id={iid}")
+        t1_cat[str(it["term"])] = str(cat)
+        t1_rows.append({
+            "term": it["term"], "tier": it["tier"], "category": cat
+        })
+    if covered != set(id2t1):
+        raise RuntimeError(f"T1 覆盖不齐 {len(covered)}/{len(id2t1)}")
 
-    g = pd.read_csv(dic / "skill_legacy_graded_BCD_v1.csv", encoding="utf-8-sig")
+    t2_by_term: dict[str, dict] = {}
+    covered_t2: set[int] = set()
+    for rec in load_jsonl("t2_legacy_review.jsonl"):
+        iid = int(rec["id"])
+        it = id2t2.get(iid)
+        if it is None:
+            raise RuntimeError("T2 结果含重建外 id（候选列表漂移）")
+        res = rec.get("res") or {}
+        if "error" in res:
+            raise RuntimeError(f"T2 存在失败记录 id={iid}: {res}")
+        required = {"s", "c", "n", "r", "a"}
+        if not required.issubset(res):
+            raise RuntimeError(
+                f"T2 结果缺字段 id={iid}: {sorted(required - set(res))}"
+            )
+        t2_by_term[str(it["term"])] = res
+        covered_t2.add(iid)
+    if covered_t2 != set(id2t2):
+        raise RuntimeError(f"T2 覆盖不齐 {len(covered_t2)}/{len(id2t2)}")
+
+    g = pd.read_csv(
+        dic / "skill_legacy_graded_BCD_v1.csv", encoding="utf-8-sig"
+    )
+    required_v1 = {"term", "skill_id", "df_freq", "grade", "first_year"}
+    if not required_v1.issubset(g.columns):
+        raise RuntimeError(
+            "v1 分级表缺少生成稳定概念ID所需字段: "
+            + ", ".join(sorted(required_v1 - set(g.columns)))
+        )
+
     rows = []
     for _, row in g.iterrows():
         term = str(row.term)
-        r2 = t2_by_term.get(term, {})
+        r2 = t2_by_term.get(term)
+        item = t2_item_by_term.get(term)
+        if r2 is None or item is None:
+            raise RuntimeError(f"T2 未覆盖 legacy 词: {term!r}")
         c1 = t1_cat.get(term)
-        final, reason = str(row.grade), ""
-        if row.grade != "D":
-            rs = []
-            if r2.get("s") is False:
-                rs.append("t2_not_skill")
-            if c1 in NON_SKILL_CATS:
-                rs.append(f"t1_{c1}")
-            if r2.get("a") is True and int(row.tautological) == 1:
-                rs.append("ambig_taut")
-            if rs:
-                final, reason = "D", "|".join(rs)
-        rows.append({"term": term, "skill_id": row.skill_id,
-                     "df_freq": int(row.df_freq),
-                     "taut": int(row.tautological),
-                     "v2e_grade": row.grade, "t1_cat": c1,
-                     "t2_skill": r2.get("s"), "t2_new_tech": r2.get("n"),
-                     "t2_ambig": r2.get("a"), "final_grade": final,
-                     "demote_reason": reason})
+        final = str(row.grade)
+        reasons: list[str] = []
+        mapping_action = ""
+        final_skill_id = ""
+        relation = int(r2["r"])
+
+        if r2.get("s") is False:
+            reasons.append("t2_not_skill")
+        if c1 in NON_SKILL_CATS:
+            reasons.append(f"t1_{c1}")
+        if relation == -3:
+            reasons.append("t2_not_skill_relation")
+        if relation == -2:
+            reasons.append("t2_ambiguous")
+        if r2.get("a") is True and int(row.tautological) == 1:
+            reasons.append("ambig_taut")
+
+        if reasons or final == "D":
+            final = "D"
+            mapping_action = "REJECT_D"
+        elif relation >= 0:
+            cands = list(item.get("cand") or [])
+            if relation >= len(cands):
+                raise RuntimeError(
+                    f"T2 选择越界 term={term!r}: r={relation}, candidates={len(cands)}"
+                )
+            alias = _norm_key(cands[relation])
+            final_skill_id = alias_to_sid.get(alias, "")
+            if not final_skill_id:
+                raise RuntimeError(
+                    f"T2 MATCH_EXISTING 无法解析 A 级 skill_id: {term!r} -> {alias!r}"
+                )
+            final = "A"
+            mapping_action = "MATCH_EXISTING"
+        elif relation == -1:
+            if final not in {"B", "C"}:
+                raise RuntimeError(
+                    f"NEW_CONCEPT 但基础分级不是 B/C: {term!r} grade={final!r}"
+                )
+            final_skill_id = stable_bc_skill_id(term, int(row.first_year))
+            mapping_action = "NEW_CONCEPT"
+        else:
+            raise RuntimeError(f"未知 T2 relation: term={term!r}, r={relation}")
+
+        rows.append({
+            "term": term,
+            "source_skill_id": str(row.skill_id),
+            "final_skill_id": final_skill_id,
+            "df_freq": int(row.df_freq),
+            "cand_cooc": row.get("cand_cooc", pd.NA),
+            "first_year": int(row.first_year),
+            "taut": int(row.tautological),
+            "v2e_grade": str(row.grade),
+            "t1_cat": c1,
+            "t2_skill": r2.get("s"),
+            "t2_cat": r2.get("c"),
+            "t2_new_tech": r2.get("n"),
+            "t2_relation": relation,
+            "t2_ambig": r2.get("a"),
+            "mapping_action": mapping_action,
+            "final_grade": final,
+            "demote_reason": "|".join(reasons),
+        })
+
     out = pd.DataFrame(rows).sort_values(
-        ["final_grade", "term"], kind="stable").reset_index(drop=True)
-    out.to_csv(dic / "skill_legacy_graded_BCD_v2.csv", index=False,
-               encoding="utf-8-sig")
+        ["final_grade", "term"], kind="stable"
+    ).reset_index(drop=True)
+    formal = out[out.final_grade.isin(["A", "B", "C"])]
+    if (formal.final_skill_id.astype(str).str.len() == 0).any():
+        raise RuntimeError("A/B/C 存在空 final_skill_id")
+    out.to_csv(
+        dic / "skill_legacy_graded_BCD_v3.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+
     fc = out.final_grade.value_counts()
-    vc = out.v2e_grade.value_counts()
-    dem = out[out.demote_reason != ""]
-    logger.info("v1.3: B %d / C %d / D %d（v2e 为 B %d/C %d/D %d；"
-                "本轮降级 %d 词，样例 %s）",
-                int(fc.get("B", 0)), int(fc.get("C", 0)), int(fc.get("D", 0)),
-                int(vc.get("B", 0)), int(vc.get("C", 0)), int(vc.get("D", 0)),
-                len(dem), dem.term.head(20).tolist())
-    # B 表：T1 全部非技能判定（legacy + A 级热词面；A 级本体不回删）
+    logger.info(
+        "v1.4 handoff治理: A映射 %d / B %d / C %d / D %d；"
+        "MATCH_EXISTING=%d / NEW_CONCEPT=%d",
+        int(fc.get("A", 0)), int(fc.get("B", 0)),
+        int(fc.get("C", 0)), int(fc.get("D", 0)),
+        int((out.mapping_action == "MATCH_EXISTING").sum()),
+        int((out.mapping_action == "NEW_CONCEPT").sum()),
+    )
+
     sb = pd.DataFrame(t1_rows)
     sb = sb[sb.category.isin(NON_SKILL_CATS)].drop_duplicates("term")
     sb = sb.sort_values(["tier", "category", "term"], kind="stable")
-    sb.to_csv(dic / "non_skill_stopword_v1.csv", index=False,
-              encoding="utf-8-sig")
-    logger.info("停用表 v1: %d 词条（legacy %d / atier %d / era %d），"
-                "A 级不回删，表供入级闸门与敏感性分析", len(sb),
-                int((sb.tier == "legacy").sum()),
-                int((sb.tier == "atier").sum()),
-                int((sb.tier == "era_missing").sum()))
+    sb.to_csv(
+        dic / "non_skill_stopword_v1.csv", index=False, encoding="utf-8-sig"
+    )
 
 
 def main() -> None:
@@ -369,7 +474,8 @@ def main() -> None:
     args = ap.parse_args()
     paths = get_project_paths()
     setup_logging(paths.log_dir / f"lexicon_llm_{args.task}.log")
-    assert args.workers <= 4, "GPU 共享纪律：并发 ≤4"
+    if args.workers > 4:
+        raise SystemExit("GPU 共享纪律：并发 ≤4")
     if args.task == "t1":
         run_t1(args.workers)
     elif args.task == "t2":
