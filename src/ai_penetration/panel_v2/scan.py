@@ -358,7 +358,7 @@ def scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str) -> dict
                         h.mention_count,
                         "legacy_exact" if h.skill_id.startswith("legacy:")
                         else "active_alias",
-                        int(h.skill_id in lex.homograph),
+                        h.ambiguity_flag,
                     )
                     for h in skill_hits
                 )
