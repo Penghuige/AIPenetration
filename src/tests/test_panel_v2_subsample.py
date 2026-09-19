@@ -17,7 +17,7 @@ def _frames():
     })
     score = pd.DataFrame({
         "job_id": [1, 2, 3, 4, 5, 6],
-        "ai_score": [0.9, np.nan, 0.4, 0.05, 0.02, np.nan],
+        "ai_score": [0.9, np.nan, 0.4, 0.05, 0.02, 0.0],
     })
     return cls, score
 
@@ -40,3 +40,14 @@ def test_curve_frame_deterministic():
     cls, score = _frames()
     pd.testing.assert_frame_equal(curve_frame(cls, score),
                                   curve_frame(cls, score))
+
+
+def test_curve_frame_rejects_missing_nonzero_skill_score():
+    cls, score = _frames()
+    score.loc[score.job_id == 6, "ai_score"] = np.nan
+    try:
+        curve_frame(cls, score, y_min=2016)
+    except ValueError as exc:
+        assert "zero_skill_override" in str(exc)
+    else:
+        raise AssertionError("inconsistent score coverage must fail closed")
