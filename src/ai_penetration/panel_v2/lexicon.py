@@ -195,6 +195,7 @@ def build_union_lexicon(
     legacy_terms: list[str] | None = None,
     aliases: list[tuple[str, str] | AliasRecord] | None = None,
     legacy_id_map: dict[str, str] | None = None,
+    legacy_ambiguous_keys: set[str] | None = None,
 ) -> UnionLexicon:
     """构建 union 词表匹配器。
 
@@ -256,6 +257,8 @@ def build_union_lexicon(
                     )
                 continue
             keys[key] = target_sid
+            if legacy_ambiguous_keys and key in legacy_ambiguous_keys:
+                ambiguous_keys.add(key)
             if term in _AMBIGUOUS_AI_TERMS:
                 homograph[keys[key]] = _AMBIGUOUS_AI_TERMS[term]
                 ambiguous_keys.add(key)
