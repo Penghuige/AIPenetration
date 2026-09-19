@@ -97,6 +97,24 @@ def gate_checks(rel: Path) -> tuple[list[str], dict]:
     counts = pq.read_table(rel / "skill_ai_counts.parquet").to_pandas()
     rel_df = pq.read_table(rel / "skill_ai_relevance.parquet").to_pandas()
     cls = pq.read_table(rel / "job_ai_classification.parquet").to_pandas()
+    text_path = rel / "job_text_clean.parquet"
+    if not text_path.exists():
+        fails.append("缺少 §6.4 job_text_clean.parquet")
+        texts = None
+    else:
+        texts = pq.read_table(text_path).to_pandas()
+        required_text = {
+            "job_id", "year", "job_description_raw", "job_description_clean",
+            "job_description_match", "text_hash",
+        }
+        missing_text = required_text - set(texts.columns)
+        if missing_text:
+            fails.append(
+                "job_text_clean 缺三态文本字段: "
+                + ", ".join(sorted(missing_text))
+            )
+        if texts.job_id.duplicated().any():
+            fails.append("job_text_clean job_id 不唯一")
 
     # §18 正式发布词典必须能独立解释正式长表。
     concept_path = rel / "skill_concept_v1.parquet"
@@ -136,6 +154,9 @@ def gate_checks(rel: Path) -> tuple[list[str], dict]:
         fails.append("long 表存在 flag 外 job_id")
     stats["n_jobs"] = len(flags)
     stats["n_pairs"] = len(longs)
+    if texts is not None and len(texts) != len(flags):
+        fails.append(
+            f"job_text_clean 行数 {len(texts)} != job_anchor_flag {len(flags)}")
 
     # 2 (job, skill) 唯一：int64 复合键全局查重（4 亿规模内存可行）
     ck = (longs.job_id.to_numpy(np.int64) << 32) | longs.skill_code.to_numpy(np.int64)
