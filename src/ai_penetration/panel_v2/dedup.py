@@ -90,7 +90,8 @@ ROW_DTYPE = np.dtype([
     ("day", "i4"), ("posh", "i8"), ("thash", "i8"), ("dlen", "u2"),
     ("comp", "u1"), ("pad", "S5"),
 ])
-assert ROW_DTYPE.itemsize == 64, ROW_DTYPE.itemsize
+if ROW_DTYPE.itemsize != 64:
+    raise RuntimeError(f"ROW_DTYPE 尺寸异常: {ROW_DTYPE.itemsize} != 64")
 
 
 def _h63(s: str) -> int:
@@ -255,7 +256,8 @@ def pass1_scan(workers: int, slices: int, out_dir: Path,
                year_filter: str | None = None) -> list[dict]:
     """并行 pass1（workers≤8 HDD 纪律）。"""
     from concurrent.futures import ProcessPoolExecutor
-    assert workers <= 8, "HDD 纪律：大表 ≤8 流（CLAUDE.md §9）"
+    if workers > 8:
+        raise ValueError("HDD 纪律：大表 ≤8 流（CLAUDE.md §9）")
     plats = _build_platform_dict()
     logger.info("平台字典: %d 种", len(plats))
     tasks = _plan_tasks(slices, year_filter)
