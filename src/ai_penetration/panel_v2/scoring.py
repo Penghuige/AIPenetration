@@ -172,7 +172,9 @@ def run(rel_dir: Path, bench: bool = False) -> None:
     n_skill = int(rel.skill_code.max()) + 1
     years = np.sort(np.unique(flags.year.to_numpy()))
     yidx_pairs = np.searchsorted(years, y_of)
-    if not np.all(years[yidx_pairs] == y_of):
+    valid_year = yidx_pairs < len(years)
+    if (not valid_year.all()
+            or not np.all(years[yidx_pairs[valid_year]] == y_of[valid_year])):
         raise RuntimeError("job_skill_long 含 flags 年份集合外年份")
     # job → company 映射（firm 每 job 一行，按 job_id 对齐，防行序错配）
     company_of_job = np.zeros(len(jobs), np.int32)
