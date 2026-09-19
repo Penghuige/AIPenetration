@@ -188,13 +188,14 @@ def scan_slice(table: str, b_start: int, b_end: int, tmp_dir: str) -> dict:
 
 
 def aggregate_counts(metas: list[dict], tmp_dir: Path | None,
-                     n_alias: int = 0) -> np.ndarray:
+                     n_alias: int = 0, cleanup: bool = True) -> np.ndarray:
     """合并各切片 (aid,key) 对，numpy 全局去重后按 aid 计数。
 
     Args:
         metas: 各切片 scan_slice 返回值。
         tmp_dir: 中间文件目录（聚合完成后统一清理）。
         n_alias: 别名总数（bincount minlength，保证数组覆盖全部别名）。
+        cleanup: 是否删除本次聚合使用的中间文件。
 
     Returns:
         uint64 数组 freq[alias序号] = distinct normalized text 命中数。
@@ -217,14 +218,15 @@ def aggregate_counts(metas: list[dict], tmp_dir: Path | None,
     del keys_s, aids_s, change, uniq_aids
     logger.info("去重完成: distinct (aid,normalized_text) 对 %d（重复率 %.2f%%）",
                 n_uniq, 100.0 * (1 - n_uniq / max(1, n_pairs)))
-    # 中间文件统一清理（删除容错：Windows 偶发占用）
-    for m in metas:
-        for f in (m["keys_file"], m["aids_file"],
-                  str(Path(tmp_dir) / f"{m['task']}.json")):
-            try:
-                Path(f).unlink()
-            except OSError:
-                logger.warning("中间文件清理失败（稍后手动删 %s）", f)
+    if cleanup:
+        # 中间文件统一清理（删除容错：Windows 偶发占用）
+        for m in metas:
+            for f in (m["keys_file"], m["aids_file"],
+                      str(Path(tmp_dir) / f"{m['task']}.json")):
+                try:
+                    Path(f).unlink()
+                except OSError:
+                    logger.warning("中间文件清理失败（稍后手动删 %s）", f)
     return freq
 
 
