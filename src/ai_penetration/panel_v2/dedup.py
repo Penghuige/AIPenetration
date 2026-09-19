@@ -363,10 +363,30 @@ def copy_stage(metas: list[dict], resume: bool) -> int:
     """
     conn = _results_conn()
     cur = conn.cursor()
-    cur.execute(f"""
-        CREATE TABLE IF NOT EXISTS public.{TABLE_STAGE} (
-            rid text NOT NULL, plat smallint, city smallint, yr int,
-            day int, posh bigint, thash bigint, dlen int, comp smallint)""")
+    cur.execute(
+        "SELECT to_regclass(%s)", (f"public.{TABLE_STAGE}",)
+    )
+    stage_exists = cur.fetchone()[0] is not None
+    if stage_exists:
+        cur.execute(
+            "SELECT count(*) FROM information_schema.columns "
+            "WHERE table_schema='public' AND table_name=%s AND column_name='jid'",
+            (TABLE_STAGE,),
+        )
+        has_jid = cur.fetchone()[0] > 0
+        if not has_jid:
+            if resume:
+                conn.close()
+                raise SystemExit(
+                    "旧 stage 缺稳定 jid 列，不能 --resume；请无 --resume 重跑"
+                )
+            cur.execute(f"DROP TABLE public.{TABLE_STAGE}")
+            stage_exists = False
+    if not stage_exists:
+        cur.execute(f"""
+            CREATE TABLE public.{TABLE_STAGE} (
+                rid text NOT NULL, jid bigint NOT NULL, plat smallint, city smallint,
+                yr int, day int, posh bigint, thash bigint, dlen int, comp smallint)""")
     _ensure_logged(cur, TABLE_STAGE)
     cur.execute(f"SELECT count(*) FROM public.{TABLE_STAGE}")
     existing = cur.fetchone()[0]
@@ -428,9 +448,12 @@ def copy_stage(metas: list[dict], resume: bool) -> int:
         bio = io.StringIO()
         for row in arr:
             rid = bytes(row["rid"]).rstrip(b"\x00").decode()
-            bio.write(f"{rid}\t{int(row['plat'])}\t{int(row['city'])}\t{int(row['yr'])}\t"
-                      f"{int(row['day'])}\t{int(row['posh'])}\t{int(row['thash'])}\t"
-                      f"{int(row['dlen'])}\t{int(row['comp'])}\n")
+            bio.write(
+                f"{rid}\t{int(row['jid'])}\t{int(row['plat'])}\t"
+                f"{int(row['city'])}\t{int(row['yr'])}\t{int(row['day'])}\t"
+                f"{int(row['posh'])}\t{int(row['thash'])}\t"
+                f"{int(row['dlen'])}\t{int(row['comp'])}\n"
+            )
         bio.seek(0)
         cur2.copy_expert(f"COPY public.{TABLE_STAGE} FROM STDIN WITH (FORMAT text)", bio)
         conn2.commit()
@@ -508,7 +531,7 @@ def build_master() -> tuple[int, int]:
         cur.execute(f"""
             CREATE TABLE public.{TABLE_SORTED} AS
             WITH joined AS (
-                SELECT s.rid, s.plat, s.city, s.yr, s.day, s.posh, s.thash,
+                SELECT s.rid, s.jid, s.plat, s.city, s.yr, s.day, s.posh, s.thash,
                        s.dlen, s.comp,
                        coalesce(e.company_id, 'UNK:' || s.rid) AS company_id,
                        (e.company_id IS NULL) AS company_unmatched
@@ -523,7 +546,7 @@ def build_master() -> tuple[int, int]:
                        count(*) OVER (PARTITION BY plat, rid) - 1 AS rule1_dups
                 FROM joined
             )
-            SELECT rid, plat, city, yr, day, posh, thash, dlen, comp,
+            SELECT rid, jid, plat, city, yr, day, posh, thash, dlen, comp,
                    company_id, company_unmatched, rule1_dups
             FROM rid_rank WHERE rn_rid = 1
         """)
@@ -564,11 +587,11 @@ def build_master() -> tuple[int, int]:
                    min(day) OVER w AS gmin,
                    max(day) OVER w AS gmax,
                    row_number() OVER (PARTITION BY company_id, posh, city, thash, yr, seg
-                                      ORDER BY comp DESC, dlen DESC, day ASC, rid ASC) AS pick
+                                      ORDER BY comp DESC, dlen DESC, day ASC, rid ASC, jid ASC) AS pick
             FROM public.{TABLE_SEG}
             WINDOW w AS (PARTITION BY company_id, posh, city, thash, yr, seg)
         )
-        SELECT row_number() OVER (ORDER BY company_id, yr, thash, rid) AS job_id,
+        SELECT jid AS job_id,
                rid AS job_id_raw, plat, city, yr AS year, company_id, thash,
                (company_id || ':' || posh || ':' || city || ':' || thash || ':'
                 || yr || ':' || seg) AS duplicate_group_id,
