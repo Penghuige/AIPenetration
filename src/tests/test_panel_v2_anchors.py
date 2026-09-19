@@ -21,7 +21,7 @@ def test_positive_phrases_and_case_variants():
     hit = match_anchors("main", normalize_desc("部署 LLMs 与 AI 平台"))
     assert set(hit.groups) == {"LLM", "AI"}
     assert hit.flag == 1
-    assert "LLM" in hit.terms
+    assert "llms" in hit.terms
 
 
 def test_positive_transformer_with_qualifier():
@@ -112,3 +112,13 @@ def test_dictionary_rows_shape():
     # 缩写行必须带 ambiguity_flag
     assert all(r["ambiguity_flag"] == 1 for r in rows
                if r["matching_rule"] in ("abbr", "abbr_llms"))
+
+
+
+def test_hit_terms_preserve_actual_flexible_surface():
+    hit = match_anchors(
+        "main",
+        normalize_desc("使用Machine-Learning与large language models"),
+    )
+    assert "machine-learning" in hit.terms
+    assert "large language models" in hit.terms
