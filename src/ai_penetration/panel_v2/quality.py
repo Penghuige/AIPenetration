@@ -13,8 +13,8 @@ exposure_rate_by_anchor）；③ LLM/TRANS 增量（已实现，anchor_jobs）�
 明细表（逐岗位/逐技能清单）未生成——阻断级检查均在全量上验证，警告触发时
 的量级可由 quality_stats.json 反查。⑤⑥为正式偏离，随全国重跑申报。
 
-"原文跨度回填"（§17.6.3）在 v2a 记为 waived：词典匹配为确定性子串命中，
-证据可由 match 文本 + 词表重算（无 LLM 生成词），非缺失场景。
+"原文跨度回填"（§17.6.3）为阻断项：正式 job_skill_long 必须持久化
+surface/start/end 等证据，并由 span_verified=1 证明扫描时可直接回填。
 重跑一致项（§17.6.10）：同一发布目录已经存在 quality_stats.json 时，
 本次运行必须与上一轮保持相同行数和关键统计量；漂移属于阻断错误。
 
@@ -104,9 +104,31 @@ def gate_checks(rel: Path) -> tuple[list[str], dict]:
         fails.append("(job_id, skill_code) 不唯一")
     del ck
 
-    # 3 跨度回填：v2a waived（确定性子串匹配可重算）
-    stats["span_backfill"] = "waived_deterministic"
-
+    # 3 原文跨度回填：指南 §11.1.4/§17.6 为阻断项，不允许 waiver。
+    evidence_cols = {
+        "skill_id", "surface_form", "start", "end", "mention_count",
+        "match_method", "ambiguity_flag", "confidence_tier",
+        "dictionary_version", "span_verified",
+    }
+    missing_evidence = sorted(evidence_cols - set(longs.columns))
+    if missing_evidence:
+        fails.append("job_skill_long 缺少交接要求证据字段: "
+                     + ", ".join(missing_evidence))
+        stats["span_backfill"] = "failed_missing_columns"
+    else:
+        bad_span = (
+            (longs["start"] < 0)
+            | (longs["end"] <= longs["start"])
+            | (longs["mention_count"] < 1)
+            | (longs["span_verified"] != 1)
+            | (longs["surface_form"].astype(str).str.len()
+               != (longs["end"] - longs["start"]))
+        )
+        if bad_span.any():
+            fails.append(f"原文跨度回填失败（{int(bad_span.sum())} 行）")
+            stats["span_backfill"] = "failed"
+        else:
+            stats["span_backfill"] = "verified"
     # 4 分子≤分母
     if (counts.n_ai_cooccur > counts.n_skill).any():
         fails.append("计数分子>分母")
@@ -315,7 +337,7 @@ def run(rel: Path | None = None) -> None:
     ]
     report += (
         [f"- ❌ {f}" for f in fails]
-        or ["- ✅ 十项全部通过（含跨度回填 waived 声明）"]
+        or ["- ✅ 十项全部通过（含原文跨度回填验证）"]
     )
     report += ["", "## 警告与披露", ""]
     report += ([f"- ⚠️ {w}" for w in warns] or ["- （无警告）"])
