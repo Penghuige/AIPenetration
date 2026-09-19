@@ -72,7 +72,7 @@ SHARDS = (("广州市", "job_p0387", 0), ("深圳市", "job_p0389", 1))
 _EPOCH_DAYS = 14610  # date(2010,1,1).toordinal()
 _YEAR_RE = re.compile(r"^\s*(\d{4})")
 _ISO_RE = re.compile(r"^\s*(\d{4})-(\d{2})-(\d{2})")
-BAD_YEAR_THRESHOLD = 0.001  # 年份不可解析阻断线（评审建议 0.1%）
+BAD_YEAR_THRESHOLD = 0.0  # 正式按年测算不得包含 yr=0；任一坏年份即阻断
 # 准入谓词**单源**（审计 D3：dedup/scan 两处手抄同文才碰巧互证，任一侧
 # 改动即失去闭环）。scan.py 必须 import 本常量，禁止再抄写。
 ADMISSION_WHERE = ("AND job_description IS NOT NULL "
@@ -641,8 +641,11 @@ def verify_invariants(metas: list[dict] | None = None) -> None:
         problems.append(f"{dup_groups} 组出现多 canonical")
     if rid_dups != 0:
         problems.append(f"{rid_dups} 个 (plat,rid) 出现多 canonical")
-    if bad_years / max(stage, 1) > BAD_YEAR_THRESHOLD:
-        problems.append(f"年份不可解析 {bad_years}/{stage} 超阻断线 {BAD_YEAR_THRESHOLD:.1%}")
+    if bad_years:
+        problems.append(
+            f"年份不可解析 {bad_years}/{stage}；指南要求隔离，"
+            "当前正式管线拒绝让 yr=0 进入 master/按年指标"
+        )
     if problems:
         for p in problems:
             logger.error("不变量: %s", p)
