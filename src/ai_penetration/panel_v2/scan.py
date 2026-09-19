@@ -122,41 +122,91 @@ def export_master(out_dir: Path) -> None:
     logger.info("master npy 导出: %d 条 / company %d", n, len(comps))
 
 
+def _load_governed_legacy_map() -> tuple[dict[str, str], str]:
+    """读取 §10 治理后的正式 A/B/C legacy 表，并返回内容哈希。"""
+    import hashlib
+    import pandas as pd
+    from .governance import governed_skill_map
+
+    path = (
+        get_project_paths().output_dir
+        / "dictionary"
+        / "skill_legacy_graded_BCD_v3.csv"
+    )
+    if not path.exists():
+        raise RuntimeError(
+            "缺少 handoff-compliant 治理表 skill_legacy_graded_BCD_v3.csv；"
+            "请先运行 panel_v2.lexicon_llm merge"
+        )
+    grades = pd.read_csv(path, encoding="utf-8-sig")
+    mapping = governed_skill_map(grades)
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    return mapping, digest
+
+
 def build_skill_vocab(out_dir: Path) -> None:
-    """主进程单点构建 union 词表并原子落盘（B3：ORDER BY 确定性）。"""
+    """用最终 A/B/C 概念映射构建 skill_code 词表并绑定治理表哈希。"""
     path = out_dir / "skill_vocab.json"
-    if path.exists():
-        return
-    from ..skill_ai_anchor import load_merged_skills
+    stamp = out_dir / "skill_vocab.stamp.json"
+    governed, governance_hash = _load_governed_legacy_map()
+    if path.exists() and stamp.exists():
+        meta = json.loads(stamp.read_text(encoding="utf-8"))
+        if (
+            meta.get("scan_pipeline_version") == SCAN_PIPELINE_VERSION
+            and meta.get("governance_sha256") == governance_hash
+        ):
+            return
     from .lexicon import _load_atier_alias_records, build_union_lexicon
     aliases = _load_atier_alias_records()
-    lex = build_union_lexicon(legacy_terms=load_merged_skills(include_llm=True),
-                              aliases=aliases)
+    lex = build_union_lexicon(
+        legacy_terms=sorted(governed),
+        aliases=aliases,
+        legacy_id_map=governed,
+    )
     sids = sorted(set(lex.keys_map.values()))
     tmp = out_dir / "_vocab.json.tmp"
-    tmp.write_text(json.dumps({s: i for i, s in enumerate(sids)},
-                              ensure_ascii=False), encoding="utf-8")
-    tmp.rename(path)
-    logger.info("skill_vocab 落盘: %d skill", len(sids))
+    tmp.write_text(
+        json.dumps({s: i for i, s in enumerate(sids)}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    tmp.replace(path)
+    stamp.write_text(
+        json.dumps({
+            "scan_pipeline_version": SCAN_PIPELINE_VERSION,
+            "governance_sha256": governance_hash,
+            "n_skills": len(sids),
+        }),
+        encoding="utf-8",
+    )
+    logger.info("skill_vocab 落盘: %d skill（governance=%s）", len(sids),
+                governance_hash[:12])
 
 
 def _init_worker(npy_dir: str) -> None:
-    """worker：mmap master + 词表一致性断言（B3）。"""
-    _WORKER["m"] = {n: np.load(Path(npy_dir) / f"{n}.npy", mmap_mode="r")
-                    for n in ("key", "job_id", "year", "company", "city", "thash")}
-    from ..skill_ai_anchor import load_merged_skills
+    """worker：mmap canonical master + 同一治理版本正式词表。"""
+    _WORKER["m"] = {
+        n: np.load(Path(npy_dir) / f"{n}.npy", mmap_mode="r")
+        for n in ("key", "job_id", "year", "company", "city", "thash")
+    }
     from .lexicon import _load_atier_alias_records, build_union_lexicon
+    governed, governance_hash = _load_governed_legacy_map()
     aliases = _load_atier_alias_records()
-    lex = build_union_lexicon(legacy_terms=load_merged_skills(include_llm=True),
-                              aliases=aliases)
+    lex = build_union_lexicon(
+        legacy_terms=sorted(governed),
+        aliases=aliases,
+        legacy_id_map=governed,
+    )
     vocab_path = Path(npy_dir).parent / "skill_vocab.json"
     vocab = json.loads(vocab_path.read_text(encoding="utf-8"))
     built = sorted(set(lex.keys_map.values()))
-    assert len(built) == len(vocab) and all(
-        vocab[s] == i for i, s in enumerate(built)), \
-        "worker 词表与落盘 vocab 不一致（B3 防御断言）"
+    if not (
+        len(built) == len(vocab)
+        and all(vocab[s] == i for i, s in enumerate(built))
+    ):
+        raise RuntimeError("worker 词表与落盘 vocab 不一致")
     _WORKER["sid_to_code"] = vocab
     _WORKER["lex"] = lex
+    _WORKER["governance_hash"] = governance_hash
 
 
 def _flush_parts(out: Path, task: str, part: int,
@@ -212,7 +262,8 @@ def scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str) -> dict
         # 三校验（审计 D2：--slices 变化时同名任务范围不同，旧"完成"不可信）
         if (stat.get("version") == MASTER_VERSION and stat.get("hi") == hi
                 and stat.get("rules") == ANCHOR_RULES_VERSION
-                and stat.get("scan_pipeline_version") == SCAN_PIPELINE_VERSION):
+                and stat.get("scan_pipeline_version") == SCAN_PIPELINE_VERSION
+                and stat.get("governance_sha256") == _WORKER.get("governance_hash")):
             return stat
         logger.warning("切片 %s 完成戳不符（%s/%s/%s），清分片重扫", task,
                        stat.get("version"), stat.get("hi"), stat.get("rules"))
@@ -309,6 +360,7 @@ def scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str) -> dict
             "version": MASTER_VERSION, "lo": int(lo), "hi": int(hi),
             "rules": ANCHOR_RULES_VERSION,
             "scan_pipeline_version": SCAN_PIPELINE_VERSION,
+            "governance_sha256": _WORKER.get("governance_hash"),
             "noncanonical_copies": noncanonical_copies}
     tmp = out / f".{task}.done.tmp"
     tmp.write_text(json.dumps(stat), encoding="utf-8")
