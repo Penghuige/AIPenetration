@@ -1,18 +1,19 @@
-"""v2i：原始交接合规重跑代（longest-match / canonical scan / 正式A-B-C概念图）。
+"""v2i：原始交接合规重跑代。
 
-本代不覆盖历史 v2h；它用于验证并发布 PR #4 的交接合规修复。
+修复范围只落实原始交接已经明确的实现约束，不改变主计算公式：
+- 正式技能空间 = A/B/C，D 仅候选；
+- 多义激活别名按 primary_skill_id 解析；
+- B/C 同义词先映射已有概念，新概念使用稳定 UUIDv5；
+- 正式匹配 longest-match，并保存 surface/start/end 证据；
+- pass2 只扫描 dedup 选中的 canonical 描述；
+- 主岗位标识仍为 main + annual + raw + strictly > 0.05。
 
-动因：v2f 的岗位锚点标记来自规则 a（20260908）扫描，而现行锚点词典/代码为
-规则 b（20260909，LLM 复数与 TRANS 尾界修订）。本代际用规则 b 重扫 pass2
-（`--out-tag b` → output/panel_v2/pass2b、release/panel_v2b），并从匹配层起
-全量重算：D 级过滤 → counts（flag 变了必须重算）→ relevance → scoring →
-quality → 装配。词表仍为 v1.3（legacy_grade_v2），主口径仍为指南 §2.4（005）。
+历史 v2h 保留不覆盖。新流程：
+  lexicon_llm t1/t2/merge
+  -> scan --out-tag _handoff_scan
+  -> v2i
 
-产物：release/panel_v2h（15 件 + metadata + run_manifest.json，
-run_id 20260919_v2i）。
-
-用法::
-    python -X utf8 -m src.ai_penetration.panel_v2.v2i [--run-id 20260919_v2i]
+产物：output/release/panel_v2i/（正式发布件 + metadata + run_manifest.json）。
 """
 from __future__ import annotations
 
