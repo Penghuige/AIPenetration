@@ -40,14 +40,17 @@ def beta_binomial_fit_unit(n: np.ndarray, c: np.ndarray) -> tuple[float, float, 
 
     Returns:
         (alpha, beta, status)，status 区分回退原因（§14.2.5）：
-        fitted / jeffreys:no_scipy / jeffreys:few_skills /
-        jeffreys:not_converged / jeffreys:unstable / jeffreys:error。
+        fitted / jeffreys:few_skills / jeffreys:not_converged /
+        jeffreys:unstable / jeffreys:error。缺少 SciPy 属环境不完整，直接阻断，
+        不得把依赖缺失伪装成方法层 Jeffreys 回退。
     """
     try:
         from scipy.optimize import minimize
         from scipy.special import betaln
-    except ImportError:
-        return 0.5, 0.5, "jeffreys:no_scipy"
+    except ImportError as exc:
+        raise RuntimeError(
+            "正式 §14.2 平滑需要 scipy；缺少依赖时拒绝静默退化为 Jeffreys"
+        ) from exc
     if n.size < 50:
         return 0.5, 0.5, "jeffreys:few_skills"
 
