@@ -30,6 +30,8 @@ logger = logging.getLogger("ai_penetration.panel_v2.lexicon")
 
 _ASCII_RE = re.compile(r"^[\x00-\x7f]+$")
 LEGACY_PREFIX = "legacy:"
+_SHORT_SKILL_KEYS = {"r"}
+_SPECIAL_ASCII_KEYS = {"c++", "c#", ".net", "r", "go"}
 
 
 @dataclass(frozen=True)
@@ -53,6 +55,8 @@ class SkillMatch:
     mention_count: int
     match_method: str
     ambiguity_flag: int
+    covered_candidate_count: int = 0
+    covered_candidates: str = "[]"
 
 
 def _norm_key(text: str) -> str:
@@ -93,6 +97,19 @@ def _is_ascii_alnum(ch: str) -> bool:
     return ("a" <= ch <= "z") or ("A" <= ch <= "Z") or ("0" <= ch <= "9")
 
 
+def _boundary_ok(key: str, text: str, start: int, end: int) -> bool:
+    """§11.1.2 ASCII 边界；特殊技能显式处理而非一刀切过滤。"""
+    before = text[start - 1] if start > 0 else ""
+    after = text[end] if end < len(text) else ""
+    if key in {"c++", "c#"}:
+        # 允许 C++17 / C#8 这类版本后缀数字，但拒绝嵌入英文单词。
+        return (not _is_ascii_alnum(before)) and not (
+            ("a" <= after.lower() <= "z")
+        )
+    # .NET / R / Go 与一般英文术语均采用 ASCII 字母数字边界。
+    return not _is_ascii_alnum(before) and not _is_ascii_alnum(after)
+
+
 @dataclass
 class UnionLexicon:
     """union 词表匹配器（A 级概念 + legacy 合成词共用一个自动机）。"""
@@ -113,11 +130,10 @@ class UnionLexicon:
         for end_inclusive, (sid, key) in self.automaton.iter(match_text):
             start = end_inclusive - len(key) + 1
             end = end_inclusive + 1
-            if key in self.ascii_keys:
-                before = match_text[start - 1] if start > 0 else ""
-                after = match_text[end] if end < len(match_text) else ""
-                if _is_ascii_alnum(before) or _is_ascii_alnum(after):
-                    continue
+            if key in self.ascii_keys and not _boundary_ok(
+                key, match_text, start, end
+            ):
+                continue
             ctx = self.homograph.get(sid)
             if ctx is not None and not ctx.search(match_text):
                 continue
@@ -126,12 +142,21 @@ class UnionLexicon:
         # 指南 §11.1.1：先按跨度长短排序，任何与已接收较长跨度重叠的
         # 候选均不再进入主匹配；并列使用确定性次序。
         accepted: list[tuple[int, int, str, str]] = []
+        covered: dict[
+            tuple[int, int, str, str],
+            list[tuple[int, int, str, str]],
+        ] = {}
         for cand in sorted(
             candidates, key=lambda x: (-(x[1] - x[0]), x[0], x[2], x[3])
         ):
             start, end, _sid, _key = cand
-            if any(not (end <= a0 or start >= a1)
-                   for a0, a1, _as, _ak in accepted):
+            overlaps = [
+                a for a in accepted
+                if not (end <= a[0] or start >= a[1])
+            ]
+            if overlaps:
+                # accepted 按“更长优先”进入，首个 owner 即确定性覆盖者。
+                covered.setdefault(overlaps[0], []).append(cand)
                 continue
             accepted.append(cand)
 
@@ -149,10 +174,24 @@ class UnionLexicon:
                     f"匹配跨度无法回填: key={key!r} surface={surface!r} "
                     f"span=({start},{end})"
                 )
+            covered_rows = []
+            for mention in mentions:
+                for c0, c1, csid, ckey in covered.get(mention, []):
+                    covered_rows.append({
+                        "skill_id": csid,
+                        "surface_form": ckey,
+                        "start": c0,
+                        "end": c1,
+                    })
+            import json
             out.append(SkillMatch(
                 skill_id=sid, surface_form=surface, start=start, end=end,
                 mention_count=len(mentions), match_method="aho_longest",
                 ambiguity_flag=1 if key in self.ambiguous_keys else 0,
+                covered_candidate_count=len(covered_rows),
+                covered_candidates=json.dumps(
+                    covered_rows, ensure_ascii=False, separators=(",", ":")
+                ),
             ))
         return sorted(out, key=lambda m: (m.start, m.end, m.skill_id))
 
@@ -169,7 +208,8 @@ def _load_atier_alias_records() -> list[AliasRecord]:
             SELECT alias, skill_id, coalesce(primary_skill_id, ''),
                    coalesce(ambiguity_flag, '0')
             FROM ai_dict.skill_aliases
-            WHERE is_active='1' AND alias IS NOT NULL AND length(trim(alias))>=2
+            WHERE is_active='1' AND alias IS NOT NULL
+              AND (length(trim(alias))>=2 OR lower(trim(alias))='r')
             ORDER BY alias, skill_id
         """)
         rows = [
@@ -239,7 +279,7 @@ def build_union_lexicon(
             else load_merged_skills(include_llm=True)
         for term in terms:
             key = _norm_key(term)
-            if len(key) < 2:
+            if len(key) < 2 and key not in _SHORT_SKILL_KEYS:
                 continue
             if legacy_id_map is not None:
                 # handoff-compliant 正式扫描只允许治理表中的 A/B/C。
