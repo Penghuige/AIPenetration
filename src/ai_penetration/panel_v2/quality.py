@@ -109,25 +109,19 @@ def _check_span_evidence(path: Path) -> tuple[int, set[str]]:
         batch_size=1_000_000,
         columns=["surface_form", "start", "end", "mention_count"],
     ):
-        tbl = rb.to_pydict()
-        surfaces = tbl["surface_form"]
-        starts = tbl["start"]
-        ends = tbl["end"]
-        mentions = tbl["mention_count"]
-        for surface, start, end, mention in zip(
-            surfaces, starts, ends, mentions
-        ):
-            if (
-                surface is None
-                or start is None
-                or end is None
-                or mention is None
-                or start < 0
-                or end <= start
-                or mention < 1
-                or len(surface) != end - start
-            ):
-                bad += 1
+        surface_len = pc.utf8_length(rb.column(0)).to_numpy(
+            zero_copy_only=False
+        )
+        starts = rb.column(1).to_numpy(zero_copy_only=False)
+        ends = rb.column(2).to_numpy(zero_copy_only=False)
+        mentions = rb.column(3).to_numpy(zero_copy_only=False)
+        invalid = (
+            (starts < 0)
+            | (ends <= starts)
+            | (mentions < 1)
+            | (surface_len != (ends - starts))
+        )
+        bad += int(np.count_nonzero(invalid))
     return bad, set()
 
 
