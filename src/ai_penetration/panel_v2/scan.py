@@ -435,6 +435,10 @@ def merge_parts(out_dir: Path, rel_dir: Path) -> None:
          "job_id, skill_code"),
         ("job_firm", "parts_firm", "job_id int8, year int, company_code int",
          "job_id"),
+        ("job_text_clean", "parts_text",
+         "job_id int8, year int, job_description_raw text,"
+         " job_description_clean text, job_description_match text, text_hash int8",
+         "job_id"),
     )
     conn = _results_conn()
     conn.autocommit = False
@@ -468,6 +472,12 @@ def merge_parts(out_dir: Path, rel_dir: Path) -> None:
             cur.execute(
                 f"SELECT count(*) FROM (SELECT job_id FROM public.{stg} "
                 f"GROUP BY job_id HAVING count(DISTINCT company_code) > 1) x")
+            conflict = cur.fetchone()[0]
+        elif name == "job_text_clean":
+            cur.execute(
+                f"SELECT count(*) FROM (SELECT job_id FROM public.{stg} "
+                f"GROUP BY job_id HAVING count(DISTINCT "
+                f"(year, text_hash, job_description_match)) > 1) x")
             conflict = cur.fetchone()[0]
         if conflict:
             raise RuntimeError(
@@ -513,6 +523,9 @@ def _arrow_types(name: str) -> list:
         return [pa.int64(), pa.int32(), pa.int32(), pa.string(), pa.string(),
                 pa.int32(), pa.int32(), pa.int32(), pa.string(), pa.int16(),
                 pa.int16()]
+    if name == "job_text_clean":
+        return [pa.int64(), pa.int32(), pa.string(), pa.string(), pa.string(),
+                pa.int64()]
     return [pa.int64(), pa.int32(), pa.int32()]
 
 
