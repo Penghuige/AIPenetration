@@ -84,7 +84,7 @@ ADMISSION_WHERE = ("AND job_description IS NOT NULL "
 PLATFORM_SAMPLE_PCT = 0.05
 PLATFORM_SAMPLE_SEED = 42
 
-# 定长窄行（64B）：rid32 + plat/city + yr2 + day4 + posh8 + thash8 + dlen2 + comp1 + pad2
+# 定长窄行（80B）：rid32 + jid/phash + plat/city + yr/day + posh/thash + dlen/comp/pad
 ROW_DTYPE = np.dtype([
     ("rid", "S32"), ("jid", "i8"), ("phash", "i8"), ("plat", "u1"), ("city", "u1"),
     ("yr", "u2"), ("day", "i4"), ("posh", "i8"), ("thash", "i8"),
@@ -387,15 +387,16 @@ def copy_stage(metas: list[dict], resume: bool) -> int:
     if stage_exists:
         cur.execute(
             "SELECT count(*) FROM information_schema.columns "
-            "WHERE table_schema='public' AND table_name=%s AND column_name='jid'",
+            "WHERE table_schema='public' AND table_name=%s "
+            "AND column_name IN ('jid','phash')",
             (TABLE_STAGE,),
         )
-        has_jid = cur.fetchone()[0] > 0
-        if not has_jid:
+        has_current_identity = cur.fetchone()[0] == 2
+        if not has_current_identity:
             if resume:
                 conn.close()
                 raise SystemExit(
-                    "旧 stage 缺稳定 jid 列，不能 --resume；请无 --resume 重跑"
+                    "旧 stage 缺稳定 jid/phash 列，不能 --resume；请无 --resume 重跑"
                 )
             cur.execute(f"DROP TABLE public.{TABLE_STAGE}")
             stage_exists = False
@@ -533,10 +534,13 @@ def build_master() -> tuple[int, int]:
     sorted_exists = cur.fetchone()[0] is not None
     if sorted_exists:
         # 旧版缺 rule1_dups 列 或 表被 PG 重启清空（原 UNLOGGED 版本）→ 重建
-        cur.execute("SELECT count(*) FROM information_schema.columns "
-                    "WHERE table_name=%s AND column_name='rule1_dups'",
-                    (TABLE_SORTED,))
-        has_col = cur.fetchone()[0] > 0
+        cur.execute(
+            "SELECT count(*) FROM information_schema.columns "
+            "WHERE table_schema='public' AND table_name=%s "
+            "AND column_name IN ('rule1_dups','phash')",
+            (TABLE_SORTED,),
+        )
+        has_col = cur.fetchone()[0] == 2
         cur.execute(f"SELECT EXISTS(SELECT 1 FROM public.{TABLE_SORTED} LIMIT 1)")
         nonempty = cur.fetchone()[0]
         if not has_col or not nonempty:
@@ -705,7 +709,7 @@ def verify_invariants(metas: list[dict] | None = None) -> None:
     if dup_groups != 0:
         problems.append(f"{dup_groups} 组出现多 canonical")
     if rid_dups != 0:
-        problems.append(f"{rid_dups} 个 (plat,rid) 出现多 canonical")
+        problems.append(f"{rid_dups} 个 (platform_hash,rid) 出现多 canonical")
     if bad_years / max(stage, 1) > BAD_YEAR_THRESHOLD:
         problems.append(f"年份不可解析 {bad_years}/{stage} 超阻断线 {BAD_YEAR_THRESHOLD:.1%}")
     if problems:
