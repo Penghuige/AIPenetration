@@ -578,6 +578,24 @@ def build_master() -> tuple[int, int]:
             cur.execute(f"DROP TABLE public.{TABLE_SORTED}")
             sorted_exists = False
     if not sorted_exists:
+        # 63-bit jid 只是完整 SHA256 的计算代理；在任何按 jid 分组之前先验证
+        # 不同 (platform_hash, raw_id) 不得碰撞到同一代理。
+        cur.execute(f"""
+            SELECT count(*) FROM (
+                SELECT jid
+                FROM public.{TABLE_STAGE}
+                GROUP BY jid
+                HAVING count(DISTINCT (phash, rid)) > 1
+            ) x
+        """)
+        proxy_collisions = int(cur.fetchone()[0])
+        if proxy_collisions:
+            conn.close()
+            raise RuntimeError(
+                f"稳定 job_id 63-bit 代理发生 {proxy_collisions} 个碰撞；"
+                "拒绝在碰撞键上执行规则1去重"
+            )
+
         # §3.1：无法完整解析日期的记录进入隔离表，不参与正式按年样本。
         cur.execute(f"DROP TABLE IF EXISTS public.{TABLE_ISOLATED}")
         cur.execute(f"""
