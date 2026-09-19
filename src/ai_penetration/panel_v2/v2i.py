@@ -177,12 +177,18 @@ def main() -> None:
     scan_inputs = ("job_anchor_flag.parquet", "job_skill_long.parquet",
                    "job_firm.parquet", "job_text_clean.parquet")
     preflight_files = [rel2 / f for f in scan_inputs]
+    translation_delivery = [
+        paths.output_dir / "dictionary" / "external_skill_translation_v1.parquet",
+        paths.output_dir / "dictionary" / "external_skill_alias_zh_v1.parquet",
+        paths.output_dir / "dictionary" / "external_skill_ambiguous_v1.parquet",
+        paths.output_dir / "dictionary" / "external_translation_log_v1.jsonl",
+    ]
     preflight_files += [
         frozen_concepts,
         frozen_aliases,
         paths.output_dir / "dictionary" / "skill_governed_ABCD_v4.csv",
         paths.output_dir / "panel_v2" / "pass2_handoff_scan" / "skill_vocab.json",
-    ]
+    ] + translation_delivery
     missing_preflight = [str(p) for p in preflight_files if not p.exists()]
     if missing_preflight:
         raise RuntimeError(
@@ -359,6 +365,7 @@ def main() -> None:
     manifest_inputs = [rel2 / f for f in scan_inputs]
     manifest_inputs += [frozen_concepts, frozen_aliases, gcsv,
                         governance_manifest, vocab_path]
+    manifest_inputs += translation_delivery
     manifest_inputs += handoff_manifests
     manifest_outputs = [rel3 / name for name, _, _ in specs]
     # staging manifest 先验证所有文件可哈希/计数。
