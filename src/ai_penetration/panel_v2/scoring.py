@@ -30,7 +30,7 @@ import pyarrow.parquet as pq
 from config.paths import get_project_paths
 
 from ..common import setup_logging
-from .anchors import ANCHOR_VERSIONS
+from .anchors import ANCHOR_VERSIONS, match_anchors, normalize_desc
 
 logger = logging.getLogger("ai_penetration.panel_v2.scoring")
 
@@ -271,6 +271,77 @@ def run(rel_dir: Path, bench: bool = False) -> None:
     for c in cls.columns:
         if c.startswith("aijob_"):
             cls[c] = np.where(zero, 0, cls[c])
+
+    # §19.2 稳健性：不改主指标，仅输出两种 main×annual×raw 替代得分。
+    annual_w = dense[("main", "raw")][yidx_pairs, s_of]
+    if not np.isfinite(annual_w).all():
+        raise RuntimeError("robustness 前 main annual raw 存在缺失权重")
+
+    def variant_score(pair_mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        pj = j_of[pair_mask]
+        ww = annual_w[pair_mask]
+        cnt = np.bincount(pj, minlength=len(jobs)).astype(np.int32)
+        sm = np.bincount(
+            pj, weights=ww, minlength=len(jobs)
+        )
+        score = np.divide(
+            sm, cnt,
+            out=np.full(len(jobs), np.nan),
+            where=cnt > 0,
+        )
+        return score, cnt
+
+    if "confidence_tier" not in longs.columns:
+        raise RuntimeError(
+            "job_skill_long 缺 confidence_tier，无法计算 exclude-C 稳健性"
+        )
+    tier_mask = (
+        longs.confidence_tier.astype(str).to_numpy() != "C"
+    )
+    score_no_c, count_no_c = variant_score(tier_mask)
+
+    alias_df = pq.read_table(
+        rel_dir / "skill_alias_v1.parquet",
+        columns=["skill_id", "alias"],
+    ).to_pandas()
+    anchor_skill_ids = {
+        str(sid)
+        for sid, alias in zip(alias_df.skill_id, alias_df.alias)
+        if match_anchors("main", normalize_desc(str(alias))).flag
+    }
+    if "skill_id" not in longs.columns:
+        raise RuntimeError(
+            "job_skill_long 缺 skill_id，无法计算 remove-anchor 稳健性"
+        )
+    pair_sid = longs.skill_id.astype(str).to_numpy()
+    no_anchor_mask = ~np.isin(pair_sid, list(anchor_skill_ids))
+    score_no_anchor, count_no_anchor = variant_score(no_anchor_mask)
+
+    robust = pd.DataFrame({
+        "job_id": jobs,
+        "year": years[job_year],
+        "aiscore_main_annual_raw_exclude_c": score_no_c,
+        "matched_skill_count_exclude_c": count_no_c,
+        "aiscore_main_annual_raw_remove_anchor_skills": score_no_anchor,
+        "matched_skill_count_remove_anchor_skills": count_no_anchor,
+    })
+    primary005 = cls["aijob_main_annual_raw_005"].to_numpy(np.int8)
+    for label, score in (
+        ("exclude_c", score_no_c),
+        ("remove_anchor_skills", score_no_anchor),
+    ):
+        for thr, suffix in ((0.05, "005"), (0.10, "010"), (0.15, "015")):
+            flag = np.where(np.isnan(score), 0, score > thr).astype(np.int8)
+            robust[f"aijob_main_annual_raw_{label}_{suffix}"] = flag
+        robust[f"flip_vs_primary005_{label}"] = (
+            robust[f"aijob_main_annual_raw_{label}_005"].to_numpy(np.int8)
+            != primary005
+        ).astype(np.int8)
+    pq.write_table(
+        pa.Table.from_pandas(robust),
+        rel_dir / "job_ai_score_robustness.parquet",
+        compression="zstd",
+    )
 
     # §14.3 留一（main raw）：单位整数计数 dense 从 counts 重建（向量）
     anchored_main = anchor_arrays["main"] > 0
