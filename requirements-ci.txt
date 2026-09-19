@@ -1,0 +1,13 @@
+# CI-only dependency set. This is NOT the production environment lock.
+numpy
+pandas
+pyarrow
+scipy
+psycopg2-binary
+pyahocorasick
+requests
+PyYAML
+SQLAlchemy
+matplotlib
+pytest
+flake8
