@@ -313,11 +313,29 @@ def _results_conn():
 
 
 def copy_ent_map() -> None:
-    """ent 映射流式导出结果库（无主键防 ent 重复 recruit_id 炸 COPY）。"""
+    """ent 映射按 city+recruit_id 导出；多企业键不做任意 min 裁决。"""
     conn = _results_conn()
     cur = conn.cursor()
-    cur.execute(f"CREATE TABLE IF NOT EXISTS public.{TABLE_ENTMAP} "
-                "(recruit_id text, company_id text)")
+    cur.execute(
+        "SELECT to_regclass(%s)", (f"public.{TABLE_ENTMAP}",)
+    )
+    exists = cur.fetchone()[0] is not None
+    if exists:
+        cur.execute(
+            "SELECT count(*) FROM information_schema.columns "
+            "WHERE table_schema='public' AND table_name=%s "
+            "AND column_name='city'",
+            (TABLE_ENTMAP,),
+        )
+        if cur.fetchone()[0] == 0:
+            cur.execute(f"DROP TABLE public.{TABLE_ENTMAP}")
+            exists = False
+    if not exists:
+        cur.execute(
+            f"CREATE TABLE public.{TABLE_ENTMAP} "
+            "(city smallint NOT NULL, recruit_id text, company_id text)"
+        )
+        conn.commit()
     cur.execute(f"SELECT count(*) FROM public.{TABLE_ENTMAP}")
     has = cur.fetchone()[0]
     conn.commit()
@@ -325,13 +343,17 @@ def copy_ent_map() -> None:
     if has:
         logger.info("ent 映射已有 %d 行，跳过导出", has)
         return
+
     eps = psycopg2.connect(**eps_conn_params())
     try:
-        for _, ent_shard, _ in (("广州市", "ent_p0387", 0), ("深圳市", "ent_p0389", 1)):
+        ent_specs = (("ent_p0387", 0), ("ent_p0389", 1))
+        for ent_shard, city_id in ent_specs:
             cur = eps.cursor(f"entmap_{ent_shard}")
             cur.itersize = 200000
-            cur.execute(f"SELECT recruit_id, company_id FROM public.{ent_shard} "
-                        "WHERE recruit_id IS NOT NULL AND company_id IS NOT NULL")
+            cur.execute(
+                f"SELECT recruit_id, company_id FROM public.{ent_shard} "
+                "WHERE recruit_id IS NOT NULL AND company_id IS NOT NULL"
+            )
             conn2 = _results_conn()
             cur2 = conn2.cursor()
             n = 0
@@ -341,15 +363,22 @@ def copy_ent_map() -> None:
                 if not batch:
                     break
                 for rid, cid in batch:
-                    bio.write(f"{rid}\t{cid}\n")
+                    bio.write(f"{city_id}\t{rid}\t{cid}\n")
                     n += 1
                 if bio.tell() > 200 << 20:
                     bio.seek(0)
-                    cur2.copy_expert(f"COPY public.{TABLE_ENTMAP} FROM STDIN WITH (FORMAT text)", bio)
+                    cur2.copy_expert(
+                        f"COPY public.{TABLE_ENTMAP} FROM STDIN "
+                        "WITH (FORMAT text)",
+                        bio,
+                    )
                     conn2.commit()
                     bio = io.StringIO()
             bio.seek(0)
-            cur2.copy_expert(f"COPY public.{TABLE_ENTMAP} FROM STDIN WITH (FORMAT text)", bio)
+            cur2.copy_expert(
+                f"COPY public.{TABLE_ENTMAP} FROM STDIN WITH (FORMAT text)",
+                bio,
+            )
             conn2.commit()
             conn2.close()
             logger.info("ent 映射导出 %s: %d 行", ent_shard, n)
@@ -549,7 +578,7 @@ def build_master() -> tuple[int, int]:
             sorted_exists = False
     if not sorted_exists:
         # 段一：规则1（§6.2.1.1 平台+编号唯一记录，跨城重复折叠并计数）
-        # + join ent 聚合映射（min 消一 rid 多司），NULL→哨兵
+        # + join ent 城市内映射；一 rid 多司不任意裁决，NULL/冲突→哨兵
         cur.execute(f"""
             CREATE TABLE public.{TABLE_SORTED} AS
             WITH joined AS (
@@ -558,9 +587,14 @@ def build_master() -> tuple[int, int]:
                        coalesce(e.company_id, 'UNK:' || s.rid) AS company_id,
                        (e.company_id IS NULL) AS company_unmatched
                 FROM public.{TABLE_STAGE} s
-                LEFT JOIN (SELECT recruit_id, min(company_id) AS company_id
-                           FROM public.{TABLE_ENTMAP} GROUP BY recruit_id) e
-                       ON e.recruit_id = s.rid
+                LEFT JOIN (
+                    SELECT city, recruit_id,
+                           CASE WHEN count(DISTINCT company_id)=1
+                                THEN min(company_id) ELSE NULL END AS company_id
+                    FROM public.{TABLE_ENTMAP}
+                    GROUP BY city, recruit_id
+                ) e
+                  ON e.city = s.city AND e.recruit_id = s.rid
             ), rid_rank AS (
                 SELECT *,
                        row_number() OVER (PARTITION BY jid
