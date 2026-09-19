@@ -7,6 +7,13 @@
 panel_version: v2i
 dictionary_version: bilingual_a_frozen_v1.1+governed_v1.4
 
+
+identity:
+  job_id_formula: sha256_63bit(source_platform + unit_separator + job_id_raw)
+  full_formula: SHA256(source_platform | job_id_raw)
+  collision_policy: block_release
+  note: "63-bit surrogate only for compute efficiency; full SHA256 construction is fixed"
+
 scope:
   cities: [广州市, 深圳市]      # v2a 先广深；全国由用户排窗后扩
   years: [2014, 2025]          # eps 实际可得止于 2024，运行期自动 clamp 并记录
@@ -59,5 +66,5 @@ robustness:                    # §14.3 企业留一（主锚点、三窗口、�
 
 release:                       # §17.6/§18
   quality_gate_fail_blocks: true
-  outputs_dir: output/release/panel_v2
+  outputs_dir: output/release/panel_v2i
   metadata_fields: 11   # 指南 §18.1 原单 11 项（"至少包含"）；旧述"12"系笔误（2026-09-09 审计修正）
