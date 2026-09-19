@@ -56,5 +56,5 @@ def test_invariants_reject_bad_counts(tmp_path):
     broken = counts.copy()
     broken.loc[broken.index[0], "n_ai_cooccur"] = broken.loc[
         broken.index[0], "n_skill"] + 5
-    with pytest.raises(AssertionError):
+    with pytest.raises(RuntimeError):
         verify_counts(broken)
