@@ -17,7 +17,7 @@ import pandas as pd
 from config.paths import get_project_paths
 
 SEED = 20260822
-BASE_PER_YEAR = 10_000
+BASE_PER_YEAR_INDUSTRY = 10_000
 ROUND_N = 10_000
 REQUIRED = {
     "job_id", "year", "industry", "position_group", "company_size",
@@ -101,30 +101,41 @@ def _proportional_take(df: pd.DataFrame, n: int, seed: int) -> pd.DataFrame:
     return out.drop(columns=["_stratum", "_rank"], errors="ignore").head(n)
 
 
-def baseline_sample(df: pd.DataFrame, per_year: int = BASE_PER_YEAR,
-                    seed: int = SEED) -> pd.DataFrame:
-    """§9.2：逐年最多1万；行业先分配 min(50,n)，再跨全部分层比例补齐。"""
+def baseline_sample(
+    df: pd.DataFrame,
+    per_year_industry: int = BASE_PER_YEAR_INDUSTRY,
+    seed: int = SEED,
+) -> pd.DataFrame:
+    """8/24 handoff：每个 year×industry 单元最多 1 万条，不放回。
+
+    单元内部再按岗位组、企业规模、文本长度、技术/非技术、平台做比例分层，
+    兼容指南 §9.1 的其余分层维度。
+    """
     validate_frame(df)
     parts = []
-    for year in sorted(df.year.astype(int).unique()):
-        y = df[df.year.astype(int) == int(year)].copy()
-        target = min(per_year, len(y))
-        picked = []
-        for j, industry in enumerate(sorted(y.industry.fillna("INDUSTRY_MISSING").astype(str).unique())):
-            g = y[y.industry.fillna("INDUSTRY_MISSING").astype(str) == industry].copy()
-            k = min(50, len(g), target - sum(len(x) for x in picked))
-            if k <= 0:
-                break
-            g["_rank"] = _rank(g, seed + year * 101 + j)
-            picked.append(g.nsmallest(k, "_rank").drop(columns="_rank"))
-        first = pd.concat(picked) if picked else y.iloc[0:0]
-        remain_n = target - len(first)
-        remain = y.loc[~y.index.isin(first.index)]
-        extra = _proportional_take(remain, remain_n, seed + year * 1009)
-        parts.append(pd.concat([first, extra]))
-    out = pd.concat(parts).drop_duplicates("job_id").reset_index(drop=True)
+    work = df.copy()
+    work["_industry"] = (
+        work.industry.fillna("INDUSTRY_MISSING").astype(str)
+        .str.strip().replace("", "INDUSTRY_MISSING")
+    )
+    grouped = work.groupby([work.year.astype(int), "_industry"], sort=True)
+    for idx, ((year, _industry), group) in enumerate(grouped):
+        target = min(per_year_industry, len(group))
+        sampled = _proportional_take(
+            group.drop(columns=["_industry"]),
+            target,
+            seed + int(year) * 1009 + idx,
+        )
+        sampled = sampled.copy()
+        sampled["sampling_component"] = "baseline_year_industry"
+        parts.append(sampled)
+    if parts:
+        out = pd.concat(parts, ignore_index=True)
+    else:
+        out = work.iloc[0:0].drop(columns=["_industry"]).copy()
+    if out.job_id.duplicated().any():
+        raise RuntimeError("基准分层样本出现重复 job_id")
     out["discovery_round"] = 0
-    out["sampling_component"] = "baseline_year_industry_multistrata"
     return out
 
 
@@ -164,7 +175,14 @@ def incremental_round(df: pd.DataFrame, selected_ids: set,
 
 
 def saturation_pass(metrics: pd.DataFrame) -> bool:
-    """§9.2.2：最后连续两轮都满足全部四个停止条件。"""
+    """8/24 handoff：覆盖率只监测，不作为正式停止条件。
+
+    连续两轮要求：
+    - 每 1 万条新增有效标准概念 <5；
+    - 年份/主要行业覆盖已完成；
+    - 主锚点未覆盖比例不再明显下降。
+    coverage_gain_pp 仍必须记录用于报告，但不参与 pass/fail。
+    """
     required = {
         "round", "new_standard_concepts", "coverage_gain_pp",
         "all_years_major_industries_covered", "anchor_uncovered_stable",
@@ -177,7 +195,6 @@ def saturation_pass(metrics: pd.DataFrame) -> bool:
     last = metrics.sort_values("round").tail(2)
     ok = (
         (last.new_standard_concepts < 5)
-        & (last.coverage_gain_pp < 0.1)
         & last.all_years_major_industries_covered.astype(bool)
         & last.anchor_uncovered_stable.astype(bool)
     )
@@ -246,7 +263,7 @@ def finalize(
     manifest = {
         "status": "formal_pass" if passed else "incomplete",
         "seed": SEED,
-        "sampling_protocol": "guide_9.1_9.2_9.2.1_9.2.2_v1",
+        "sampling_protocol": "handoff_20260824_year_industry_10k_saturation_v2",
         "frame_sha256": _sha(frame_path),
         "selected_sha256": _sha(selected_path),
         "round_metrics_sha256": _sha(metrics_path),
