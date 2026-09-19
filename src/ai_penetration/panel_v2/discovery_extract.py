@@ -235,6 +235,9 @@ def run(sample_csv: Path) -> tuple[Path, Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     raw_path = out_dir / "chunk_results.jsonl"
     mentions_path = out_dir / "mentions.parquet"
+    candidate_surface_path = (
+        paths.output_dir / "dictionary" / "skill_candidate_surface.parquet"
+    )
     manifest_path = out_dir / "extraction_manifest.json"
 
     latest: dict[str, dict] = {}
@@ -430,6 +433,10 @@ def run(sample_csv: Path) -> tuple[Path, Path]:
     mentions.to_parquet(
         mentions_path, index=False, compression="zstd"
     )
+    candidate_surface_path.parent.mkdir(parents=True, exist_ok=True)
+    mentions.to_parquet(
+        candidate_surface_path, index=False, compression="zstd"
+    )
 
     status_counts = pd.Series(
         [r.get("status", "pending") for r in records]
@@ -466,6 +473,10 @@ def run(sample_csv: Path) -> tuple[Path, Path]:
         ).hexdigest(),
         "mentions_sha256": hashlib.sha256(
             mentions_path.read_bytes()
+        ).hexdigest(),
+        "skill_candidate_surface_path": str(candidate_surface_path),
+        "skill_candidate_surface_sha256": hashlib.sha256(
+            candidate_surface_path.read_bytes()
         ).hexdigest(),
     }
     manifest_path.write_text(
