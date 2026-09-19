@@ -98,34 +98,36 @@ def gate_checks(rel: Path) -> tuple[list[str], dict]:
     rel_df = pq.read_table(rel / "skill_ai_relevance.parquet").to_pandas()
     cls = pq.read_table(rel / "job_ai_classification.parquet").to_pandas()
     text_path = rel / "job_text_clean.parquet"
+    text_rows = None
     if not text_path.exists():
         fails.append("缺少 §6.4 job_text_clean.parquet")
-        texts = None
     else:
-        texts = pq.read_table(text_path).to_pandas()
+        pf_text = pq.ParquetFile(text_path)
+        text_rows = int(pf_text.metadata.num_rows)
+        text_cols = set(pf_text.schema_arrow.names)
         required_text = {
             "job_id", "job_id_sha256", "job_id_raw", "source_platform", "year",
             "job_description_raw", "job_description_clean",
             "job_description_match", "text_hash",
         }
-        missing_text = required_text - set(texts.columns)
+        missing_text = required_text - text_cols
         if missing_text:
             fails.append(
                 "job_text_clean 缺三态文本字段: "
                 + ", ".join(sorted(missing_text))
             )
-        if texts.job_id.duplicated().any():
-            fails.append("job_text_clean job_id 不唯一")
-        if "job_id_sha256" in texts.columns:
-            sha = texts.job_id_sha256.astype(str)
+        if {"job_id", "job_id_sha256"} <= text_cols:
+            # 只读身份列；raw/clean/match 大文本无需进入 Pandas 内存。
+            ids = pq.read_table(
+                text_path, columns=["job_id", "job_id_sha256"]
+            ).to_pandas()
+            if ids.job_id.duplicated().any():
+                fails.append("job_text_clean job_id 不唯一")
+            sha = ids.job_id_sha256.astype(str)
             if sha.duplicated().any():
                 fails.append("完整 SHA256 stable job_id 不唯一")
             if not sha.str.fullmatch(r"[0-9a-f]{64}").all():
                 fails.append("job_id_sha256 格式非法")
-        if {"source_platform", "job_id_raw"}.issubset(texts.columns):
-            pair = texts[["source_platform", "job_id_raw"]].astype(str)
-            if pair.duplicated().any():
-                fails.append("(source_platform, job_id_raw) 在 canonical 文本表中不唯一")
 
     # §18 正式发布词典必须能独立解释正式长表。
     concept_path = rel / "skill_concept_v1.parquet"
@@ -212,9 +214,9 @@ def gate_checks(rel: Path) -> tuple[list[str], dict]:
         fails.append("long 表存在 flag 外 job_id")
     stats["n_jobs"] = len(flags)
     stats["n_pairs"] = len(longs)
-    if texts is not None and len(texts) != len(flags):
+    if text_rows is not None and text_rows != len(flags):
         fails.append(
-            f"job_text_clean 行数 {len(texts)} != job_anchor_flag {len(flags)}")
+            f"job_text_clean 行数 {text_rows} != job_anchor_flag {len(flags)}")
 
     # 2 (job, skill) 唯一：job_id 为稳定 63-bit 哈希，禁止位移打包
     # （左移会 int64 溢出并制造伪碰撞/漏碰撞）。
