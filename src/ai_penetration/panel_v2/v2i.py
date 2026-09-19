@@ -40,7 +40,7 @@ from .governance import materialize_formal_dictionary, normalize_term
 from .lexicon import _load_atier_alias_records
 from .export_release import _meta
 from .relevance import compute_relevance, decode_skill_ids
-from .reproducibility import write_run_manifest
+from .reproducibility import sha256_file, write_run_manifest
 
 logger = logging.getLogger("ai_penetration.panel_v2.v2i")
 
@@ -203,6 +203,15 @@ def main() -> None:
     if not governance_manifest.exists():
         raise RuntimeError("缺少 T1/T2 治理 provenance manifest；请重新运行 lexicon_llm merge")
     grade = pd.read_csv(gcsv, encoding="utf-8-sig")
+    discovery_manifest = json.loads(
+        (paths.output_dir / "dictionary" / "formal_discovery_manifest_v1.json")
+        .read_text(encoding="utf-8")
+    )
+    if discovery_manifest.get("governance_sha256") != sha256_file(gcsv):
+        raise RuntimeError(
+            "formal discovery manifest 绑定的治理表与当前 "
+            "skill_legacy_graded_BCD_v3.csv 不一致"
+        )
     pass2b = paths.output_dir / "panel_v2" / "pass2_handoff_scan"
     vocab_path = pass2b / "skill_vocab.json"
     vocab = json.loads(vocab_path.read_text(encoding="utf-8"))
