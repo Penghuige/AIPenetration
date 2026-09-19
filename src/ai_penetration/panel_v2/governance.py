@@ -191,10 +191,36 @@ def materialize_formal_dictionary(
 
     formal = grades[grades.final_grade.isin(["A", "B", "C"])].copy()
     d_candidates = grades[grades.final_grade == "D"].copy()
+    if formal.final_skill_id.isna().any():
+        raise ValueError("A/B/C 存在空 final_skill_id")
+    grade_conflict = (
+        formal.groupby(formal.final_skill_id.astype(str)).final_grade.nunique()
+    )
+    if (grade_conflict > 1).any():
+        bad = grade_conflict[grade_conflict > 1].index.tolist()[:5]
+        raise ValueError(f"同一 final_skill_id 出现多个 confidence tier: {bad}")
 
+    controlled_types = set(_T2_TYPE_MAP.values()) | {
+        "hardware_equipment", "domain_knowledge", "business_management",
+        "general_work_skill", "soft_skill", "other_skill",
+    }
+    existing_concept_ids = set(concepts.skill_id.astype(str))
     concept_rows: list[dict] = []
-    for _, row in formal[formal.final_grade.isin(["B", "C"])].iterrows():
+    bc = formal[formal.final_grade.isin(["B", "C"])].copy()
+    sort_cols = ["final_skill_id", "term"]
+    if "df_freq" in bc.columns:
+        bc["_df_sort"] = pd.to_numeric(bc["df_freq"], errors="coerce").fillna(-1)
+        bc = bc.sort_values(
+            ["final_skill_id", "_df_sort", "term"],
+            ascending=[True, False, True],
+            kind="stable",
+        )
+    else:
+        bc = bc.sort_values(sort_cols, kind="stable")
+    for _, row in bc.iterrows():
         sid = str(row.final_skill_id)
+        if sid in existing_concept_ids:
+            continue
         term = str(row.term)
         rec = {col: pd.NA for col in concepts.columns}
         rec["skill_id"] = sid
@@ -202,9 +228,11 @@ def materialize_formal_dictionary(
             rec["canonical_zh"] = term if _CJK_RE.search(term) else pd.NA
         if "canonical_en" in rec:
             rec["canonical_en"] = term if not _CJK_RE.search(term) else pd.NA
+        raw_type = _text(row.get("t2_cat"))
         if "skill_type" in rec:
-            rec["skill_type"] = _T2_TYPE_MAP.get(
-                str(row.get("t2_cat", "")), "other_skill"
+            rec["skill_type"] = (
+                raw_type if raw_type in controlled_types
+                else _T2_TYPE_MAP.get(raw_type, "other_skill")
             )
         if "skill_category" in rec:
             rec["skill_category"] = "china_recruitment_governed"
@@ -215,6 +243,7 @@ def materialize_formal_dictionary(
         if "dictionary_version" in rec:
             rec["dictionary_version"] = dictionary_version
         concept_rows.append(rec)
+        existing_concept_ids.add(sid)
 
     if concept_rows:
         concepts = pd.concat([concepts, pd.DataFrame(concept_rows)], ignore_index=True)
@@ -264,7 +293,8 @@ def materialize_formal_dictionary(
                 "ascii_alnum_boundary" if is_ascii else "substring_longest"
             )
         if "ambiguity_flag" in rec:
-            rec["ambiguity_flag"] = "1" if bool(row.get("t2_ambig", False)) else "0"
+            amb = _text(row.get("t2_ambig")).lower() in {"1", "true", "yes"}
+            rec["ambiguity_flag"] = "1" if amb else "0"
         if "confidence_tier" in rec:
             rec["confidence_tier"] = str(row.final_grade)
         if "dictionary_version" in rec:
@@ -280,9 +310,10 @@ def materialize_formal_dictionary(
         if "case_sensitive" in rec:
             rec["case_sensitive"] = "0"
         if "activation_reason" in rec:
+            action = _text(row.get("mapping_action"))
             rec["activation_reason"] = (
-                "mapped_existing_by_t2"
-                if str(row.final_grade) == "A"
+                "mapped_existing_by_review"
+                if action.startswith("MATCH_EXISTING")
                 else f"governed_grade_{row.final_grade}"
             )
         if "translation_status" in rec:
