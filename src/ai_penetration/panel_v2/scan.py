@@ -132,12 +132,12 @@ def _load_governed_legacy_map() -> tuple[dict[str, str], set[str], str]:
     path = (
         get_project_paths().output_dir
         / "dictionary"
-        / "skill_legacy_graded_BCD_v3.csv"
+        / "skill_governed_ABCD_v4.csv"
     )
     if not path.exists():
         raise RuntimeError(
-            "缺少 handoff-compliant 治理表 skill_legacy_graded_BCD_v3.csv；"
-            "请先运行 panel_v2.lexicon_llm merge"
+            "缺少 handoff-compliant 治理表 skill_governed_ABCD_v4.csv；"
+            "请先完成 formal discovery review"
         )
     grades = pd.read_csv(path, encoding="utf-8-sig")
     mapping = governed_skill_map(grades)
