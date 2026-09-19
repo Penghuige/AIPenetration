@@ -157,9 +157,8 @@ def main() -> None:
     rel_df.to_parquet(rel3 / "skill_ai_relevance.parquet", index=False)
     logger.info("skill_ai_relevance: %d 行", len(rel_df))
 
-    # 4) scoring + quality
+    # 4) scoring
     scoring.run(rel3)
-    quality.run(rel3)
 
     # 5) 装配：§18 正式词典必须与实际 matcher 同一 A/B/C 概念集合。
     base_concepts = pd.read_parquet(rel_src / "skill_concept_v1.parquet")
@@ -186,6 +185,9 @@ def main() -> None:
         encoding="utf-8-sig",
     )
     shutil.copy2(gcsv, rel3 / gcsv.name)
+
+    # 6) 正式词典、长表、得分全部到位后再跑 §17 质量门。
+    quality.run(rel3)
 
     single = rel3 / "job_ai_score.parquet"
     files = sorted((rel3 / "job_ai_score").glob("*.parquet"))
@@ -230,7 +232,7 @@ def main() -> None:
             dictionary_version=LEX_VERSION,
         )
 
-    # 6) 指南 §4.2：把本次正式运行的代码/配置、输入、输出绑定成一个总账。
+    # 7) 指南 §4.2：把本次正式运行的代码/配置、输入、输出绑定成一个总账。
     manifest_inputs = [rel2 / f for f in scan_inputs]
     manifest_inputs += [rel_src / "skill_concept_v1.parquet",
                         rel_src / "skill_alias_v1.parquet", gcsv, vocab_path]
