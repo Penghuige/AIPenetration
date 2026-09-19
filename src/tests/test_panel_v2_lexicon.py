@@ -4,7 +4,11 @@ from __future__ import annotations
 import pandas as pd
 
 from src.ai_penetration.panel_v2.anchors import normalize_desc
-from src.ai_penetration.panel_v2.lexicon import LEGACY_PREFIX, build_union_lexicon
+from src.ai_penetration.panel_v2.lexicon import (
+    LEGACY_PREFIX,
+    _resolve_active_alias_rows,
+    build_union_lexicon,
+)
 from src.ai_penetration.text_clean import (
     clean_description,
     match_from_raw,
@@ -35,6 +39,48 @@ def test_extract_unions_both_layers():
     # A 级已覆盖 PyTorch，legacy 同名不重复制键
     assert LEGACY_PREFIX + "pytorch" not in got
     assert "PyTorch" in lex.overlap_terms
+
+
+
+
+def test_longest_nested_match_prevents_double_counting():
+    lex = build_union_lexicon(
+        legacy_terms=[],
+        aliases=[("机器学习", "uuid-ml"), ("学习", "uuid-learning")],
+    )
+    hits = lex.extract_matches(normalize_desc("负责机器学习模型"))
+    assert [h.skill_id for h in hits] == ["uuid-ml"]
+    assert hits[0].surface_form == "机器学习"
+    assert hits[0].end - hits[0].start == len(hits[0].surface_form)
+    assert hits[0].mention_count == 1
+
+
+def test_repeated_skill_keeps_first_span_and_mention_count():
+    lex = build_union_lexicon(
+        legacy_terms=[],
+        aliases=[("机器学习", "uuid-ml")],
+    )
+    hits = lex.extract_matches(normalize_desc("机器学习与机器学习"))
+    assert len(hits) == 1
+    assert hits[0].skill_id == "uuid-ml"
+    assert hits[0].start == 0
+    assert hits[0].mention_count == 2
+
+
+def test_active_alias_collision_requires_primary_skill_id():
+    rows = [
+        ("ABAP", "uuid-b", "uuid-a"),
+        ("ABAP", "uuid-a", "uuid-a"),
+    ]
+    assert _resolve_active_alias_rows(rows) == [("ABAP", "uuid-a")]
+
+    bad = [("ABAP", "uuid-a", None), ("ABAP", "uuid-b", None)]
+    try:
+        _resolve_active_alias_rows(bad)
+    except RuntimeError as exc:
+        assert "primary_skill_id" in str(exc)
+    else:
+        raise AssertionError("ambiguous active aliases must fail closed")
 
 
 def test_ascii_boundary_on_legacy_and_atier():
