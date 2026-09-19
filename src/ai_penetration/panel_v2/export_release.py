@@ -285,33 +285,64 @@ def export_final_dictionaries(
     grade_path: Path,
     *,
     dictionary_version: str,
+    a_concept_path: Path | None = None,
+    a_alias_path: Path | None = None,
 ) -> None:
-    """从冻结 A 级 DB + 最终语义分级组装指南 §18 的正式三件。"""
-    conn = psycopg2.connect(**eps_conn_params())
-    try:
-        concepts = pd.read_sql(
-            """SELECT skill_id, canonical_zh, canonical_en, skill_type,
-                      skill_category,
-                      coalesce(definition_en, description_en, '') AS definition,
-                      source_primary AS source,
-                      source_version_primary AS source_version,
-                      source_id_primary AS source_id,
-                      valid_from, valid_to, confidence_tier, dictionary_version
-               FROM ai_dict.skill_concepts""",
-            conn,
-        )
-        aliases = pd.read_sql(
-            """SELECT alias_id, skill_id, alias, alias_normalized, language,
-                      source, matching_rule, ambiguity_flag, confidence_tier,
-                      dictionary_version, is_active, primary_skill_id,
-                      boundary_rule, case_sensitive, activation_reason
-               FROM ai_dict.skill_aliases
-               WHERE is_active='1'
-               ORDER BY alias, skill_id""",
-            conn,
-        )
-    finally:
-        conn.close()
+    """从冻结 A 级文件 + 最终语义分级组装指南 §18 的正式三件。
+
+    正式发布优先使用冻结 CSV，使 A 级输入也能被 run manifest 做文件哈希绑定；
+    DB 查询仅保留给旧入口兼容。
+    """
+    if a_concept_path is not None and a_alias_path is not None:
+        raw_concepts = pd.read_csv(a_concept_path, encoding="utf-8-sig")
+        concepts = pd.DataFrame({
+            "skill_id": raw_concepts["skill_id"],
+            "canonical_zh": raw_concepts.get("canonical_zh", ""),
+            "canonical_en": raw_concepts.get("canonical_en", ""),
+            "skill_type": raw_concepts.get("skill_type", ""),
+            "skill_category": raw_concepts.get("skill_category", ""),
+            "definition": raw_concepts.get(
+                "definition_en",
+                raw_concepts.get("description_en", ""),
+            ),
+            "source": raw_concepts.get("source_primary", ""),
+            "source_version": raw_concepts.get("source_version_primary", ""),
+            "source_id": raw_concepts.get("source_id_primary", ""),
+            "valid_from": raw_concepts.get("valid_from", pd.NA),
+            "valid_to": raw_concepts.get("valid_to", pd.NA),
+            "confidence_tier": raw_concepts.get("confidence_tier", "A"),
+            "dictionary_version": raw_concepts.get(
+                "dictionary_version", "bilingual_a_frozen_v1.1"
+            ),
+        })
+        aliases = pd.read_csv(a_alias_path, encoding="utf-8-sig")
+        aliases = aliases[aliases["is_active"].astype(str) == "1"].copy()
+    else:
+        conn = psycopg2.connect(**eps_conn_params())
+        try:
+            concepts = pd.read_sql(
+                """SELECT skill_id, canonical_zh, canonical_en, skill_type,
+                          skill_category,
+                          coalesce(definition_en, description_en, '') AS definition,
+                          source_primary AS source,
+                          source_version_primary AS source_version,
+                          source_id_primary AS source_id,
+                          valid_from, valid_to, confidence_tier, dictionary_version
+                   FROM ai_dict.skill_concepts""",
+                conn,
+            )
+            aliases = pd.read_sql(
+                """SELECT alias_id, skill_id, alias, alias_normalized, language,
+                          source, matching_rule, ambiguity_flag, confidence_tier,
+                          dictionary_version, is_active, primary_skill_id,
+                          boundary_rule, case_sensitive, activation_reason
+                   FROM ai_dict.skill_aliases
+                   WHERE is_active='1'
+                   ORDER BY alias, skill_id""",
+                conn,
+            )
+        finally:
+            conn.close()
 
     grade = pd.read_csv(grade_path, encoding="utf-8-sig")
     concepts, aliases, d_frame = build_final_dictionary_frames(
