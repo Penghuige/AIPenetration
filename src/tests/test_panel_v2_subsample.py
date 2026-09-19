@@ -17,7 +17,7 @@ def _frames():
     })
     score = pd.DataFrame({
         "job_id": [1, 2, 3, 4, 5, 6],
-        "ai_score": [0.9, np.nan, 0.4, 0.05, 0.02, np.nan],
+        "ai_score": [0.9, np.nan, 0.4, 0.05, 0.02, 0.10],
     })
     return cls, score
 
@@ -40,3 +40,12 @@ def test_curve_frame_deterministic():
     cls, score = _frames()
     pd.testing.assert_frame_equal(curve_frame(cls, score),
                                   curve_frame(cls, score))
+
+
+
+def test_curve_frame_rejects_missing_score_for_matched_job():
+    import pytest
+    cls, score = _frames()
+    score.loc[score.job_id == 3, "ai_score"] = np.nan
+    with pytest.raises(RuntimeError, match="有技能岗位缺"):
+        curve_frame(cls, score)
