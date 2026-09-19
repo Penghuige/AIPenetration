@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -137,19 +138,54 @@ def filter_longs(rel2: Path, codes: np.ndarray,
 def main() -> None:
     ap = argparse.ArgumentParser(description="v2i 原始交接合规全链重算")
     ap.add_argument("--run-id", default="20260919_v2i")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--force-release", action="store_true")
     args = ap.parse_args()
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", args.run_id):
+        raise SystemExit("--run-id 仅允许字母数字、点、下划线、连字符")
     paths = get_project_paths()
     setup_logging(paths.log_dir / "panel_v2_v2i.log")
     t0 = datetime.now()
     handoff_manifests = require_handoff_manifests(paths)
-    rel_src = paths.output_dir / "release" / "panel_v2"
-    rel2 = paths.output_dir / "release" / "panel_v2_handoff_scan"  # 新扫描输入
-    rel3 = paths.output_dir / "release" / "panel_v2i"  # 新正式发布
-    rel3.mkdir(parents=True, exist_ok=True)
+    release_root = paths.output_dir / "release"
+    rel_src = release_root / "panel_v2"
+    rel2 = release_root / "panel_v2_handoff_scan"  # 新扫描输入
+    target = release_root / "panel_v2i"
+    rel3 = release_root / f".panel_v2i_{args.run_id}.tmp"
 
-    # 1) 输入件从 v2b 移入 v2h（flag/long/firm 为规则 b 扫描产物）
     scan_inputs = ("job_anchor_flag.parquet", "job_skill_long.parquet",
                    "job_firm.parquet")
+    preflight_files = [rel2 / f for f in scan_inputs]
+    preflight_files += [
+        rel_src / "skill_concept_v1.parquet",
+        rel_src / "skill_alias_v1.parquet",
+        paths.output_dir / "dictionary" / "skill_legacy_graded_BCD_v3.csv",
+        paths.output_dir / "panel_v2" / "pass2_handoff_scan" / "skill_vocab.json",
+    ]
+    missing_preflight = [str(p) for p in preflight_files if not p.exists()]
+    if missing_preflight:
+        raise RuntimeError(
+            "v2i 前置产物缺失:\n" + "\n".join(missing_preflight)
+        )
+    if args.dry_run:
+        print("v2i dry-run 前置检查通过；未写任何发布文件")
+        return
+
+    if target.exists() and not args.force_release:
+        raise SystemExit(
+            f"正式发布目录已存在: {target}；默认拒绝覆盖。"
+            "如确需替换请显式 --force-release"
+        )
+    if rel3.exists() and not args.resume:
+        raise SystemExit(
+            f"staging 已存在: {rel3}；使用 --resume 继续，或人工清理后重跑"
+        )
+    rel3.mkdir(parents=True, exist_ok=True)
+    if target.exists() and (target / "quality_stats.json").exists()             and not (rel3 / "quality_stats.json").exists():
+        shutil.copy2(target / "quality_stats.json", rel3 / "quality_stats.json")
+
+    # 1) 输入件从 handoff scan 移入 staging
     for f in scan_inputs:
         shutil.copy2(rel2 / f, rel3 / f)
 
@@ -278,7 +314,8 @@ def main() -> None:
                         governance_manifest, vocab_path]
     manifest_inputs += handoff_manifests
     manifest_outputs = [rel3 / name for name, _, _ in specs]
-    manifest = write_run_manifest(
+    # staging manifest 先验证所有文件可哈希/计数。
+    write_run_manifest(
         rel3,
         run_id=args.run_id,
         started_at=t0,
@@ -288,7 +325,33 @@ def main() -> None:
         anchor_version="main,cn_paper,babina@20260909_b",
     )
 
-    print(f"panel_v2i 发布: {len(specs)} 件 + metadata + {manifest.name} @ {rel3}，用时 "
+    backup = None
+    if target.exists():
+        backup = release_root / (
+            "panel_v2i.previous_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+        )
+        target.replace(backup)
+    try:
+        rel3.replace(target)
+    except Exception:
+        if backup is not None and backup.exists() and not target.exists():
+            backup.replace(target)
+        raise
+
+    final_outputs = [target / name for name, _, _ in specs]
+    manifest = write_run_manifest(
+        target,
+        run_id=args.run_id,
+        started_at=t0,
+        input_paths=manifest_inputs,
+        output_paths=final_outputs,
+        dictionary_version=LEX_VERSION,
+        anchor_version="main,cn_paper,babina@20260909_b",
+    )
+    (target / "RELEASE_COMPLETE").write_text(
+        args.run_id + "\n", encoding="utf-8"
+    )
+    print(f"panel_v2i 发布: {len(specs)} 件 + metadata + {manifest.name} @ {target}，用时 "
           f"{(datetime.now() - t0).total_seconds() / 60:.1f} 分钟")
 
 
