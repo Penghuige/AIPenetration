@@ -176,13 +176,24 @@ def run(rel_dir: Path, bench: bool = False) -> None:
     if (not valid_year.all()
             or not np.all(years[yidx_pairs[valid_year]] == y_of[valid_year])):
         raise RuntimeError("job_skill_long 含 flags 年份集合外年份")
-    # job → company 映射（firm 每 job 一行，按 job_id 对齐，防行序错配）
+    # job → company 映射（firm 必须与岗位全集一对一）
     company_of_job = np.zeros(len(jobs), np.int32)
     firm_job_arr = firm.job_id.to_numpy()
     if not np.array_equal(np.sort(firm_job_arr), np.unique(firm_job_arr)):
         raise RuntimeError("firm 表 job 重复")
-    company_of_job[np.searchsorted(jobs, firm_job_arr)] = \
-        firm.company_code.to_numpy(np.int32)
+    firm_pos = np.searchsorted(jobs, firm_job_arr)
+    firm_valid = firm_pos < len(jobs)
+    if (
+        not firm_valid.all()
+        or not np.all(jobs[firm_pos[firm_valid]] == firm_job_arr[firm_valid])
+    ):
+        raise RuntimeError("job_firm 含 flags 外 job_id")
+    if len(firm_job_arr) != len(jobs):
+        raise RuntimeError(
+            f"job_firm 覆盖不完整: {len(firm_job_arr)} != {len(jobs)}"
+        )
+    company_of_job[firm_pos] = firm.company_code.to_numpy(np.int32)
+
 
     anchor_arrays = {}
     for ver in VERSIONS:
@@ -193,10 +204,21 @@ def run(rel_dir: Path, bench: bool = False) -> None:
     dense = _dense_weights(rel, years, n_skill)
     n_y = len(years)
 
-    # job 属性表
+    # job 属性表：按实际 years 建显式索引，不假设年份连续或使用未定义 ymin。
     job_year = np.zeros(len(jobs), np.int32)
-    job_year[np.searchsorted(jobs, flags.job_id.to_numpy())] = \
-        flags.year.to_numpy(np.int32) - ymin
+    flag_pos = np.searchsorted(jobs, flags.job_id.to_numpy())
+    flag_years = flags.year.to_numpy(np.int32)
+    flag_year_idx = np.searchsorted(years, flag_years)
+    year_idx_valid = flag_year_idx < len(years)
+    if (
+        not year_idx_valid.all()
+        or not np.all(
+            years[flag_year_idx[year_idx_valid]]
+            == flag_years[year_idx_valid]
+        )
+    ):
+        raise RuntimeError("flags 含年份集合外年份")
+    job_year[flag_pos] = flag_year_idx
     matched = np.bincount(j_of, minlength=len(jobs)).astype(np.int32)
 
     # B1：每个 (ver,win,scoretype) 单元即算即落盘（dataset 分区），
