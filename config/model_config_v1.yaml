@@ -5,6 +5,7 @@ model:
   revision: TO_BE_CONFIRMED
   quantization: TO_BE_CONFIRMED
   tokenizer_version: TO_BE_CONFIRMED
+  tokenizer_path: TO_BE_CONFIRMED
 runtime:
   framework: vllm
   framework_version: TO_BE_CONFIRMED
