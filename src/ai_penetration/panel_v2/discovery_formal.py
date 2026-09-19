@@ -241,6 +241,8 @@ def finalize(
             "candidate audit 缺列: " + ", ".join(sorted(missing))
         )
     if not set(audit.final_grade.astype(str)) <= {"A", "B", "C", "D"}:
+        raise ValueError("candidate audit 含未知 final_grade")
+
     if {"decision", "source_round"}.issubset(audit.columns):
         derived = (
             audit[
@@ -259,7 +261,7 @@ def finalize(
                     f"{int(row.new_standard_concepts)} != audit-derived "
                     f"{expected_new}"
                 )
-        raise ValueError("candidate audit 含未知 final_grade")
+
     formal = audit[audit.final_grade.isin(["A", "B", "C"])].copy()
     if (formal.evidence_count <= 0).any() or not formal.span_valid.astype(bool).all():
         raise ValueError("A/B/C 候选存在无有效原文证据记录")
