@@ -37,6 +37,18 @@ def _is_ascii_alnum(ch: str) -> bool:
     return ("a" <= ch <= "z") or ("A" <= ch <= "Z") or ("0" <= ch <= "9")
 
 
+@dataclass(frozen=True)
+class SkillMatch:
+    """一次岗位内唯一技能命中；跨度基于 job_description_match。"""
+
+    skill_id: str
+    surface_form: str
+    start: int
+    end: int
+    mention_count: int
+    match_key: str
+
+
 @dataclass
 class UnionLexicon:
     """union 词表匹配器（A 级概念 + legacy 合成词共用一个自动机）。"""
@@ -50,46 +62,112 @@ class UnionLexicon:
     n_concepts: int = 0
     overlap_terms: tuple[str, ...] = ()
 
-    def extract(self, match_text: str) -> set[str]:
-        """从 match 态文本抽取技能 id 集合（岗位内去重）。
+    def extract_matches(self, match_text: str) -> list[SkillMatch]:
+        """按指南 §11.1.1 返回最长优先、岗位内 skill_id 唯一的命中证据。
 
-        Args:
-            match_text: normalize_desc/NFKC+lower 后的描述文本。
-
-        Returns:
-            skill_id 集合（uuid 或 legacy:<term>）。
+        不同概念发生完全嵌套时保留较长跨度；部分交叠但互不包含时均保留。
+        同一 skill_id 多次出现只输出首次位置，同时记录 mention_count。
         """
-        hits: set[str] = set()
-        for end, (sid, key) in self.automaton.iter(match_text):
+        raw: list[tuple[int, int, str, str]] = []
+        for end_inclusive, (sid, key) in self.automaton.iter(match_text):
+            start = end_inclusive - len(key) + 1
+            end = end_inclusive + 1
             if key in self.ascii_keys:
-                start = end - len(key) + 1
                 before = match_text[start - 1] if start > 0 else ""
-                after = match_text[end + 1] if end + 1 < len(match_text) else ""
+                after = match_text[end] if end < len(match_text) else ""
                 if _is_ascii_alnum(before) or _is_ascii_alnum(after):
                     continue
-            hits.add(sid)
-        for sid, ctx in self.homograph.items():
-            if sid in hits and not ctx.search(match_text):
-                hits.discard(sid)
-        return hits
+            if sid in self.homograph and not self.homograph[sid].search(match_text):
+                continue
+            raw.append((start, end, sid, key))
+
+        # 长跨度先占位；相同长度按起点、skill_id、key 确定性排序。
+        accepted: list[tuple[int, int, str, str]] = []
+        for hit in sorted(
+            set(raw),
+            key=lambda x: (-(x[1] - x[0]), x[0], x[1], x[2], x[3]),
+        ):
+            start, end, _sid, _key = hit
+            if any(
+                start >= a0 and end <= a1 and (start, end) != (a0, a1)
+                for a0, a1, _as, _ak in accepted
+            ):
+                continue
+            accepted.append(hit)
+
+        by_sid: dict[str, list[tuple[int, int, str, str]]] = {}
+        for hit in accepted:
+            by_sid.setdefault(hit[2], []).append(hit)
+
+        out: list[SkillMatch] = []
+        for sid, hits in by_sid.items():
+            first = min(hits, key=lambda x: (x[0], -(x[1] - x[0]), x[3]))
+            start, end, _sid, key = first
+            surface = match_text[start:end]
+            if surface != key:
+                raise RuntimeError(
+                    f"词典跨度回填失败: sid={sid} key={key!r} surface={surface!r}"
+                )
+            out.append(SkillMatch(
+                skill_id=sid,
+                surface_form=surface,
+                start=start,
+                end=end,
+                mention_count=len(hits),
+                match_key=key,
+            ))
+        return sorted(out, key=lambda x: (x.start, x.end, x.skill_id))
+
+    def extract(self, match_text: str) -> set[str]:
+        """兼容旧调用：返回按 §11 最长匹配规则去重后的 skill_id 集合。"""
+        return {hit.skill_id for hit in self.extract_matches(match_text)}
+
+
+def _resolve_active_alias_rows(
+    rows: list[tuple[str, str, str | None]]
+) -> list[tuple[str, str]]:
+    """按 §7.4.4/§11.1.3 用 primary_skill_id 解析激活同形别名。
+
+    多概念激活别名若没有唯一 primary_skill_id 属词典不变量错误，禁止再以
+    min(skill_id) 猜测主概念。
+    """
+    grouped: dict[str, list[tuple[str, str | None]]] = {}
+    for alias, sid, primary in rows:
+        grouped.setdefault(str(alias), []).append((str(sid), primary or None))
+
+    resolved: list[tuple[str, str]] = []
+    for alias in sorted(grouped):
+        values = grouped[alias]
+        sids = {sid for sid, _ in values}
+        primaries = {str(p) for _, p in values if p}
+        if len(primaries) > 1:
+            raise RuntimeError(
+                f"激活别名 {alias!r} 存在多个 primary_skill_id: {sorted(primaries)}"
+            )
+        if primaries:
+            sid = next(iter(primaries))
+        elif len(sids) == 1:
+            sid = next(iter(sids))
+        else:
+            raise RuntimeError(
+                f"激活别名 {alias!r} 同时映射多个 skill_id 且未指定 primary_skill_id"
+            )
+        resolved.append((alias, sid))
+    return resolved
 
 
 def _load_atier_aliases() -> list[tuple[str, str]]:
-    """读 A 级激活别名 (alias, skill_id)。
-
-    确定性保证（B3 审计修复）：同一 alias 多 skill_id 时取 min(skill_id)，
-    按 alias 排序返回——first-wins 结果跨进程/跨重跑稳定（实证 36 个
-    碰撞键如 abap/ansible/cobol，若不定序会造成 skill_code 跨分片错位）。
-    """
+    """读取 A 级激活别名，并严格应用词典 primary_skill_id 语义。"""
     conn = psycopg2.connect(**eps_conn_params())
     try:
         cur = conn.cursor()
         cur.execute("""
-            SELECT alias, min(skill_id) AS skill_id FROM ai_dict.skill_aliases
+            SELECT alias, skill_id, nullif(primary_skill_id, '')
+            FROM ai_dict.skill_aliases
             WHERE is_active='1' AND alias IS NOT NULL AND length(trim(alias))>=2
-            GROUP BY alias ORDER BY alias
+            ORDER BY alias, skill_id
         """)
-        return [(r[0], r[1]) for r in cur.fetchall()]
+        return _resolve_active_alias_rows(cur.fetchall())
     finally:
         conn.close()
 
@@ -116,8 +194,11 @@ def build_union_lexicon(
     homograph: dict[str, re.Pattern] = {}
     for alias, sid in aliases:
         key = unicodedata.normalize("NFKC", alias).lower()
-        if key not in keys:
-            keys[key] = sid
+        if key in keys and keys[key] != sid:
+            raise RuntimeError(
+                f"激活别名规范化键 {key!r} 映射多个概念: {keys[key]} vs {sid}"
+            )
+        keys[key] = sid
         if alias in _AMBIGUOUS_AI_TERMS:
             homograph[sid] = _AMBIGUOUS_AI_TERMS[alias]
 
@@ -149,7 +230,7 @@ def build_union_lexicon(
     return UnionLexicon(
         automaton=automaton, ascii_keys=ascii_keys, homograph=homograph,
         keys_map=keys, n_atier=n_atier, n_legacy=n_legacy,
-        n_concepts=len(keys), overlap_terms=tuple(overlap),
+        n_concepts=len(set(keys.values())), overlap_terms=tuple(overlap),
     )
 
 
