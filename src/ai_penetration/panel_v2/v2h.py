@@ -35,7 +35,7 @@ from .anchors import anchor_dictionary_rows
 from .governance import materialize_formal_dictionary, normalize_term
 from .lexicon import _load_atier_alias_records
 from .export_release import _meta
-from .relevance import _load_tier_map, compute_relevance, decode_skill_ids
+from .relevance import compute_relevance, decode_skill_ids
 from .reproducibility import write_run_manifest
 
 logger = logging.getLogger("ai_penetration.panel_v2.v2h")
@@ -147,8 +147,12 @@ def main() -> None:
     counts = compute_counts(rel3)
     counts.to_parquet(rel3 / "skill_ai_counts.parquet", index=False)
     logger.info("skill_ai_counts: %d 行", len(counts))
+    n_vocab = max(vocab.values()) + 1
+    tier_map = np.full(n_vocab, "A", dtype=object)
+    for sid, code in vocab.items():
+        tier_map[int(code)] = grade_by_sid.get(str(sid), "A")
     rel_df = decode_skill_ids(
-        compute_relevance(counts, _load_tier_map(vocab_path)), vocab_path
+        compute_relevance(counts, tier_map), vocab_path
     )
     rel_df.to_parquet(rel3 / "skill_ai_relevance.parquet", index=False)
     logger.info("skill_ai_relevance: %d 行", len(rel_df))
