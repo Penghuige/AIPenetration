@@ -29,7 +29,7 @@ from ..zh_alias_freq import FREQ_PROTOCOL_VERSION, aggregate_counts
 from ..text_clean import match_from_raw, text_hash
 from .anchors import match_all_versions
 from .dedup import SHARDS, _blocks
-from .lexicon import LEGACY_PREFIX, _is_ascii_alnum, build_union_lexicon
+from .lexicon import LEGACY_PREFIX, _boundary_ok, build_union_lexicon
 
 logger = logging.getLogger("ai_penetration.panel_v2.legacy_freq")
 
@@ -179,9 +179,7 @@ def scan_slice(table: str, b_start: int, b_end: int, tmp_dir: str,
                 for end, k in auto.iter(norm):
                     if k in ascii_keys:
                         s0 = end - len(k) + 1
-                        bef = norm[s0 - 1] if s0 > 0 else ""
-                        aft = norm[end + 1] if end + 1 < len(norm) else ""
-                        if _is_ascii_alnum(bef) or _is_ascii_alnum(aft):
+                        if not _boundary_ok(k, norm, s0, end + 1):
                             continue
                     aid = idx[k]
                     if 2014 <= year <= 2025 and year < int(local_first_year[aid]):
@@ -212,8 +210,19 @@ def scan_slice(table: str, b_start: int, b_end: int, tmp_dir: str,
         parts = sorted(Path(tmp_dir).glob(f"{task}.k*.part"))
         if pairs:
             ka = np.concatenate([np.fromfile(p, dtype=np.uint64) for p in parts])
-            aa = np.concatenate([np.fromfile(p, dtype=np.uint32)
-                                 for p in Path(tmp_dir).glob(f"{task}.a*.part")])
+            aid_parts = sorted(Path(tmp_dir).glob(f"{task}.a*.part"))
+            if len(aid_parts) != len(parts):
+                raise RuntimeError(
+                    f"{task} key/aid part 数量不一致: "
+                    f"{len(parts)} != {len(aid_parts)}"
+                )
+            aa = np.concatenate([
+                np.fromfile(p, dtype=np.uint32) for p in aid_parts
+            ])
+            if len(ka) != len(aa):
+                raise RuntimeError(
+                    f"{task} key/aid 长度不一致: {len(ka)} != {len(aa)}"
+                )
             ka.tofile(kf)
             aa.tofile(af)
             n_uniq_local = int(len(np.unique(ka)))
@@ -224,6 +233,11 @@ def scan_slice(table: str, b_start: int, b_end: int, tmp_dir: str,
             n_uniq_local = 0
         ai_key_parts = sorted(Path(tmp_dir).glob(f"{task}.mk*.part"))
         ai_aid_parts = sorted(Path(tmp_dir).glob(f"{task}.ma*.part"))
+        if len(ai_key_parts) != len(ai_aid_parts):
+            raise RuntimeError(
+                f"{task} AI key/aid part 数量不一致: "
+                f"{len(ai_key_parts)} != {len(ai_aid_parts)}"
+            )
         if ai_pairs:
             kai = np.concatenate([
                 np.fromfile(p, dtype=np.uint64) for p in ai_key_parts
@@ -231,6 +245,10 @@ def scan_slice(table: str, b_start: int, b_end: int, tmp_dir: str,
             aai = np.concatenate([
                 np.fromfile(p, dtype=np.uint32) for p in ai_aid_parts
             ])
+            if len(kai) != len(aai):
+                raise RuntimeError(
+                    f"{task} AI key/aid 长度不一致: {len(kai)} != {len(aai)}"
+                )
             kai.tofile(aikf)
             aai.tofile(aiaf)
             del kai, aai
