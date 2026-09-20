@@ -298,7 +298,6 @@ def main() -> None:
     t0 = datetime.now()
     handoff_manifests = require_handoff_manifests(paths)
     release_root = paths.output_dir / "release"
-    rel_src = release_root / "panel_v2"
     frozen_concepts = (
         paths.output_dir / "dictionary"
         / "skill_concept_bilingual_a_frozen_v1.1.csv"

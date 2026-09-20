@@ -147,7 +147,6 @@ def run(n: int) -> None:
 
     import pandas as pd
     top = sorted(net.items(), key=lambda kv: (-kv[1], kv[0]))[:200]
-    cdf = pd.DataFrame(top, columns=["term", "sample_df"])
     # top200 语义评审（§10.3.3：确定性 top10 相近词 + 模型判同概念/新/非技）
     gitems = [{"id": 800_000 + i, "term": t, "df": int(c),
                "cand": []} for i, (t, c) in enumerate(top)]

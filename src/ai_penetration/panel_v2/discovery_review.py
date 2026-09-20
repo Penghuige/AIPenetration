@@ -206,6 +206,31 @@ def _load_registry(
     return registry, exact, tier
 
 
+def _registry_hash(registry: pd.DataFrame) -> str:
+    """对初始 A/B/C 治理注册表做确定性哈希。
+
+    与 ``Retriever.dynamic_signature`` 互补：后者只覆盖本轮新增概念，
+    本函数固定评审开始时刻的 registry 状态，两者共同绑定候选评审的
+    缓存键与治理溯源。
+
+    Args:
+        registry: ``_load_registry`` 返回的注册表，列为
+            alias/skill_id/tier/canonical_zh/canonical_en/definition/category。
+
+    Returns:
+        排序后按列拼接内容的 SHA256 十六进制摘要。
+    """
+    cols = [
+        "alias", "skill_id", "tier",
+        "canonical_zh", "canonical_en", "definition", "category",
+    ]
+    ordered = registry.sort_values(
+        ["skill_id", "alias", "tier"], kind="stable",
+    )
+    payload = ordered[cols].to_csv(index=False, lineterminator="\n")
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 class Retriever:
     def __init__(self, registry: pd.DataFrame):
         self.registry = registry.reset_index(drop=True)
@@ -485,7 +510,6 @@ def review(candidates: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     final_ids = []
     for row in audit.itertuples():
         decision = str(row.decision)
-        df = int(row.df_unique_description)
         if decision.startswith("MATCH_EXISTING"):
             grade = str(row.existing_tier or "A")
             sid = str(row.final_skill_id)

@@ -1,4 +1,8 @@
-"""zh_alias_freq 去重口径纯函数与 numpy 聚合管线的离线测试。"""
+"""zh_alias_freq 去重口径纯函数与 numpy 聚合管线的离线测试。
+
+口径按指南 §10.3.2：freq_total = COUNT(DISTINCT normalized_text_hash)，
+平台不计入频数键——同一规范化岗位描述跨平台重复发布只计一次。
+"""
 from __future__ import annotations
 
 import numpy as np
@@ -7,31 +11,32 @@ from src.ai_penetration.zh_alias_freq import (
     aggregate_counts,
     build_automaton,
     normalize_desc,
-    platform_id,
     text_key,
 )
 
 
-def test_normalize_desc_strips_whitespace_and_lowercases():
-    assert normalize_desc("  深度 Learning\t\n AI ") == "深度learningai"
+def test_normalize_desc_folds_whitespace_and_lowercases():
+    """raw→match 链：小写化 + 连续空白折叠为单空格（match 态本身不删空白）。"""
+    assert normalize_desc("  深度 Learning\t\n AI ") == "深度 learning ai"
 
 
-def test_text_key_same_text_same_platform_stable():
+def test_text_key_same_text_ignores_layout_difference():
     k1 = text_key("负责 深度学习\n模型", "51Job")
     k2 = text_key("负责深度学习模型", "51Job")
     assert k1 == k2
 
 
-def test_text_key_cross_platform_distinct():
-    assert text_key("相同文本", "51Job") != text_key("相同文本", "BOSS直聘")
+def test_text_key_ignores_platform():
+    """§10.3.2：平台不计入频数键，同文本跨平台视为同一文档。"""
+    assert text_key("相同文本", "51Job") == text_key("相同文本", "BOSS直聘")
+    assert text_key("相同文本") == text_key("相同文本", "51Job")
 
 
-def test_platform_id_known_and_unknown():
-    assert platform_id("51Job") == 2
-    assert platform_id("  51Job ") == 2
-    pid_a, pid_b = platform_id("未知平台甲"), platform_id("未知平台乙")
-    assert 10 <= pid_a < 1024 and 10 <= pid_b < 1024
-    assert platform_id("未知平台甲") == pid_a  # 确定性
+def test_text_key_is_63bit_safe():
+    """text_hash 取 blake2b 8B 后压到 63bit，保证 int64 有符号安全。"""
+    for desc in ("相同文本", "深度学习工程师", "AI 训练师"):
+        key = text_key(desc, "51Job")
+        assert 0 <= key < (1 << 63)
 
 
 def test_automaton_matches_mixed_case_alias_on_lowered_text():

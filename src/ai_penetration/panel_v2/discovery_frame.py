@@ -21,7 +21,6 @@ import unicodedata
 from datetime import datetime
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import psycopg2
 import pyarrow as pa

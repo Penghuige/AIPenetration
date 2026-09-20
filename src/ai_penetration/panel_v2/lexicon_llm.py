@@ -19,7 +19,6 @@ import argparse
 import hashlib
 import json
 import logging
-import re
 import threading
 from datetime import datetime
 import unicodedata
