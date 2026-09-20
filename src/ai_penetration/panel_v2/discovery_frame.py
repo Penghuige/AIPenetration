@@ -49,6 +49,14 @@ def _sha(path: Path) -> str:
     return h.hexdigest()
 
 
+def _discovery_id(platform: str, text_hash_value: int) -> str:
+    """§6.2.0 唯一文本组身份，不复用可能多文本的原始岗位编号。"""
+    payload = (
+        str(platform) + "\x1f" + str(int(text_hash_value))
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _norm_meta(value, missing: str) -> str:
     text = unicodedata.normalize("NFKC", str(value or "")).strip()
     return text if text else missing
@@ -444,7 +452,7 @@ def build() -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     corpus_path = out_dir / "dictionary_discovery_corpus_v1.parquet"
     corpus_cols = [
-        "job_id", "year", "industry", "position_group", "company_size",
+        "job_id AS representative_job_id", "year", "industry", "position_group", "company_size",
         "text_length_bin", "tech_flag", "platform", "anchor_main",
         "matched_skill_count", "text_hash", "description",
         "company_id", "source_city", "source_raw_id",
@@ -452,7 +460,7 @@ def build() -> Path:
         "year_min", "year_max", "job_ids_json",
     ]
     types = {
-        "job_id": pa.int64(), "year": pa.int32(),
+        "representative_job_id": pa.int64(), "year": pa.int32(),
         "industry": pa.string(), "position_group": pa.string(),
         "company_size": pa.string(), "text_length_bin": pa.string(),
         "tech_flag": pa.int16(), "platform": pa.string(),
@@ -466,16 +474,26 @@ def build() -> Path:
     _export_table(FINAL, corpus_path, corpus_cols, types)
 
     frame_path = out_dir / "discovery_frame_v1.parquet"
-    frame_cols = [
-        "job_id", "year", "industry", "position_group", "company_size",
-        "text_length_bin", "tech_flag", "platform", "anchor_main",
-        "matched_skill_count", "text_hash", "description",
+    source_cols = [
+        "representative_job_id", "year", "industry", "position_group",
+        "company_size", "text_length_bin", "tech_flag", "platform",
+        "anchor_main", "matched_skill_count", "text_hash", "description",
     ]
     pf = pq.ParquetFile(corpus_path)
     writer = None
     try:
-        for rb in pf.iter_batches(batch_size=200000, columns=frame_cols):
+        for rb in pf.iter_batches(batch_size=200000, columns=source_cols):
             tbl = pa.Table.from_batches([rb])
+            platforms = tbl["platform"].to_pylist()
+            hashes = tbl["text_hash"].to_pylist()
+            did = pa.array(
+                [
+                    _discovery_id(p, h)
+                    for p, h in zip(platforms, hashes)
+                ],
+                pa.string(),
+            )
+            tbl = tbl.add_column(0, "job_id", did)
             if writer is None:
                 writer = pq.ParquetWriter(
                     frame_path, tbl.schema, compression="zstd"
@@ -490,7 +508,8 @@ def build() -> Path:
     manifest = {
         "status": "formal_pass",
         "created_at": datetime.now().isoformat(timespec="seconds"),
-        "protocol": "global_distinct_platform_text_hash_representative_v1",
+        "protocol": "global_distinct_platform_text_hash_representative_v2",
+        "discovery_job_id_formula": "SHA256(platform | text_hash)",
         "representative_rule": [
             "industry_present_desc", "company_size_present_desc",
             "year_asc", "stable_job_id_asc",
