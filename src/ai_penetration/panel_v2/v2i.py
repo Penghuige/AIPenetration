@@ -80,6 +80,53 @@ def require_handoff_manifests(paths) -> list[Path]:
             raise RuntimeError(
                 f"上游 manifest 未通过: {path.name} status={payload.get('status')!r}"
             )
+    selection = json.loads(
+        (paths.report_dir / "model_selection_manifest_v1.json")
+        .read_text(encoding="utf-8")
+    )
+    prerun = json.loads(
+        (paths.report_dir / "model_benchmark_prerun_manifest_v1.json")
+        .read_text(encoding="utf-8")
+    )
+    extraction = json.loads(
+        (
+            paths.output_dir / "llm_review" / "formal_discovery_v1"
+            / "extraction_manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    review = json.loads(
+        (
+            paths.output_dir / "dictionary"
+            / "formal_discovery_review_manifest_v1.json"
+        ).read_text(encoding="utf-8")
+    )
+    model_cfg = paths.config_dir / "model_config_v1.yaml"
+    model_cfg_sha = sha256_file(model_cfg)
+    if selection.get("production_config_sha256") != model_cfg_sha:
+        raise RuntimeError(
+            "model selection 绑定的 production config 与当前 model_config_v1 不一致"
+        )
+    if prerun.get("config_sha256") != model_cfg_sha:
+        raise RuntimeError(
+            "1万条 prerun 不是由当前 model_config_v1 运行"
+        )
+    if prerun.get("model_signature") != selection.get("selected_model_signature"):
+        raise RuntimeError(
+            "prerun 模型签名与 model selection 选中模型不一致"
+        )
+    cfg = json.loads(json.dumps(
+        __import__("yaml").safe_load(model_cfg.read_text(encoding="utf-8"))
+    ))
+    expected_revision = str(cfg["model"]["revision"])
+    expected_repo = str(cfg["model"]["repository"])
+    if extraction.get("model_revision") != expected_revision:
+        raise RuntimeError("formal discovery extraction 模型 revision 与生产配置不一致")
+    if review.get("model_revision") != expected_revision:
+        raise RuntimeError("formal discovery review 模型 revision 与生产配置不一致")
+    if review.get("model_repository") != expected_repo:
+        raise RuntimeError("formal discovery review 模型 repository 与生产配置不一致")
+    if review.get("model_config_sha256") != model_cfg_sha:
+        raise RuntimeError("formal discovery review 未绑定当前 model_config_v1")
     return required
 
 
