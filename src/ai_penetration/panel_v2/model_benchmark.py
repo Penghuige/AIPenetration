@@ -346,7 +346,7 @@ def run(
                     except Exception as exc:
                         valid = False
                         error = f"{type(exc).__name__}: {exc}"
-                        details = (0, 0, 0, 0, (), [])
+                        details = (0, 0, 0, 0, 0, (), [])
                     finally:
                         inference_seconds += time.perf_counter() - t0
                     if valid or attempt > retry_invalid:
