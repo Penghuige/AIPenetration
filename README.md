@@ -133,17 +133,13 @@ python -m src.ai_penetration.freeze_external_dictionary
 冻结器必须生成三个 §7.6.7 Parquet，translation verifier 必须生成
 `external_translation_log_v1.jsonl`；缺任意一件时 v2i 拒绝发布。
 
-### 2. 主样本去重与 pre-discovery v3 词典
+### 2. 主样本去重与当前全量 legacy 频数
 
 ```bash
 python -m src.ai_penetration.panel_v2.dedup
 
 python -m src.ai_penetration.panel_v2.legacy_freq \
   --tag legacy_df_freq_v1
-
-python -m src.ai_penetration.panel_v2.lexicon_llm t1
-python -m src.ai_penetration.panel_v2.lexicon_llm t2
-python -m src.ai_penetration.panel_v2.lexicon_llm merge
 ```
 
 `legacy_df_freq_v1.csv` 的 B/C 证据来自全量规范化文本：
@@ -179,7 +175,19 @@ python -m src.ai_penetration.panel_v2.model_benchmark run \
   --sample-file <10000条预运行.jsonl>
 ```
 
-### 4. 构建正式 discovery corpus / frame
+### 4. 用冻结 production Qwen 生成 pre-discovery v3，再构建 frame
+
+```bash
+python -m src.ai_penetration.panel_v2.lexicon_llm t1
+python -m src.ai_penetration.panel_v2.lexicon_llm t2
+python -m src.ai_penetration.panel_v2.lexicon_llm merge
+```
+
+T1/T2 会强制检查 `model_runtime.yaml` 与冻结的
+`model_config_v1.yaml` 是同一个 production 模型，并生成
+`skill_legacy_governance_manifest_v3.json`。
+
+随后构建正式 discovery corpus / frame：
 
 ```bash
 python -m src.ai_penetration.panel_v2.discovery_frame
