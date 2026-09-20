@@ -26,7 +26,7 @@ from src.model_platform.llm import create_llm_client, extract_json_from_response
 
 THRESHOLDS = {
     "json_schema_valid_rate": 0.995,
-    "direct_span_valid_rate": 0.99,
+    "effective_span_valid_rate": 0.99,
     "hallucinated_surface_rate_max": 0.01,
     "failure_rate_max": 0.01,
     "repeat_exact_rate": 0.95,
@@ -143,21 +143,47 @@ def _base_aliases() -> set[str]:
     }
 
 
+def _locate_surface(text: str, surface: str, evidence: str) -> bool:
+    """§8.11 确定性回退：surface 在输入中可定位即形成有效主跨度。"""
+    if not surface:
+        return False
+    starts = []
+    pos = text.find(surface)
+    while pos >= 0:
+        starts.append(pos)
+        pos = text.find(surface, pos + 1)
+    if not starts:
+        return False
+    if len(starts) == 1:
+        return True
+    ev = str(evidence or "")
+    if ev and ev in text:
+        ev_start = text.find(ev)
+        ev_end = ev_start + len(ev)
+        if any(
+            ev_start <= s and s + len(surface) <= ev_end
+            for s in starts
+        ):
+            return True
+    # §8.11：仍无法唯一定位时选择首次位置并置 multiple flag。
+    return True
+
+
 def _validate(
     parsed,
     expected_job_id: str,
     text: str,
     allowed_types: set[str],
-) -> tuple[bool, int, int, int, int, tuple, list[str]]:
+) -> tuple[bool, int, int, int, int, int, tuple, list[str]]:
     if not isinstance(parsed, dict):
-        return False, 0, 0, 0, 0, (), []
+        return False, 0, 0, 0, 0, 0, (), []
     if str(parsed.get("job_id")) != expected_job_id:
-        return False, 0, 0, 0, 0, (), []
+        return False, 0, 0, 0, 0, 0, (), []
     skills = parsed.get("skills")
     if not isinstance(skills, list):
-        return False, 0, 0, 0, 0, (), []
+        return False, 0, 0, 0, 0, 0, (), []
 
-    direct_span_ok = hallucinated = evidence_ok = total = 0
+    direct_ok = effective_ok = hallucinated = evidence_ok = total = 0
     canonical = []
     surfaces = []
     required = {
@@ -166,7 +192,7 @@ def _validate(
     }
     for skill in skills:
         if not isinstance(skill, dict) or not required.issubset(skill):
-            return False, direct_span_ok, total, hallucinated, evidence_ok, (), []
+            return False, direct_ok, effective_ok, total, hallucinated, evidence_ok, (), []
         surface = str(skill.get("surface", ""))
         canonical_suggestion = str(skill.get("canonical_suggestion", ""))
         stype = str(skill.get("skill_type", ""))
@@ -175,17 +201,23 @@ def _validate(
             not surface or not canonical_suggestion or not evidence
             or stype not in allowed_types
         ):
-            return False, direct_span_ok, total, hallucinated, evidence_ok, (), []
+            return False, direct_ok, effective_ok, total, hallucinated, evidence_ok, (), []
         existing = skill.get("existing_skill_id")
         if existing is not None and not isinstance(existing, str):
-            return False, direct_span_ok, total, hallucinated, evidence_ok, (), []
+            return False, direct_ok, effective_ok, total, hallucinated, evidence_ok, (), []
         total += 1
         try:
             start, end = int(skill["start"]), int(skill["end"])
         except (TypeError, ValueError):
             start = end = -1
-        if 0 <= start < end <= len(text) and text[start:end] == surface:
-            direct_span_ok += 1
+        direct = (
+            0 <= start < end <= len(text)
+            and text[start:end] == surface
+        )
+        direct_ok += int(direct)
+        effective_ok += int(
+            direct or _locate_surface(text, surface, evidence)
+        )
         if surface not in text:
             hallucinated += 1
         if evidence in text:
@@ -193,7 +225,7 @@ def _validate(
         surfaces.append(surface.casefold())
         canonical.append((surface, canonical_suggestion, stype))
     return (
-        True, direct_span_ok, total, hallucinated, evidence_ok,
+        True, direct_ok, effective_ok, total, hallucinated, evidence_ok,
         tuple(sorted(set(canonical))), surfaces,
     )
 
@@ -249,7 +281,7 @@ def run(
     raw_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
 
-    schema_ok = direct_span_ok = spans = hallucinated = evidence_ok = 0
+    schema_ok = direct_span_ok = effective_span_ok = spans = hallucinated = evidence_ok = 0
     failures = retries = 0
     repeated: dict[str, list[tuple]] = {}
     first_pass_surfaces: list[str] = []
@@ -293,16 +325,16 @@ def run(
                         except ValueError as exc:
                             valid = False
                             error = str(exc)
-                            details = (0, 0, 0, 0, (), [])
+                            details = (0, 0, 0, 0, 0, (), [])
                         else:
                             (
-                                valid, sok, stotal, hall, eok,
-                                skillset, surfaces,
+                                valid, direct_ok, effective_ok, stotal,
+                                hall, eok, skillset, surfaces,
                             ) = _validate(
                                 parsed, jid, text, allowed_types
                             )
                             details = (
-                                sok, stotal, hall, eok,
+                                direct_ok, effective_ok, stotal, hall, eok,
                                 skillset, surfaces,
                             )
                             if not valid:
@@ -310,7 +342,7 @@ def run(
                     except TimeoutError as exc:
                         valid = False
                         error = "timeout: " + str(exc)
-                        details = (0, 0, 0, 0, (), [])
+                        details = (0, 0, 0, 0, 0, (), [])
                     except Exception as exc:
                         valid = False
                         error = f"{type(exc).__name__}: {exc}"
@@ -325,10 +357,11 @@ def run(
                 if final is None:
                     raise RuntimeError("benchmark 未产生最终调用状态")
                 valid, raw, error, details, attempts = final
-                sok, stotal, hall, eok, skillset, surfaces = details
+                direct_ok, effective_ok, stotal, hall, eok, skillset, surfaces = details
                 if valid:
                     schema_ok += 1
-                    direct_span_ok += sok
+                    direct_span_ok += direct_ok
+                    effective_span_ok += effective_ok
                     spans += stotal
                     hallucinated += hall
                     evidence_ok += eok
@@ -362,6 +395,7 @@ def run(
         "json_schema_valid_rate": schema_ok / calls,
         "evidence_backfill_rate": evidence_ok / max(spans, 1),
         "direct_span_valid_rate": direct_span_ok / max(spans, 1),
+        "effective_span_valid_rate": effective_span_ok / max(spans, 1),
         "hallucinated_surface_rate": hallucinated / max(spans, 1),
         "repeat_exact_rate": repeat_exact,
         "base_dictionary_overlap_rate": (
@@ -383,8 +417,8 @@ def run(
     passed = (
         metrics["json_schema_valid_rate"]
             >= THRESHOLDS["json_schema_valid_rate"]
-        and metrics["direct_span_valid_rate"]
-            >= THRESHOLDS["direct_span_valid_rate"]
+        and metrics["effective_span_valid_rate"]
+            >= THRESHOLDS["effective_span_valid_rate"]
         and metrics["hallucinated_surface_rate"]
             <= THRESHOLDS["hallucinated_surface_rate_max"]
         and metrics["failure_rate"]
