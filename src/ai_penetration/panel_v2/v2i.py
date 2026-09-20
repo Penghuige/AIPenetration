@@ -63,6 +63,7 @@ def require_handoff_manifests(paths) -> list[Path]:
         paths.output_dir / "dictionary" / "external_translation_completion_manifest_v1.json",
         paths.report_dir / "model_selection_manifest_v1.json",
         paths.report_dir / "model_benchmark_prerun_manifest_v1.json",
+        paths.output_dir / "dictionary" / "discovery_frame_manifest_v1.json",
         paths.output_dir / "dictionary" / "formal_discovery_manifest_v1.json",
         paths.output_dir / "llm_review" / "formal_discovery_v1" / "extraction_manifest.json",
         paths.output_dir / "dictionary" / "formal_discovery_review_manifest_v1.json",
@@ -125,6 +126,26 @@ def require_handoff_manifests(paths) -> list[Path]:
         raise RuntimeError("formal discovery review 模型 repository 与生产配置不一致")
     if review.get("model_config_sha256") != model_cfg_sha:
         raise RuntimeError("formal discovery review 未绑定当前 model_config_v1")
+    frame_manifest_path = (
+        paths.output_dir / "dictionary" / "discovery_frame_manifest_v1.json"
+    )
+    formal_discovery_path = (
+        paths.output_dir / "dictionary" / "formal_discovery_manifest_v1.json"
+    )
+    frame_manifest = json.loads(
+        frame_manifest_path.read_text(encoding="utf-8")
+    )
+    formal_discovery = json.loads(
+        formal_discovery_path.read_text(encoding="utf-8")
+    )
+    if formal_discovery.get("frame_manifest_sha256") != sha256_file(frame_manifest_path):
+        raise RuntimeError(
+            "formal discovery 未绑定当前 discovery frame manifest"
+        )
+    if formal_discovery.get("frame_sha256") != frame_manifest.get("frame_sha256"):
+        raise RuntimeError(
+            "formal discovery 使用的 frame 与当前 discovery frame 不一致"
+        )
     return required
 
 
