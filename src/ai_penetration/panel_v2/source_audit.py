@@ -113,7 +113,9 @@ def audit(snapshot_id: str):
         total = _one(cur, f"SELECT count(*) FROM public.{job_table}")
         cur.execute(
             f"""SELECT
-                count(*) FILTER (WHERE recruit_id IS NULL),
+                count(*) FILTER (
+                    WHERE recruit_id IS NULL OR trim(recruit_id::text)=''
+                ),
                 count(*) FILTER (WHERE position IS NULL OR trim(position)=''),
                 count(*) FILTER (
                     WHERE job_description IS NULL OR trim(job_description)=''
@@ -140,7 +142,7 @@ def audit(snapshot_id: str):
             blocking.append(job_table + " 岗位描述整体缺失")
 
         cur.execute(
-            f"""SELECT substr(publish_time,1,4) AS y, count(*)
+            f"""SELECT substr(publish_time::text,1,4) AS y, count(*)
                 FROM public.{job_table}
                 GROUP BY 1 ORDER BY 1"""
         )
