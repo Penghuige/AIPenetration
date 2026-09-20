@@ -66,13 +66,21 @@ def _load_config() -> tuple[dict, Path]:
     paths = get_project_paths()
     path = paths.config_dir / CONFIG_NAME
     cfg = load_config_yaml(CONFIG_NAME)
-    company_col = str(
-        cfg.get("source", {}).get("company_size_column", "")
-    ).strip()
+    source_cfg = cfg.get("source", {})
+    industry_source = str(source_cfg.get("industry_source", "")).strip()
+    industry_col = str(source_cfg.get("industry_column", "")).strip()
+    company_source = str(source_cfg.get("company_size_source", "")).strip()
+    company_col = str(source_cfg.get("company_size_column", "")).strip()
     tech_regex = str(
         cfg.get("tech_flag", {}).get("position_regex", "")
     ).strip()
     bad = []
+    if industry_source not in {"job", "ent"}:
+        bad.append("source.industry_source")
+    if not industry_col or industry_col == "TO_BE_CONFIRMED":
+        bad.append("source.industry_column")
+    if company_source not in {"job", "ent"}:
+        bad.append("source.company_size_source")
     if not company_col or company_col == "TO_BE_CONFIRMED":
         bad.append("source.company_size_column")
     if not tech_regex or tech_regex == "TO_BE_CONFIRMED":
@@ -318,9 +326,10 @@ def _scan_source(cfg: dict, lex) -> dict:
                     pos_group = normalize_position(str(position))
                     hits = match_all_versions(match)
                     matched = len(lex.extract(match))
+                    raw_platform = str(platform or "").strip()
                     platform_s = _norm_meta(platform, "PLATFORM_MISSING")
                     buf.append((
-                        int(_stable_job_id(platform_s, str(rid))),
+                        int(_stable_job_id(raw_platform, str(rid))),
                         int(year_s),
                         _norm_meta(industry, "INDUSTRY_MISSING"),
                         pos_group or "POSITION_MISSING",
