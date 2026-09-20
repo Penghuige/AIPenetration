@@ -3,9 +3,9 @@
 version: discovery_strata_v1
 
 source:
-  industry_source: ent
-  industry_column: industry_code
-  company_size_source: ent
+  industry_source: TO_BE_CONFIRMED
+  industry_column: TO_BE_CONFIRMED
+  company_size_source: TO_BE_CONFIRMED
   company_size_column: TO_BE_CONFIRMED
 
 position_group:
