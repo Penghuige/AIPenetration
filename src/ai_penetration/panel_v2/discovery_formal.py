@@ -194,6 +194,7 @@ def saturation_pass(metrics: pd.DataFrame) -> bool:
 
 
 def build_round_metrics(
+    selected_path: Path,
     candidate_audit_path: Path,
     out_path: Path,
     coverage_path: Path | None = None,
@@ -207,11 +208,18 @@ def build_round_metrics(
             "candidate audit 缺 metrics 字段: "
             + ", ".join(sorted(missing))
         )
+    selected = pd.read_csv(selected_path)
+    if "discovery_round" not in selected.columns:
+        raise ValueError("selected sample 缺 discovery_round")
     rounds = sorted(
-        {int(x) for x in audit.source_round.dropna().astype(int)}
+        {int(x) for x in selected.discovery_round.dropna().astype(int)}
     )
     if not rounds:
-        raise ValueError("candidate audit 无 source_round")
+        raise ValueError("selected sample 无 discovery_round")
+    if rounds[0] != 0 or rounds != list(range(rounds[-1] + 1)):
+        raise ValueError(
+            f"discovery_round 必须从0连续递增，当前={rounds}"
+        )
     accepted = audit[
         (audit.decision.astype(str) == "NEW_CONCEPT")
         & audit.final_grade.isin(["B", "C"])
@@ -408,6 +416,7 @@ def main() -> None:
     r.add_argument("--round", type=int, required=True)
     r.add_argument("--out", type=Path, required=True)
     m = sub.add_parser("metrics")
+    m.add_argument("--selected", type=Path, required=True)
     m.add_argument("--candidate-audit", type=Path, required=True)
     m.add_argument("--coverage", type=Path)
     m.add_argument("--out", type=Path, required=True)
@@ -440,7 +449,8 @@ def main() -> None:
         out.to_csv(args.out, index=False, encoding="utf-8-sig")
     elif args.cmd == "metrics":
         build_round_metrics(
-            args.candidate_audit, args.out, args.coverage
+            args.selected, args.candidate_audit,
+            args.out, args.coverage
         )
     else:
         finalize(args.frame, args.frame_manifest, args.selected, args.metrics,
