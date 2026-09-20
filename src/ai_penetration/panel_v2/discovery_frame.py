@@ -145,6 +145,36 @@ def _validate_source_fields(cfg: dict) -> None:
         conn.close()
 
 
+def _verify_source_snapshot(audit: dict) -> None:
+    """开始 discovery 前重新核对数据库/表行数，避免快照标签漂移。"""
+    conn = psycopg2.connect(**eps_conn_params())
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT current_database()")
+        database = str(cur.fetchone()[0])
+        if database != str(audit.get("database", "")):
+            raise RuntimeError(
+                f"当前数据库 {database!r} != source audit {audit.get('database')!r}"
+            )
+        tables = audit.get("tables")
+        if not isinstance(tables, dict) or not tables:
+            raise RuntimeError("source audit manifest 缺 tables 快照统计")
+        drift = []
+        for table, meta in tables.items():
+            cur.execute(f"SELECT count(*) FROM public.{table}")
+            now = int(cur.fetchone()[0])
+            expected = int(meta.get("rows", -1))
+            if now != expected:
+                drift.append(f"{table}:{expected}->{now}")
+        if drift:
+            raise RuntimeError(
+                "源数据库已偏离审计快照，拒绝 discovery: "
+                + ", ".join(drift[:10])
+            )
+    finally:
+        conn.close()
+
+
 def _pre_discovery_lexicon():
     paths = get_project_paths()
     path = (
@@ -451,6 +481,7 @@ def build() -> Path:
     audit = json.loads(audit_manifest.read_text(encoding="utf-8"))
     if audit.get("status") != "formal_pass":
         raise RuntimeError("source_db_manifest_v1 未 formal_pass")
+    _verify_source_snapshot(audit)
 
     lex, v3_path = _pre_discovery_lexicon()
     _create_stage()
