@@ -57,12 +57,12 @@ def _results_conn():
 
 
 def export_master(out_dir: Path) -> None:
-    """job_master → 4 个排序裸 .npy（mmap 真共享）。原子写（M9）。
+    """job_master → 排序裸 .npy（mmap 真共享），原子写。
 
-    过滤键 = h63(job_id_raw)（**rid-only 定稿**，2026-09-08 三迭代结论：
-    复合键 (plat,city,rid) 因 pmap 采样对长尾平台编码覆盖缺口实证漏命中
-    9,867 例已弃用；master rid 全局唯一由下方碰撞断言保证）。
-    复用需过版号戳校验（审计 D2：三件存在≠同代）。
+    过滤键直接使用去重阶段的稳定 job_id（完整 SHA256(platform|raw_id) 的
+    63-bit 计算代理）；pass2 对原始行用同一公式重算，再用 canonical city +
+    text_hash 复核，避免 rid-only 或平台采样编码旁路。复用必须同时通过
+    master 与 scan pipeline 版号戳。
     """
     npy_dir = out_dir / "master_npy"
     stamp = npy_dir / ".stamp.json"
