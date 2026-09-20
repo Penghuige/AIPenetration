@@ -162,3 +162,21 @@ def test_ambiguous_active_alias_without_primary_fails_closed():
     ]
     with pytest.raises(RuntimeError, match="primary_skill_id"):
         resolve_active_alias_records(rows)
+
+
+def test_single_letter_r_is_preserved_with_ascii_boundary():
+    lex = build_union_lexicon(
+        legacy_terms=["R"],
+        aliases=[],
+    )
+    assert LEGACY_PREFIX + "r" in lex.extract(normalize_desc("熟悉 R 与 Python"))
+    assert LEGACY_PREFIX + "r" not in lex.extract(normalize_desc("熟悉 React"))
+
+
+def test_cpp_version_suffix_uses_special_boundary_rule():
+    lex = build_union_lexicon(
+        legacy_terms=["C++"],
+        aliases=[],
+    )
+    assert LEGACY_PREFIX + "c++" in lex.extract(normalize_desc("要求 C++17 开发经验"))
+    assert LEGACY_PREFIX + "c++" not in lex.extract(normalize_desc("abc++tool"))
