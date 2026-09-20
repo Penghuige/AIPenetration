@@ -184,11 +184,67 @@ def saturation_pass(metrics: pd.DataFrame) -> bool:
     missing = required - set(metrics.columns)
     if missing:
         raise ValueError("round metrics 缺列: " + ", ".join(sorted(missing)))
-    if len(metrics) < 2:
+    incremental = metrics[metrics["round"].astype(int) > 0].copy()
+    if len(incremental) < 2:
         return False
-    last = metrics.sort_values("round").tail(2)
+    last = incremental.sort_values("round").tail(2)
+    if int(last["round"].iloc[1]) != int(last["round"].iloc[0]) + 1:
+        return False
     return bool((last.new_standard_concepts < 5).all())
 
+
+def build_round_metrics(
+    candidate_audit_path: Path,
+    out_path: Path,
+    coverage_path: Path | None = None,
+) -> Path:
+    """从候选审计自动生成停止指标；覆盖率仅作为监测字段。"""
+    audit = pd.read_csv(candidate_audit_path)
+    required = {"source_round", "decision", "final_grade"}
+    missing = required - set(audit.columns)
+    if missing:
+        raise ValueError(
+            "candidate audit 缺 metrics 字段: "
+            + ", ".join(sorted(missing))
+        )
+    rounds = sorted(
+        {int(x) for x in audit.source_round.dropna().astype(int)}
+    )
+    if not rounds:
+        raise ValueError("candidate audit 无 source_round")
+    accepted = audit[
+        (audit.decision.astype(str) == "NEW_CONCEPT")
+        & audit.final_grade.isin(["B", "C"])
+    ].copy()
+    new_counts = (
+        accepted.groupby(accepted.source_round.astype(int))
+        .size().to_dict()
+    )
+    coverage: dict[int, float] = {}
+    if coverage_path is not None:
+        cov = pd.read_csv(coverage_path)
+        if not {"round", "coverage_gain_pp"} <= set(cov.columns):
+            raise ValueError(
+                "coverage monitor CSV 必须含 round,coverage_gain_pp"
+            )
+        if cov["round"].astype(int).duplicated().any():
+            raise ValueError("coverage monitor round 重复")
+        coverage = {
+            int(r): float(v)
+            for r, v in zip(cov["round"], cov["coverage_gain_pp"])
+        }
+    rows = [
+        {
+            "round": r,
+            "new_standard_concepts": int(new_counts.get(r, 0)),
+            "coverage_gain_pp": coverage.get(r, np.nan),
+        }
+        for r in rounds
+    ]
+    out = pd.DataFrame(rows).sort_values("round")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out.to_csv(out_path, index=False, encoding="utf-8-sig")
+    return out_path
 
 def finalize(
     frame_path: Path,
@@ -351,6 +407,10 @@ def main() -> None:
     r.add_argument("--selected", type=Path, required=True)
     r.add_argument("--round", type=int, required=True)
     r.add_argument("--out", type=Path, required=True)
+    m = sub.add_parser("metrics")
+    m.add_argument("--candidate-audit", type=Path, required=True)
+    m.add_argument("--coverage", type=Path)
+    m.add_argument("--out", type=Path, required=True)
     f = sub.add_parser("finalize")
     f.add_argument("--frame", type=Path, required=True)
     f.add_argument("--frame-manifest", type=Path, required=True)
@@ -378,6 +438,10 @@ def main() -> None:
             raise RuntimeError("累计 discovery selected 出现重复 job_id")
         args.out.parent.mkdir(parents=True, exist_ok=True)
         out.to_csv(args.out, index=False, encoding="utf-8-sig")
+    elif args.cmd == "metrics":
+        build_round_metrics(
+            args.candidate_audit, args.out, args.coverage
+        )
     else:
         finalize(args.frame, args.frame_manifest, args.selected, args.metrics,
                  args.candidate_audit, args.governance)
