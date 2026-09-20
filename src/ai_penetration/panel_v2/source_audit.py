@@ -109,6 +109,12 @@ def audit(snapshot_id: str):
             warnings.append(ent_table + " 缺 company_id，去重/LOO能力下降")
         if "industry_code" not in e_names:
             warnings.append(ent_table + " 缺 industry_code，正式分层发现无法完成")
+        ent_total = _one(cur, f"SELECT count(*) FROM public.{ent_table}")
+        table_stats[ent_table] = {
+            "city": city,
+            "rows": int(ent_total),
+            "table_role": "enterprise",
+        }
 
         total = _one(cur, f"SELECT count(*) FROM public.{job_table}")
         cur.execute(
@@ -130,7 +136,7 @@ def audit(snapshot_id: str):
         (missing_id, missing_pos, missing_desc, short_desc,
          min_date, max_date) = cur.fetchone()
         table_stats[job_table] = {
-            "city": city, "rows": int(total),
+            "city": city, "rows": int(total), "table_role": "job",
             "missing_recruit_id": int(missing_id),
             "missing_position": int(missing_pos),
             "missing_description": int(missing_desc),
