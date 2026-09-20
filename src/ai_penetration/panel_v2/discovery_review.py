@@ -251,6 +251,38 @@ class Retriever:
             })
         return out
 
+    def add_concept(
+        self, *, term: str, skill_id: str, tier: str, skill_type: str
+    ) -> None:
+        """把本轮已接受的新 B/C 概念加入后续候选的确定性检索库。"""
+        key = _norm(term)
+        row = {
+            "alias": key,
+            "skill_id": str(skill_id),
+            "tier": str(tier),
+            "canonical_zh": key,
+            "canonical_en": "",
+            "definition": "",
+            "category": str(skill_type),
+        }
+        i = len(self.registry)
+        self.registry.loc[i] = row
+        bgs = _bigrams(key)
+        self.alias_bigrams.append(bgs)
+        for bg in bgs:
+            self.index.setdefault(bg, []).append(i)
+
+    def dynamic_signature(self) -> str:
+        """当前检索库状态哈希，进入 review cache key。"""
+        payload = (
+            self.registry[[
+                "alias", "skill_id", "tier", "category"
+            ]]
+            .fillna("").astype(str)
+            .to_csv(index=False, lineterminator="\n")
+            .encode("utf-8")
+        )
+        return hashlib.sha256(payload).hexdigest()
 
 SYSTEM = (
     "你是技能概念归一化评审。给定招聘语料候选技能及至多10个现有概念。"
@@ -261,6 +293,18 @@ SYSTEM = (
     "只输出一个 JSON 对象。"
 )
 
+
+def _new_concept_grade(row, new_tech: bool) -> str:
+    df = int(row.df_unique_description)
+    if df >= 100:
+        return "B"
+    if 10 <= df < 100:
+        return "C"
+    if df >= 5 and (
+        float(row.candidate_anchor_cooc) >= 0.50 or bool(new_tech)
+    ):
+        return "C"
+    return "D"
 
 def review(candidates: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     paths = get_project_paths()
@@ -288,9 +332,13 @@ def review(candidates: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
             if key:
                 cached[key] = rec
 
+    ordered = candidates.sort_values(
+        ["df_unique_description", "term"],
+        ascending=[False, True], kind="stable",
+    ).reset_index(drop=True)
     results = []
     with cache_path.open("a", encoding="utf-8") as fh:
-        for row in candidates.itertuples(index=False):
+        for row in ordered.itertuples(index=False):
             term = _norm(row.term)
             exact_ids = exact.get(term, set())
             if len(exact_ids) == 1:
@@ -325,7 +373,8 @@ def review(candidates: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
                 cache_key = hashlib.sha256(
                     "|".join([
                         term, revision, prompt_sha, registry_sha,
-                        RETRIEVAL_VERSION,
+                        retriever.dynamic_signature(),
+                        REVIEW_VERSION, RETRIEVAL_VERSION,
                         hashlib.sha256(payload_text.encode("utf-8")).hexdigest(),
                     ]).encode("utf-8")
                 ).hexdigest()
@@ -398,15 +447,32 @@ def review(candidates: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
                         "registry_sha256": registry_sha,
                         "review_prompt_sha256": prompt_sha,
                         "retrieval_version": RETRIEVAL_VERSION,
+        "dynamic_new_concept_registry": True,
                     }
                     fh.write(
                         json.dumps(rec, ensure_ascii=False) + "\n"
                     )
                     fh.flush()
+            if str(rec.get("decision")) == "NEW_CONCEPT":
+                provisional_grade = _new_concept_grade(
+                    row, bool(rec.get("new_tech", False))
+                )
+                if provisional_grade in {"B", "C"}:
+                    sid = stable_bc_skill_id(
+                        term, int(row.first_year)
+                    )
+                    rec["final_skill_id"] = sid
+                    rec["existing_tier"] = provisional_grade
+                    retriever.add_concept(
+                        term=term, skill_id=sid,
+                        tier=provisional_grade,
+                        skill_type=str(rec.get("skill_type", "other_skill")),
+                    )
+                    tiers[sid] = provisional_grade
+                    exact.setdefault(term, set()).add(sid)
             results.append(rec)
 
-    review_df = pd.DataFrame(results)
-    audit = candidates.merge(
+    review_df = pd.DataFrame(results)    audit = candidates.merge(
         review_df, on="term", how="left", validate="one_to_one"
     )
     grades = []
@@ -420,20 +486,14 @@ def review(candidates: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
         elif decision in {"AMBIGUOUS", "AMBIGUOUS_EXACT", "NOT_SKILL"}:
             grade, sid = "D", ""
         elif decision == "NEW_CONCEPT":
-            if df >= 100:
-                grade = "B"
-            elif 10 <= df < 100:
-                grade = "C"
-            elif df >= 5 and (
-                float(row.candidate_anchor_cooc) >= 0.50
-                or bool(row.new_tech)
-            ):
-                grade = "C"
-            else:
-                grade = "D"
+            grade = _new_concept_grade(row, bool(row.new_tech))
             sid = (
-                stable_bc_skill_id(str(row.term), int(row.first_year))
-                if grade in {"B", "C"} else ""
+                str(row.final_skill_id)
+                if grade in {"B", "C"} and str(row.final_skill_id).strip()
+                else (
+                    stable_bc_skill_id(str(row.term), int(row.first_year))
+                    if grade in {"B", "C"} else ""
+                )
             )
         else:
             raise RuntimeError(f"不可识别决策: {decision}")
