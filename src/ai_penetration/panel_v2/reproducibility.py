@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import platform
 import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
+import importlib.metadata
 
 from config.paths import get_project_paths, load_config_yaml
 
@@ -49,7 +51,8 @@ def _code_fingerprint(root: Path) -> str:
     h = hashlib.sha256()
     files = sorted((root / "src").rglob("*.py"))
     files += sorted((root / "config").rglob("*.py"))
-    files += sorted((root / "config").glob("*.yaml"))
+    for pattern in ("*.yaml", "*.json", "*.md"):
+        files += sorted((root / "config").glob(pattern))
     for path in files:
         rel = path.relative_to(root).as_posix()
         h.update(rel.encode("utf-8"))
@@ -110,6 +113,21 @@ def _records(
     return names, hashes, rows
 
 
+def environment_versions() -> dict[str, str]:
+    """记录会影响正式计算的解释器和关键依赖版本。"""
+    packages = ["numpy", "pandas", "pyarrow", "scipy", "psycopg2-binary", "PyYAML"]
+    out = {
+        "python": platform.python_version(),
+        "implementation": platform.python_implementation(),
+    }
+    for name in packages:
+        try:
+            out[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            out[name] = "NOT_INSTALLED"
+    return out
+
+
 def write_run_manifest(
     release_dir: Path,
     *,
@@ -131,13 +149,21 @@ def write_run_manifest(
     inp, inp_sha, inp_rows = _records(input_paths, root)
     out, out_sha, out_rows = _records(output_paths, root)
 
-    config_files = sorted(paths.config_dir.glob("*.yaml"))
+    config_files = []
+    for pattern in ("*.yaml", "*.json", "*.md"):
+        config_files += sorted(paths.config_dir.glob(pattern))
     config_sha = {
         p.relative_to(root).as_posix(): sha256_file(p)
         for p in config_files
     }
-    model_cfg = load_config_yaml("model_runtime.yaml")
-    llm_cfg = model_cfg.get("llm", {}) if isinstance(model_cfg, dict) else {}
+    runtime_cfg = load_config_yaml("model_runtime.yaml")
+    llm_cfg = (
+        runtime_cfg.get("llm", {})
+        if isinstance(runtime_cfg, dict) else {}
+    )
+    production_cfg = load_config_yaml("model_config_v1.yaml")
+    protocol_cfg = production_cfg.get("protocol", {})
+    model_cfg = production_cfg.get("model", {})
 
     manifest = {
         "run_id": run_id,
@@ -145,13 +171,17 @@ def write_run_manifest(
         "finished_at": datetime.now().isoformat(timespec="seconds"),
         "git_commit_or_code_hash": code_revision(root),
         "code_tree_sha256": _code_fingerprint(root),
+        "environment_versions": environment_versions(),
         "input_file_paths": inp,
         "input_file_sha256": inp_sha,
         "input_row_counts": inp_rows,
         "dictionary_version": dictionary_version,
         "anchor_version": anchor_version,
-        "prompt_version": "not_used_in_v2h_release_rebuild",
-        "model_revision": str(llm_cfg.get("model", "not_used")),
+        "prompt_version": str(protocol_cfg.get("prompt_version", "")),
+        "schema_version": str(protocol_cfg.get("schema_version", "")),
+        "model_repository": str(model_cfg.get("repository", "")),
+        "model_revision": str(model_cfg.get("revision", "")),
+        "runtime_model": str(llm_cfg.get("model", "")),
         "config_file_sha256": config_sha,
         "output_file_paths": out,
         "output_file_sha256": out_sha,

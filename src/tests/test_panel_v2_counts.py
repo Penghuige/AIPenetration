@@ -56,5 +56,16 @@ def test_invariants_reject_bad_counts(tmp_path):
     broken = counts.copy()
     broken.loc[broken.index[0], "n_ai_cooccur"] = broken.loc[
         broken.index[0], "n_skill"] + 5
-    with pytest.raises(AssertionError):
+    with pytest.raises(RuntimeError):
         verify_counts(broken)
+
+
+
+def test_pair_year_must_match_job_year(tmp_path):
+    rel = _fixture(tmp_path)
+    t = pq.read_table(rel / "job_skill_long.parquet").to_pandas()
+    t.loc[t.index[0], "year"] = 2015
+    pq.write_table(pa.Table.from_pandas(t, preserve_index=False),
+                   rel / "job_skill_long.parquet")
+    with pytest.raises(RuntimeError, match="year"):
+        compute_counts(rel)

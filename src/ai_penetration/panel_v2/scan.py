@@ -1,16 +1,13 @@
 """panel_v2 M3-a：Pass2 识别扫描（§12.5 job_anchor_flag + job_skill_long）。
 
 输入 M2 产物 job_master_gzsz（结果库）；eps 只读；产物写
-output/panel_v2/pass2/。审计修复版（B1/B3/M9）：
+output/panel_v2/pass2_handoff_scan/。交接合规版：
 
-- master 导出为**裸 .npy + np.load(mmap_mode="r")**（npz 成员不真 mmap，
-  实证每 worker 会私载全量——已修正），按 key=blake2b-63(recruit_id) 排序；
+- master 导出为**裸 .npy + np.load(mmap_mode="r")**；按 §3.2 稳定 job_id 的
+  63-bit 计算代理排序；
   目录含 .stamp.json 版号戳（MASTER_VERSION+n），复用前校验。
-- 命中键最终定稿 **rid-only**（master rid 实证全局唯一）：同一 rid 的多份
-  raw 拷贝全部映射到同一 job_id，跨切片重复由 worker hit_seen 片内去重 +
-  merge 端 PG DISTINCT ON 仲裁；keep-first 的"多拷贝识别等价"假设由
-  merge_parts 冲突计数**实测披露**（flag/firm 逐 job 多值计数），全国重跑
-  预检须复核该计数（审计 D4）。
+- raw 行通过 `SHA256(platform|job_id_raw)` 的同一 63-bit 代理回到 master；
+  再用 canonical city + text_hash 双重确认，只扫描去重阶段选中的那条描述。
 - skill 词表由**主进程单点构建**并原子落盘（含 ORDER BY 的别名查询消除
   36 个实证碰撞键的跨 worker 分歧），worker 读文件 + 一致性断言。
 - 产物**按批落盘为 parquet dataset 分区**（flags/long/firm 三目录），
@@ -36,15 +33,17 @@ import psycopg2
 from config.paths import get_project_paths
 
 from ..common import eps_conn_params, setup_logging
-from ..text_clean import match_from_raw
+from ..text_clean import clean_description, text_hash, to_match
 from .anchors import ANCHOR_RULES_VERSION, match_all_versions
-from .dedup import ADMISSION_WHERE, MASTER_VERSION, SHARDS, _blocks, _h63
+from .dedup import (ADMISSION_WHERE, MASTER_VERSION, SHARDS, _blocks,
+                    _stable_job_id, _stable_job_id_sha256)
 
 logger = logging.getLogger("ai_penetration.panel_v2.scan")
 
 GROUP_BITS = {"AI": 1, "ML": 2, "NLP": 4, "CVISION": 8,
               "CIMAGE": 16, "LLM": 32, "TRANS": 64}
 FLUSH_ROWS = 500_000  # 每子批落盘行数（B1：禁止全切片累积）
+SCAN_PIPELINE_VERSION = "handoff_v4_full_evidence_20260920"
 
 _WORKER: dict = {}
 
@@ -58,26 +57,27 @@ def _results_conn():
 
 
 def export_master(out_dir: Path) -> None:
-    """job_master → 4 个排序裸 .npy（mmap 真共享）。原子写（M9）。
+    """job_master → 排序裸 .npy（mmap 真共享），原子写。
 
-    过滤键 = h63(job_id_raw)（**rid-only 定稿**，2026-09-08 三迭代结论：
-    复合键 (plat,city,rid) 因 pmap 采样对长尾平台编码覆盖缺口实证漏命中
-    9,867 例已弃用；master rid 全局唯一由下方碰撞断言保证）。
-    复用需过版号戳校验（审计 D2：三件存在≠同代）。
+    过滤键直接使用去重阶段的稳定 job_id（完整 SHA256(platform|raw_id) 的
+    63-bit 计算代理）；pass2 对原始行用同一公式重算，再用 canonical city +
+    text_hash 复核，避免 rid-only 或平台采样编码旁路。复用必须同时通过
+    master 与 scan pipeline 版号戳。
     """
     npy_dir = out_dir / "master_npy"
     stamp = npy_dir / ".stamp.json"
-    names = ("key", "job_id", "year", "company")
+    names = ("key", "job_id", "year", "company", "city", "thash")
     if all((npy_dir / f"{n}.npy").exists() for n in names) and stamp.exists():
         s = json.loads(stamp.read_text(encoding="utf-8"))
-        if s.get("version") == MASTER_VERSION:
+        if (s.get("version") == MASTER_VERSION
+                and s.get("scan_pipeline_version") == SCAN_PIPELINE_VERSION):
             logger.info("master npy 复用（%s，n=%d）", s["version"], s["n"])
             return
         logger.warning("master npy 版号不符（%s != %s），重建",
                        s.get("version"), MASTER_VERSION)
     conn = _results_conn()
     cur = conn.cursor()
-    cur.execute("SELECT job_id_raw, plat, job_id, city, year, company_id "
+    cur.execute("SELECT job_id, city, year, company_id, thash "
                 "FROM public.job_master_gzsz")
     rows = cur.fetchall()
     conn.close()
@@ -87,73 +87,140 @@ def export_master(out_dir: Path) -> None:
     job_id = np.empty(n, np.int64)
     year = np.empty(n, np.int32)
     company = np.empty(n, np.int32)
-    comps: dict[str, int] = {}
-    # key = h63(rid)：master 的 rid 全局唯一（实证 0 重复组），跨切片/跨平台
-    # 的重复命中由 worker hit_seen + PG 端 DISTINCT ON 仲裁（rid 复合平台编码
-    # 会因映射覆盖缺口产生漏命中，2026-09-07 实证 9867 例，已弃用）
-    for i, (rid, _plat, jid, _city, y, comp) in enumerate(rows):
-        key[i] = _h63(str(rid))
+    city = np.empty(n, np.int16)
+    thash = np.empty(n, np.int64)
+    company_ids = sorted({str(row[3]) for row in rows})
+    comps: dict[str, int] = {
+        cid: i for i, cid in enumerate(company_ids)
+    }
+    # key 直接使用 §3.2 稳定 job_id = SHA256(platform|raw_id) 的 63-bit 代理。
+    # pass2 对原始行用同一公式重算，避免任何 rid-only/平台编码旁路。
+    for i, (jid, city_id, y, comp, hash_value) in enumerate(rows):
+        key[i] = int(jid)
         job_id[i] = int(jid)
         year[i] = int(y)
-        company[i] = comps.setdefault(str(comp), len(comps))
+        company[i] = comps[str(comp)]
+        city[i] = int(city_id)
+        thash[i] = int(hash_value)
     order = np.argsort(key, kind="stable")
     k_sorted = key[order]
-    assert not np.any(k_sorted[1:] == k_sorted[:-1]), "canonical key 哈希碰撞"
+    if np.any(k_sorted[1:] == k_sorted[:-1]):
+        raise RuntimeError("canonical 稳定 job_id 碰撞")
     npy_dir.mkdir(parents=True, exist_ok=True)
     tmp = out_dir / "_master_tmp"
     tmp.mkdir(parents=True, exist_ok=True)
     for name, arr in (("key", k_sorted), ("job_id", job_id[order]),
-                      ("year", year[order]), ("company", company[order])):
+                      ("year", year[order]), ("company", company[order]),
+                      ("city", city[order]), ("thash", thash[order])):
         p = tmp / f"{name}.npy"
         np.save(p, arr)
-        p.rename(npy_dir / f"{name}.npy")   # 原子发布
-    stamp.write_text(json.dumps({"version": MASTER_VERSION, "n": n}),
-                     encoding="utf-8")
+        p.replace(npy_dir / f"{name}.npy")   # 原子发布
+    stamp.write_text(json.dumps({
+        "version": MASTER_VERSION, "scan_pipeline_version": SCAN_PIPELINE_VERSION,
+        "n": n}), encoding="utf-8")
     (out_dir / "company_vocab.json").write_text(
         json.dumps(comps), encoding="utf-8")
     logger.info("master npy 导出: %d 条 / company %d", n, len(comps))
 
 
+def _load_governed_legacy_map() -> tuple[dict[str, str], set[str], str]:
+    """读取 §10 治理后的正式 A/B/C map、歧义键与内容哈希。"""
+    import hashlib
+    import pandas as pd
+    from .governance import governed_skill_map
+
+    path = (
+        get_project_paths().output_dir
+        / "dictionary"
+        / "skill_governed_ABCD_v4.csv"
+    )
+    if not path.exists():
+        raise RuntimeError(
+            "缺少 handoff-compliant 治理表 skill_governed_ABCD_v4.csv；"
+            "请先完成 formal discovery review"
+        )
+    grades = pd.read_csv(path, encoding="utf-8-sig")
+    mapping = governed_skill_map(grades)
+    formal = grades[grades.final_grade.isin(["A", "B", "C"])].copy()
+    ambiguous = {
+        str(term).lower() for term, flag in zip(formal.term, formal.t2_ambig)
+        if str(flag).strip().lower() in {"1", "true", "yes"}
+    }
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    return mapping, ambiguous, digest
+
+
 def build_skill_vocab(out_dir: Path) -> None:
-    """主进程单点构建 union 词表并原子落盘（B3：ORDER BY 确定性）。"""
+    """用最终 A/B/C 概念映射构建 skill_code 词表并绑定治理表哈希。"""
     path = out_dir / "skill_vocab.json"
-    if path.exists():
-        return
-    from ..skill_ai_anchor import load_merged_skills
-    from .lexicon import _load_atier_aliases, build_union_lexicon
-    aliases = _load_atier_aliases()   # 查询已 ORDER BY，first-wins 确定
-    lex = build_union_lexicon(legacy_terms=load_merged_skills(include_llm=True),
-                              aliases=aliases)
+    stamp = out_dir / "skill_vocab.stamp.json"
+    governed, ambiguous, governance_hash = _load_governed_legacy_map()
+    if path.exists() and stamp.exists():
+        meta = json.loads(stamp.read_text(encoding="utf-8"))
+        if (
+            meta.get("scan_pipeline_version") == SCAN_PIPELINE_VERSION
+            and meta.get("governance_sha256") == governance_hash
+        ):
+            return
+    from .lexicon import _load_atier_alias_records, build_union_lexicon
+    aliases = _load_atier_alias_records()
+    lex = build_union_lexicon(
+        legacy_terms=sorted(governed),
+        aliases=aliases,
+        legacy_id_map=governed,
+        legacy_ambiguous_keys=ambiguous,
+    )
     sids = sorted(set(lex.keys_map.values()))
     tmp = out_dir / "_vocab.json.tmp"
-    tmp.write_text(json.dumps({s: i for i, s in enumerate(sids)},
-                              ensure_ascii=False), encoding="utf-8")
-    tmp.rename(path)
-    logger.info("skill_vocab 落盘: %d skill", len(sids))
+    tmp.write_text(
+        json.dumps({s: i for i, s in enumerate(sids)}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    tmp.replace(path)
+    stamp.write_text(
+        json.dumps({
+            "scan_pipeline_version": SCAN_PIPELINE_VERSION,
+            "governance_sha256": governance_hash,
+            "n_skills": len(sids),
+        }),
+        encoding="utf-8",
+    )
+    logger.info("skill_vocab 落盘: %d skill（governance=%s）", len(sids),
+                governance_hash[:12])
 
 
 def _init_worker(npy_dir: str) -> None:
-    """worker：mmap master + 词表一致性断言（B3）。"""
-    _WORKER["m"] = {n: np.load(Path(npy_dir) / f"{n}.npy", mmap_mode="r")
-                    for n in ("key", "job_id", "year", "company")}
-    from ..skill_ai_anchor import load_merged_skills
-    from .lexicon import _load_atier_aliases, build_union_lexicon
-    aliases = _load_atier_aliases()
-    lex = build_union_lexicon(legacy_terms=load_merged_skills(include_llm=True),
-                              aliases=aliases)
+    """worker：mmap canonical master + 同一治理版本正式词表。"""
+    _WORKER["m"] = {
+        n: np.load(Path(npy_dir) / f"{n}.npy", mmap_mode="r")
+        for n in ("key", "job_id", "year", "company", "city", "thash")
+    }
+    from .lexicon import _load_atier_alias_records, build_union_lexicon
+    governed, ambiguous, governance_hash = _load_governed_legacy_map()
+    aliases = _load_atier_alias_records()
+    lex = build_union_lexicon(
+        legacy_terms=sorted(governed),
+        aliases=aliases,
+        legacy_id_map=governed,
+        legacy_ambiguous_keys=ambiguous,
+    )
     vocab_path = Path(npy_dir).parent / "skill_vocab.json"
     vocab = json.loads(vocab_path.read_text(encoding="utf-8"))
     built = sorted(set(lex.keys_map.values()))
-    assert len(built) == len(vocab) and all(
-        vocab[s] == i for i, s in enumerate(built)), \
-        "worker 词表与落盘 vocab 不一致（B3 防御断言）"
+    if not (
+        len(built) == len(vocab)
+        and all(vocab[s] == i for i, s in enumerate(built))
+    ):
+        raise RuntimeError("worker 词表与落盘 vocab 不一致")
     _WORKER["sid_to_code"] = vocab
     _WORKER["lex"] = lex
+    _WORKER["governance_hash"] = governance_hash
 
 
 def _flush_parts(out: Path, task: str, part: int,
-                 flags_buf: list, long_buf: list, firm_buf: list) -> None:
-    """子批 buffer 即时写 parquet 分区（B1）。"""
+                 flags_buf: list, long_buf: list, firm_buf: list,
+                 text_buf: list) -> None:
+    """子批 buffer 即时写 zstd parquet 分区（指南 §4.1）。"""
     import pyarrow as pa
     import pyarrow.parquet as pq
     if flags_buf:
@@ -165,22 +232,50 @@ def _flush_parts(out: Path, task: str, part: int,
             "anchor_cn_paper": pa.array(cols[3], pa.int8()),
             "anchor_babina": pa.array(cols[4], pa.int8()),
             "groups_main_bits": pa.array(cols[5], pa.int16()),
-        }), out / "parts_flags" / f"{task}_{part:04d}.parquet")
+            "matched_anchor_groups_main": pa.array(cols[6], pa.string()),
+            "matched_anchor_terms_main": pa.array(cols[7], pa.string()),
+        }), out / "parts_flags" / f"{task}_{part:04d}.parquet",
+                       compression="zstd")
     if long_buf:
         cols = list(zip(*long_buf))
         pq.write_table(pa.table({
             "job_id": pa.array(cols[0], pa.int64()),
             "year": pa.array(cols[1], pa.int32()),
             "skill_code": pa.array(cols[2], pa.int32()),
-        }), out / "parts_long" / f"{task}_{part:04d}.parquet")
+            "skill_id": pa.array(cols[3], pa.string()),
+            "surface_form": pa.array(cols[4], pa.string()),
+            "match_start": pa.array(cols[5], pa.int32()),
+            "match_end": pa.array(cols[6], pa.int32()),
+            "mention_count": pa.array(cols[7], pa.int32()),
+            "match_method": pa.array(cols[8], pa.string()),
+            "ambiguity_flag": pa.array(cols[9], pa.int8()),
+            "span_verified": pa.array(cols[10], pa.int8()),
+            "covered_candidate_count": pa.array(cols[11], pa.int32()),
+            "covered_candidates": pa.array(cols[12], pa.string()),
+        }), out / "parts_long" / f"{task}_{part:04d}.parquet",
+                       compression="zstd")
+    if text_buf:
+        cols = list(zip(*text_buf))
+        pq.write_table(pa.table({
+            "job_id": pa.array(cols[0], pa.int64()),
+            "job_id_sha256": pa.array(cols[1], pa.string()),
+            "job_id_raw": pa.array(cols[2], pa.string()),
+            "source_platform": pa.array(cols[3], pa.string()),
+            "year": pa.array(cols[4], pa.int32()),
+            "job_description_raw": pa.array(cols[5], pa.string()),
+            "job_description_clean": pa.array(cols[6], pa.string()),
+            "job_description_match": pa.array(cols[7], pa.string()),
+            "text_hash": pa.array(cols[8], pa.int64()),
+        }), out / "parts_text" / f"{task}_{part:04d}.parquet",
+                       compression="zstd")
     if firm_buf:
         cols = list(zip(*firm_buf))
         pq.write_table(pa.table({
             "job_id": pa.array(cols[0], pa.int64()),
             "year": pa.array(cols[1], pa.int32()),
             "company_code": pa.array(cols[2], pa.int32()),
-        }), out / "parts_firm" / f"{task}_{part:04d}.parquet")
-
+        }), out / "parts_firm" / f"{task}_{part:04d}.parquet",
+                       compression="zstd")
 
 def scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str) -> dict:
     """一个 ctid 切片的 pass2：buffer 满子批即落盘，meta 为完成标记。"""
@@ -191,11 +286,13 @@ def scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str) -> dict
         stat = json.loads(done.read_text(encoding="utf-8"))
         # 三校验（审计 D2：--slices 变化时同名任务范围不同，旧"完成"不可信）
         if (stat.get("version") == MASTER_VERSION and stat.get("hi") == hi
-                and stat.get("rules") == ANCHOR_RULES_VERSION):
+                and stat.get("rules") == ANCHOR_RULES_VERSION
+                and stat.get("scan_pipeline_version") == SCAN_PIPELINE_VERSION
+                and stat.get("governance_sha256") == _WORKER.get("governance_hash")):
             return stat
         logger.warning("切片 %s 完成戳不符（%s/%s/%s），清分片重扫", task,
                        stat.get("version"), stat.get("hi"), stat.get("rules"))
-        for d in ("parts_flags", "parts_long", "parts_firm"):
+        for d in ("parts_flags", "parts_long", "parts_firm", "parts_text"):
             for stale in (out / d).glob(f"{task}_*.parquet"):
                 stale.unlink()  # 防旧分片混入 merge（重扫部分失败留残）
         done.unlink()
@@ -205,11 +302,12 @@ def scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str) -> dict
     keys = m["key"]
     conn = psycopg2.connect(**eps_conn_params())
     n_rows = n_canon = part = 0
-    dup_hits = 0
+    dup_hits = noncanonical_copies = 0
     hit_seen: set[int] = set()  # raw 同 (plat,city,rid) 真重复行只识别一次（§6.2.1.1）
     flags_buf: list = []
     long_buf: list = []
     firm_buf: list = []
+    text_buf: list = []
     n_pairs = 0
     try:
         with conn.cursor() as setup:
@@ -218,21 +316,32 @@ def scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str) -> dict
         cur = conn.cursor(f"pass2_{task}")
         cur.itersize = 50000
         cur.execute(
-            f"SELECT recruit_id, job_description FROM public.{shard} "
+            f"SELECT recruit_id, platform, job_description FROM public.{shard} "
             "WHERE ctid >= '(%s,0)'::tid AND ctid < '(%s,0)'::tid "
             + ADMISSION_WHERE,  # 单源谓词（审计 D3：禁再手抄）
             (int(lo), int(hi)))
-        for d in ("parts_flags", "parts_long", "parts_firm"):
+        for d in ("parts_flags", "parts_long", "parts_firm", "parts_text"):
             (out / d).mkdir(parents=True, exist_ok=True)
         while True:
             batch = cur.fetchmany(50000)
             if not batch:
                 break
-            for rid, desc in batch:
+            for rid, platform, desc in batch:
                 n_rows += 1
-                k = _h63(str(rid))
+                k = _stable_job_id(str(platform or ""), str(rid))
                 idx = int(np.searchsorted(keys, k))
                 if idx >= keys.size or int(keys[idx]) != k:
+                    continue
+                # 必须扫描 dedup 选中的 canonical 文本，而不是同 recruit_id 的
+                # 任意 raw 拷贝。否则 ctid 顺序变化即可改变技能/锚点结果。
+                if int(m["city"][idx]) != int(city_id):
+                    noncanonical_copies += 1
+                    continue
+                raw_txt = str(desc)
+                clean_txt = clean_description(raw_txt)
+                match_txt = to_match(clean_txt)
+                if text_hash(match_txt) != int(m["thash"][idx]):
+                    noncanonical_copies += 1
                     continue
                 if k in hit_seen:
                     dup_hits += 1
@@ -241,37 +350,57 @@ def scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str) -> dict
                 n_canon += 1
                 job_id = int(m["job_id"][idx])
                 yr = int(m["year"][idx])
-                match_txt = match_from_raw(str(desc))
                 hits = match_all_versions(match_txt)
                 bits = 0
                 for g in hits["main"].groups:
                     bits |= GROUP_BITS[g]
-                codes = sorted(sid2code[s] for s in lex.extract(match_txt))
-                flags_buf.append((job_id, yr, hits["main"].flag,
-                                  hits["cn_paper"].flag, hits["babina"].flag,
-                                  bits))
-                long_buf.extend((job_id, yr, c) for c in codes)
+                matches = lex.extract_matches(match_txt)
+                flags_buf.append((
+                    job_id, yr, hits["main"].flag, hits["cn_paper"].flag,
+                    hits["babina"].flag, bits,
+                    "|".join(hits["main"].groups),
+                    "|".join(hits["main"].terms),
+                ))
+                for match in matches:
+                    code = sid2code[match.skill_id]
+                    long_buf.append((
+                        job_id, yr, code, match.skill_id, match.surface_form,
+                        match.start, match.end, match.mention_count,
+                        match.match_method, match.ambiguity_flag,
+                        int(match_txt[match.start:match.end] == match.surface_form),
+                        match.covered_candidate_count,
+                        match.covered_candidates,
+                    ))
                 firm_buf.append((job_id, yr, int(m["company"][idx])))
-                n_pairs += len(codes)
+                text_buf.append((
+                    job_id,
+                    _stable_job_id_sha256(str(platform or ""), str(rid)),
+                    str(rid), str(platform or ""), yr, raw_txt, clean_txt,
+                    match_txt, int(m["thash"][idx]),
+                ))
+                n_pairs += len(matches)
                 if len(flags_buf) >= FLUSH_ROWS:
-                    _flush_parts(out, task, part, flags_buf, long_buf, firm_buf)
-                    flags_buf, long_buf, firm_buf = [], [], []
+                    _flush_parts(out, task, part, flags_buf, long_buf, firm_buf, text_buf)
+                    flags_buf, long_buf, firm_buf, text_buf = [], [], [], []
                     part += 1
             if len(flags_buf) >= FLUSH_ROWS:  # fetchmany 边界也检查
-                _flush_parts(out, task, part, flags_buf, long_buf, firm_buf)
-                flags_buf, long_buf, firm_buf = [], [], []
+                _flush_parts(out, task, part, flags_buf, long_buf, firm_buf, text_buf)
+                flags_buf, long_buf, firm_buf, text_buf = [], [], [], []
                 part += 1
         cur.close()
-        _flush_parts(out, task, part, flags_buf, long_buf, firm_buf)
+        _flush_parts(out, task, part, flags_buf, long_buf, firm_buf, text_buf)
     finally:
         conn.close()
     stat = {"task": task, "rows": n_rows, "canonical": n_canon,
             "skill_pairs": n_pairs, "dup_hits": dup_hits,
             "version": MASTER_VERSION, "lo": int(lo), "hi": int(hi),
-            "rules": ANCHOR_RULES_VERSION}
+            "rules": ANCHOR_RULES_VERSION,
+            "scan_pipeline_version": SCAN_PIPELINE_VERSION,
+            "governance_sha256": _WORKER.get("governance_hash"),
+            "noncanonical_copies": noncanonical_copies}
     tmp = out / f".{task}.done.tmp"
     tmp.write_text(json.dumps(stat), encoding="utf-8")
-    tmp.rename(done)
+    tmp.replace(done)
     logger.info("pass2 切片完成 %s: canonical=%d pairs=%d", task, n_canon, n_pairs)
     return stat
 
@@ -308,12 +437,21 @@ def merge_parts(out_dir: Path, rel_dir: Path) -> None:
     specs = (
         ("job_anchor_flag", "parts_flags",
          "job_id int8, year int, anchor_main smallint, anchor_cn_paper smallint,"
-         " anchor_babina smallint, groups_main_bits int",
+         " anchor_babina smallint, groups_main_bits int,"
+         " matched_anchor_groups_main text, matched_anchor_terms_main text",
          "job_id"),
         ("job_skill_long", "parts_long",
-         "job_id int8, year int, skill_code int",
+         "job_id int8, year int, skill_code int, skill_id text, surface_form text,"
+         " match_start int, match_end int, mention_count int, match_method text,"
+         " ambiguity_flag smallint, span_verified smallint,"
+         " covered_candidate_count int, covered_candidates text",
          "job_id, skill_code"),
         ("job_firm", "parts_firm", "job_id int8, year int, company_code int",
+         "job_id"),
+        ("job_text_clean", "parts_text",
+         "job_id int8, job_id_sha256 text, job_id_raw text, source_platform text,"
+         " year int, job_description_raw text, job_description_clean text,"
+         " job_description_match text, text_hash int8",
          "job_id"),
     )
     conn = _results_conn()
@@ -328,7 +466,8 @@ def merge_parts(out_dir: Path, rel_dir: Path) -> None:
         cur.execute(f"DROP TABLE IF EXISTS public.{fin} CASCADE")
         cur.execute(f"CREATE TABLE public.{stg} ({cols})")
         files = sorted((out_dir / sub).glob("*.parquet"))
-        assert files, f"{sub} 无分片"
+        if not files:
+            raise RuntimeError(f"{sub} 无分片")
         for f in files:
             bio = _table_to_csv_buf(f)
             cur.copy_expert(
@@ -348,12 +487,21 @@ def merge_parts(out_dir: Path, rel_dir: Path) -> None:
                 f"SELECT count(*) FROM (SELECT job_id FROM public.{stg} "
                 f"GROUP BY job_id HAVING count(DISTINCT company_code) > 1) x")
             conflict = cur.fetchone()[0]
+        elif name == "job_text_clean":
+            cur.execute(
+                f"SELECT count(*) FROM (SELECT job_id FROM public.{stg} "
+                f"GROUP BY job_id HAVING count(DISTINCT "
+                f"(job_id_sha256, job_id_raw, source_platform, year, text_hash,"
+                f" job_description_match)) > 1) x")
+            conflict = cur.fetchone()[0]
         if conflict:
-            logger.warning("keep-first 冲突披露 %s: %d 个 job 多拷贝识别不等价"
-                           "（受影响行由 ctid 序 keep-first 裁决，跨运行可翻转）",
-                           name, conflict)
+            raise RuntimeError(
+                f"canonical 扫描出现不等价重复 {name}: {conflict} 个 job；"
+                "拒绝用 ctid keep-first 仲裁")
+        order_by = (f"{dedup_key}, match_start, match_end, surface_form"
+                    if name == "job_skill_long" else f"{dedup_key}, job_id")
         cur.execute(f"CREATE TABLE public.{fin} AS SELECT DISTINCT ON ({dedup_key}) *"
-                    f" FROM public.{stg} ORDER BY {dedup_key}, job_id")
+                    f" FROM public.{stg} ORDER BY {order_by}")
         conn.commit()
         cur.execute(f"SELECT count(*) FROM public.{stg}")
         before = cur.fetchone()[0]
@@ -385,9 +533,14 @@ def _arrow_types(name: str) -> list:
     import pyarrow as pa
     if name == "job_anchor_flag":
         return [pa.int64(), pa.int32(), pa.int16(), pa.int16(), pa.int16(),
-                pa.int16()]
+                pa.int16(), pa.string(), pa.string()]
     if name == "job_skill_long":
-        return [pa.int64(), pa.int32(), pa.int32()]
+        return [pa.int64(), pa.int32(), pa.int32(), pa.string(), pa.string(),
+                pa.int32(), pa.int32(), pa.int32(), pa.string(), pa.int16(),
+                pa.int16(), pa.int32(), pa.string()]
+    if name == "job_text_clean":
+        return [pa.int64(), pa.string(), pa.string(), pa.string(), pa.int32(),
+                pa.string(), pa.string(), pa.string(), pa.int64()]
     return [pa.int64(), pa.int32(), pa.int32()]
 
 
@@ -409,15 +562,23 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--slices", type=int, default=4)
     parser.add_argument("--bench", action="store_true")
-    parser.add_argument("--out-tag", default="",
-                        help="输出目录标签：pass2<tag> 与 release/panel_v2<tag>"
-                             "（v2h 重扫用，避免覆盖 v2ac 基底）")
+    parser.add_argument(
+        "--out-tag", default="_handoff_scan",
+        help="输出目录标签；默认隔离到 pass2_handoff_scan / panel_v2_handoff_scan，"
+             "避免覆盖历史 panel_v2",
+    )
     args = parser.parse_args()
+    if args.workers > 8:
+        raise SystemExit("--workers 不得超过 8（大表 IO 纪律）")
     paths = get_project_paths()
     setup_logging(paths.log_dir / f"panel_v2_scan{args.out_tag}.log")
     out_dir = paths.output_dir / "panel_v2" / f"pass2{args.out_tag}"
     rel_out = paths.output_dir / "release" / f"panel_v2{args.out_tag}"
     out_dir.mkdir(parents=True, exist_ok=True)
+    rel_out.mkdir(parents=True, exist_ok=True)
+    scan_manifest_path = rel_out / "scan_manifest.json"
+    # 任何新 scan 一开始先撤销旧“完整”凭证；只有全链成功后才重建。
+    scan_manifest_path.unlink(missing_ok=True)
     logger.info("锚点规则版本: %s | 主样本版号: %s",
                 ANCHOR_RULES_VERSION, MASTER_VERSION)
     t0 = datetime.now()
@@ -452,14 +613,43 @@ def main() -> None:
     import pyarrow.parquet as pq
     n_flag = pq.ParquetFile(
         rel_out / "job_anchor_flag.parquet").metadata.num_rows
-    if n_flag != n_master:
+    n_text = pq.ParquetFile(
+        rel_out / "job_text_clean.parquet").metadata.num_rows
+    if n_flag != n_master or n_text != n_master:
         raise SystemExit(
-            f"守恒失败: 合并后 flag {n_flag} != master {n_master}"
+            f"守恒失败: flag={n_flag}, text={n_text}, master={n_master}"
             f"（Σcanonical={canon} 本地去重 {dup_hits}）")
+    from .reproducibility import sha256_file
+    governed_path = (
+        paths.output_dir / "dictionary" / "skill_governed_ABCD_v4.csv"
+    )
+    scan_files = [
+        rel_out / "job_anchor_flag.parquet",
+        rel_out / "job_skill_long.parquet",
+        rel_out / "job_firm.parquet",
+        rel_out / "job_text_clean.parquet",
+    ]
+    scan_manifest = {
+        "status": "formal_pass",
+        "master_version": MASTER_VERSION,
+        "scan_pipeline_version": SCAN_PIPELINE_VERSION,
+        "anchor_rules_version": ANCHOR_RULES_VERSION,
+        "governance_sha256": sha256_file(governed_path),
+        "n_master": int(n_master),
+        "n_flag": int(n_flag),
+        "n_text": int(n_text),
+        "files": {
+            p.name: sha256_file(p) for p in scan_files
+        },
+    }
+    scan_manifest_path.write_text(
+        json.dumps(scan_manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     dur = (datetime.now() - t0).total_seconds() / 3600
     print(f"pass2 完成: canonical={canon:,}(dup hits {dup_hits:,}) "
           f"pairs={sum(s['skill_pairs'] for s in stats):,} "
-          f"flag={n_flag:,} 用时 {dur:.2f}h，守恒核验通过 ✓")
+          f"flag={n_flag:,} text={n_text:,} 用时 {dur:.2f}h，守恒核验通过 ✓")
 
 
 if __name__ == "__main__":

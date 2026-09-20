@@ -1,11 +1,18 @@
 # 面板 v2 主管线配置（指南 §19.2；口径变更须同步 docs/panel_v2_设计.md）
 # 定位声明（2026-09-09 审计）：本文件是**口径登记文档**（唯一权威参数清单），
-# 运行时代码**不读取**它（各模块用代码内常量/CLI 参数实现同值语义）；其内容
+# 运行时代码**不直接读取**全部字段（各模块仍有常量/CLI 参数）；其内容
 # 经发布 metadata 的 config_hash 背书。新增参数或改语义时须同步三处：
 # 本文件、对应模块常量、设计文档。运行期真正生效的绑定在代码（如
 # dedup.ADMISSION_WHERE、scoring.THRESHOLDS）。
-panel_version: v2a
-dictionary_version: bilingual_a_frozen_v1.1+legacy_union_v1
+panel_version: v2i
+dictionary_version: bilingual_a_frozen_v1.1+governed_v1.5
+
+
+identity:
+  job_id_formula: sha256_63bit(source_platform + unit_separator + job_id_raw)
+  full_formula: SHA256(source_platform | job_id_raw)
+  collision_policy: block_release
+  note: "63-bit surrogate only for compute efficiency; full SHA256 construction is fixed"
 
 scope:
   cities: [广州市, 深圳市]      # v2a 先广深；全国由用户排窗后扩
@@ -54,10 +61,12 @@ job_score:                     # §15–§16
   zero_skill_rule: {keep_row: true, score: missing, flags: 0, override: zero_skill_override}
   require_coverage_one: true   # §15.3 score_skill_coverage<1 阻断
 
-robustness:                    # §14.3 企业留一（主锚点、三窗口、原始率）
+robustness:
   leave_one_firm: {enabled: true, anchors: [main], score_type: raw}
+  exclude_tier_c: {enabled: true, anchor: main, window: annual, score_type: raw}
+  remove_anchor_skills: {enabled: true, anchor: main, window: annual, score_type: raw}
 
 release:                       # §17.6/§18
   quality_gate_fail_blocks: true
-  outputs_dir: output/release/panel_v2
+  outputs_dir: output/release/panel_v2i
   metadata_fields: 11   # 指南 §18.1 原单 11 项（"至少包含"）；旧述"12"系笔误（2026-09-09 审计修正）

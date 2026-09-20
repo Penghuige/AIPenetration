@@ -2,18 +2,18 @@
 
 数据事实（2026-09-07 实测+评审确认）：广深 recruit_id 平台内唯一（v2b 起
 规则1 跨城折叠兜底残余重复）；job↔ent join 覆盖高；ent.recruit_id 有重复
-（聚合取 min(company_id)，确定性选择；未命中数入披露并断言）。
+（按 city+recruit_id 唯一映射；多企业冲突进入 UNK，不做任意 min 裁决）。
 所有写入仅在结果库；eps 只读。
 
 流程（2026-09-09 审计修复版：断点版号绑定 + WAL 强制 + 谓词单源）：
-1. ``copy_ent_map``：ent (recruit_id, company_id) 流式导出结果库（无主键，
-   join 时 GROUP BY 聚合去重）。
+1. ``copy_ent_map``：ent (city,recruit_id,company_id) 流式导出结果库；
+   只有 city+recruit_id 唯一映射到一个企业时才采用，否则进入 UNK。
 2. ``pass1_scan``：ctid 切片（≤8 路，HDD 纪律）扫 job 表全行（准入谓词
    ``ADMISSION_WHERE`` 单源定义，scan 阶段复用防漂移），Python 侧算
    match 文本 hash、pos_norm_hash、日期、描述长度、**字段完整度**
    （education/work_type/experience/recruit_count/age_req 非空数——评审代理
-   定义，§6.2.2.2 的可辩护实现）；年份/日期不可解析**不丢行**（yr=0/day=-1
-   隔离标记）；rid 超 32 字节**硬失败**（防定长槽静默截断）；定长 64B 窄行
+   定义，§6.2.2.2 的可辩护实现）；年份/日期不可解析先保留在 stage，随后进入
+   `dedup_invalid_date_gzsz` 隔离表，不进入正式 master；rid 超 32 字节**硬失败**；定长窄行
    分片落盘，断点复用校验 MASTER_VERSION+切片范围。
 3. ``copy_stage``：文本 COPY 进常规 WAL stage 表（启动时强制
    ``SET LOGGED``——`CREATE IF NOT EXISTS` 不改变既有表持久性，审计实证
@@ -26,10 +26,9 @@
    canonical 选择，物化 job_master_gzsz；另建 dup_group_map（§6.2.2 平台
    数/编号映射，仅含规则1 幸存行，被折叠行以聚合差值披露——指南"跨年互标"
    与全量映射明细为已申报偏离）。
-5. ``verify_invariants``：count(stage)==Σmetas==Σflags、
-   Σ(collapsed)=groupmap 行数、(plat,rid) 全量唯一、plat=255==Σmeta
-   unknown_platform、long_rid==0、company 未命中披露、bad_year>0.1% 阻断、
-   组跨度>30 天=0 断言（桶规则推论）。
+5. ``verify_invariants``：stage/隔离/eligible/groupmap/master 守恒、
+   Σ(collapsed)=groupmap 行数、(platform_hash,rid) 唯一、平台诊断计数守恒、
+   company 未命中披露、日期隔离守恒、组跨度>30 天=0。
 
 §6.1.1 三态文本声明：raw 由 eps 原表永久保留替代，match 态可由
 text_clean.match_from_raw 重算，中间表只存 hash（设计文档 §决策 记录）。
@@ -62,12 +61,13 @@ logger = logging.getLogger("ai_penetration.panel_v2.dedup")
 
 # b 版：规则1 跨城 rid 去重 + 组首锚定 30 天桶（链式语义超披露线修正）
 # c 版：2022 数据治理——描述有效长度 >=10 准入（blank 率 18.3% 污染修复）
-MASTER_VERSION = "main_v2a_20260908c"
+MASTER_VERSION = "main_v2a_20260919e_platformhash"
 TABLE_STAGE = "dedup_stage_gzsz"
 TABLE_SORTED = "dedup_sorted_gzsz"
 TABLE_MASTER = "job_master_gzsz"
 TABLE_GROUPMAP = "dup_group_map_gzsz"
 TABLE_ENTMAP = "ent_company_map"
+TABLE_ISOLATED = "dedup_invalid_date_gzsz"
 SHARDS = (("广州市", "job_p0387", 0), ("深圳市", "job_p0389", 1))
 _EPOCH_DAYS = 14610  # date(2010,1,1).toordinal()
 _YEAR_RE = re.compile(r"^\s*(\d{4})")
@@ -84,19 +84,52 @@ ADMISSION_WHERE = ("AND job_description IS NOT NULL "
 PLATFORM_SAMPLE_PCT = 0.05
 PLATFORM_SAMPLE_SEED = 42
 
-# 定长窄行（64B）：rid32 + plat/city + yr2 + day4 + posh8 + thash8 + dlen2 + comp1 + pad2
+# 定长窄行（80B）：rid32 + jid/phash + plat/city + yr/day + posh/thash + dlen/comp/pad
 ROW_DTYPE = np.dtype([
-    ("rid", "S32"), ("plat", "u1"), ("city", "u1"), ("yr", "u2"),
-    ("day", "i4"), ("posh", "i8"), ("thash", "i8"), ("dlen", "u2"),
-    ("comp", "u1"), ("pad", "S5"),
+    ("rid", "S32"), ("jid", "i8"), ("phash", "i8"), ("plat", "u1"), ("city", "u1"),
+    ("yr", "u2"), ("day", "i4"), ("posh", "i8"), ("thash", "i8"),
+    ("dlen", "u2"), ("comp", "u1"), ("pad", "S5"),
 ])
-assert ROW_DTYPE.itemsize == 64, ROW_DTYPE.itemsize
+if ROW_DTYPE.itemsize != 80:
+    raise RuntimeError(f"ROW_DTYPE 尺寸异常: {ROW_DTYPE.itemsize} != 80")
+
+
+def _stable_job_id_sha256(platform: str, raw_job_id: str) -> str:
+    """指南 §3.2 的完整稳定岗位编号。"""
+    import hashlib
+    payload = (
+        str(platform or "").strip()
+        + "\x1f"
+        + str(raw_job_id or "").strip()
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _stable_job_id(platform: str, raw_job_id: str) -> int:
+    """SHA256(source_platform | job_id_raw) 的 63-bit 计算代理键。
+
+    完整 SHA256 公式固定；截取 63 bit 仅为保持下游 int64 高效表示，
+    master 构建后必须做全量碰撞检查。
+    """
+    import hashlib
+    payload = (
+        str(platform or "").strip()
+        + "\x1f"
+        + str(raw_job_id or "").strip()
+    ).encode("utf-8")
+    digest = hashlib.sha256(payload).digest()
+    return int.from_bytes(digest[:8], "big") & 0x7FFF_FFFF_FFFF_FFFF
 
 
 def _h63(s: str) -> int:
     from hashlib import blake2b
     return int.from_bytes(blake2b(s.encode("utf-8"), digest_size=8).digest(),
                           "big") & 0x7FFF_FFFF_FFFF_FFFF
+
+
+def _stable_platform_hash(platform: str) -> int:
+    """平台真实字符串的稳定 63-bit 标识；去重语义不依赖采样字典。"""
+    return _h63("platform\x1f" + str(platform or "").strip())
 
 
 def _day_of(y: int, mo: int, d: int) -> int:
@@ -113,8 +146,26 @@ def _blocks(cur, shard: str) -> int:
 _WORKER: dict = {}
 
 
-def _init_worker(platforms: dict[str, int]) -> None:
+def _source_snapshot_sha() -> str:
+    """正式 dedup 必须绑定 source_audit 的固定数据快照。"""
+    import hashlib
+    path = (
+        get_project_paths().output_dir / "data_audit"
+        / "source_db_manifest_v1.json"
+    )
+    if not path.exists():
+        raise RuntimeError(
+            "缺 source_db_manifest_v1.json；正式 dedup 前先运行 source_audit"
+        )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("status") != "formal_pass":
+        raise RuntimeError("source_db_manifest_v1 未 formal_pass")
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _init_worker(platforms: dict[str, int], source_snapshot_sha: str) -> None:
     _WORKER["platforms"] = platforms
+    _WORKER["source_snapshot_sha"] = source_snapshot_sha
 
 
 def _completeness(edu, wtype, exp, rcnt, age) -> int:
@@ -137,7 +188,9 @@ def _scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str,
         # 断点复用三校验（审计 D2：旧版仅凭文件存在性复用，--slices 改变
         # 时同名任务范围不同会被静默截空；准入规则变更需重扫）
         if (meta.get("version") == MASTER_VERSION and meta.get("lo") == lo
-                and meta.get("hi") == hi):
+                and meta.get("hi") == hi
+                and meta.get("source_snapshot_sha")
+                    == _WORKER.get("source_snapshot_sha")):
             logger.info("切片 %s 断点复用（%d 行，版号一致）", task, meta["rows"])
             return meta
         logger.warning("切片 %s 断点版号/范围不符（meta=%s/%s-%s 现=%s/%s-%s），"
@@ -191,10 +244,14 @@ def _scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str,
                         n = 0
                     r = buf[n]
                     srid = str(rid).encode("utf-8")
-                    if len(srid) > 32:  # 审计 D11：S32 超长为静默截断，
-                        long_rid += 1   # 两条 rid 可同键致规则1误折叠
-                        srid = srid[:32]
+                    if len(srid) > 32:
+                        raise RuntimeError(
+                            f"recruit_id UTF-8 长度 {len(srid)} > 32，"
+                            "拒绝在定长槽中截断；请先扩展 ROW_DTYPE"
+                        )
                     r["rid"] = srid
+                    r["jid"] = _stable_job_id(pkey, str(rid))
+                    r["phash"] = _stable_platform_hash(pkey)
                     r["plat"] = plats.get(pkey, 255)
                     r["city"] = city_id
                     r["yr"] = yr
@@ -212,7 +269,8 @@ def _scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str,
         conn.close()
     meta = {"task": task, "rows": total, "bad_year": bad_year, "bad_day": bad_day,
             "unknown_platform": unk_plat, "long_rid": long_rid,
-            "version": MASTER_VERSION, "lo": int(lo), "hi": int(hi)}
+            "version": MASTER_VERSION, "lo": int(lo), "hi": int(hi),
+            "source_snapshot_sha": _WORKER.get("source_snapshot_sha")}
     meta_path.write_text(json.dumps(meta), encoding="utf-8")  # meta 最后落=完整性标记
     logger.info("切片完成 %s: rows=%d bad_year=%d bad_day=%d", task, total,
                 bad_year, bad_day)
@@ -252,17 +310,20 @@ def _build_platform_dict() -> dict[str, int]:
 
 
 def pass1_scan(workers: int, slices: int, out_dir: Path,
+               source_snapshot_sha: str,
                year_filter: str | None = None) -> list[dict]:
     """并行 pass1（workers≤8 HDD 纪律）。"""
     from concurrent.futures import ProcessPoolExecutor
-    assert workers <= 8, "HDD 纪律：大表 ≤8 流（CLAUDE.md §9）"
+    if workers > 8:
+        raise ValueError("HDD 纪律：大表 ≤8 流（CLAUDE.md §9）")
     plats = _build_platform_dict()
     logger.info("平台字典: %d 种", len(plats))
     tasks = _plan_tasks(slices, year_filter)
     out_dir.mkdir(parents=True, exist_ok=True)
     metas = []
-    with ProcessPoolExecutor(max_workers=workers, initializer=_init_worker,
-                             initargs=(plats,)) as pool:
+    with ProcessPoolExecutor(
+            max_workers=workers, initializer=_init_worker,
+            initargs=(plats, source_snapshot_sha)) as pool:
         futs = [pool.submit(_scan_slice, s, c, lo, hi, str(out_dir), yf)
                 for s, c, lo, hi, yf in tasks]
         for f in futs:
@@ -276,49 +337,112 @@ def _results_conn():
     return _p.connect(**rp)
 
 
-def copy_ent_map() -> None:
-    """ent 映射流式导出结果库（无主键防 ent 重复 recruit_id 炸 COPY）。"""
+def copy_ent_map(source_snapshot_sha: str, resume: bool = False) -> None:
+    """导出企业映射；resume 只复用与当前 source snapshot 严格绑定的表。"""
+    paths = get_project_paths()
+    manifest_path = paths.output_dir / "panel_v2" / "ent_map_manifest.json"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+
     conn = _results_conn()
-    cur = conn.cursor()
-    cur.execute(f"CREATE TABLE IF NOT EXISTS public.{TABLE_ENTMAP} "
-                "(recruit_id text, company_id text)")
-    cur.execute(f"SELECT count(*) FROM public.{TABLE_ENTMAP}")
-    has = cur.fetchone()[0]
-    conn.commit()
-    conn.close()
-    if has:
-        logger.info("ent 映射已有 %d 行，跳过导出", has)
-        return
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT to_regclass(%s)", (f"public.{TABLE_ENTMAP}",)
+        )
+        exists = cur.fetchone()[0] is not None
+        current_schema = False
+        existing_rows = 0
+        if exists:
+            cur.execute(
+                "SELECT count(*) FROM information_schema.columns "
+                "WHERE table_schema='public' AND table_name=%s "
+                "AND column_name IN ('city','recruit_id','company_id')",
+                (TABLE_ENTMAP,),
+            )
+            current_schema = cur.fetchone()[0] == 3
+            cur.execute(f"SELECT count(*) FROM public.{TABLE_ENTMAP}")
+            existing_rows = int(cur.fetchone()[0])
+
+        if resume and exists and current_schema and manifest_path.exists():
+            meta = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if (
+                meta.get("master_version") == MASTER_VERSION
+                and meta.get("source_snapshot_sha") == source_snapshot_sha
+                and int(meta.get("rows", -1)) == existing_rows
+            ):
+                logger.info(
+                    "ent 映射 resume 复用: %d 行，source snapshot 一致",
+                    existing_rows,
+                )
+                return
+            raise RuntimeError(
+                "--resume 检测到 ent_map 与当前 source snapshot/版号不一致；"
+                "请去掉 --resume 重新导出"
+            )
+
+        if exists:
+            cur.execute(f"DROP TABLE public.{TABLE_ENTMAP}")
+        cur.execute(
+            f"CREATE TABLE public.{TABLE_ENTMAP} "
+            "(city smallint NOT NULL, recruit_id text, company_id text)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
     eps = psycopg2.connect(**eps_conn_params())
     try:
-        for _, ent_shard, _ in (("广州市", "ent_p0387", 0), ("深圳市", "ent_p0389", 1)):
+        ent_specs = (("ent_p0387", 0), ("ent_p0389", 1))
+        total = 0
+        for ent_shard, city_id in ent_specs:
             cur = eps.cursor(f"entmap_{ent_shard}")
             cur.itersize = 200000
-            cur.execute(f"SELECT recruit_id, company_id FROM public.{ent_shard} "
-                        "WHERE recruit_id IS NOT NULL AND company_id IS NOT NULL")
+            cur.execute(
+                f"SELECT recruit_id, company_id FROM public.{ent_shard} "
+                "WHERE recruit_id IS NOT NULL AND company_id IS NOT NULL"
+            )
             conn2 = _results_conn()
-            cur2 = conn2.cursor()
-            n = 0
-            bio = io.StringIO()
-            while True:
-                batch = cur.fetchmany(200000)
-                if not batch:
-                    break
-                for rid, cid in batch:
-                    bio.write(f"{rid}\t{cid}\n")
-                    n += 1
-                if bio.tell() > 200 << 20:
-                    bio.seek(0)
-                    cur2.copy_expert(f"COPY public.{TABLE_ENTMAP} FROM STDIN WITH (FORMAT text)", bio)
-                    conn2.commit()
-                    bio = io.StringIO()
-            bio.seek(0)
-            cur2.copy_expert(f"COPY public.{TABLE_ENTMAP} FROM STDIN WITH (FORMAT text)", bio)
-            conn2.commit()
-            conn2.close()
-            logger.info("ent 映射导出 %s: %d 行", ent_shard, n)
+            try:
+                cur2 = conn2.cursor()
+                n = 0
+                bio = io.StringIO()
+                while True:
+                    batch = cur.fetchmany(200000)
+                    if not batch:
+                        break
+                    for rid, cid in batch:
+                        bio.write(f"{city_id}\t{rid}\t{cid}\n")
+                        n += 1
+                    if bio.tell() > 200 << 20:
+                        bio.seek(0)
+                        cur2.copy_expert(
+                            f"COPY public.{TABLE_ENTMAP} FROM STDIN "
+                            "WITH (FORMAT text)",
+                            bio,
+                        )
+                        conn2.commit()
+                        bio = io.StringIO()
+                bio.seek(0)
+                cur2.copy_expert(
+                    f"COPY public.{TABLE_ENTMAP} FROM STDIN WITH (FORMAT text)",
+                    bio,
+                )
+                conn2.commit()
+                total += n
+                logger.info("ent 映射导出 %s: %d 行", ent_shard, n)
+            finally:
+                conn2.close()
     finally:
         eps.close()
+
+    manifest_path.write_text(
+        json.dumps({
+            "master_version": MASTER_VERSION,
+            "source_snapshot_sha": source_snapshot_sha,
+            "rows": total,
+        }, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 def _ensure_logged(cur, table: str) -> None:
@@ -344,10 +468,32 @@ def copy_stage(metas: list[dict], resume: bool) -> int:
     """
     conn = _results_conn()
     cur = conn.cursor()
-    cur.execute(f"""
-        CREATE TABLE IF NOT EXISTS public.{TABLE_STAGE} (
-            rid text NOT NULL, plat smallint, city smallint, yr int,
-            day int, posh bigint, thash bigint, dlen int, comp smallint)""")
+    cur.execute(
+        "SELECT to_regclass(%s)", (f"public.{TABLE_STAGE}",)
+    )
+    stage_exists = cur.fetchone()[0] is not None
+    if stage_exists:
+        cur.execute(
+            "SELECT count(*) FROM information_schema.columns "
+            "WHERE table_schema='public' AND table_name=%s "
+            "AND column_name IN ('jid','phash')",
+            (TABLE_STAGE,),
+        )
+        has_current_identity = cur.fetchone()[0] == 2
+        if not has_current_identity:
+            if resume:
+                conn.close()
+                raise SystemExit(
+                    "旧 stage 缺稳定 jid/phash 列，不能 --resume；请无 --resume 重跑"
+                )
+            cur.execute(f"DROP TABLE public.{TABLE_STAGE}")
+            stage_exists = False
+    if not stage_exists:
+        cur.execute(f"""
+            CREATE TABLE public.{TABLE_STAGE} (
+                rid text NOT NULL, jid bigint NOT NULL, phash bigint NOT NULL,
+                plat smallint, city smallint,
+                yr int, day int, posh bigint, thash bigint, dlen int, comp smallint)""")
     _ensure_logged(cur, TABLE_STAGE)
     cur.execute(f"SELECT count(*) FROM public.{TABLE_STAGE}")
     existing = cur.fetchone()[0]
@@ -409,9 +555,13 @@ def copy_stage(metas: list[dict], resume: bool) -> int:
         bio = io.StringIO()
         for row in arr:
             rid = bytes(row["rid"]).rstrip(b"\x00").decode()
-            bio.write(f"{rid}\t{int(row['plat'])}\t{int(row['city'])}\t{int(row['yr'])}\t"
-                      f"{int(row['day'])}\t{int(row['posh'])}\t{int(row['thash'])}\t"
-                      f"{int(row['dlen'])}\t{int(row['comp'])}\n")
+            bio.write(
+                f"{rid}\t{int(row['jid'])}\t{int(row['phash'])}\t"
+                f"{int(row['plat'])}\t{int(row['city'])}\t"
+                f"{int(row['yr'])}\t{int(row['day'])}\t"
+                f"{int(row['posh'])}\t{int(row['thash'])}\t"
+                f"{int(row['dlen'])}\t{int(row['comp'])}\n"
+            )
         bio.seek(0)
         cur2.copy_expert(f"COPY public.{TABLE_STAGE} FROM STDIN WITH (FORMAT text)", bio)
         conn2.commit()
@@ -473,10 +623,13 @@ def build_master() -> tuple[int, int]:
     sorted_exists = cur.fetchone()[0] is not None
     if sorted_exists:
         # 旧版缺 rule1_dups 列 或 表被 PG 重启清空（原 UNLOGGED 版本）→ 重建
-        cur.execute("SELECT count(*) FROM information_schema.columns "
-                    "WHERE table_name=%s AND column_name='rule1_dups'",
-                    (TABLE_SORTED,))
-        has_col = cur.fetchone()[0] > 0
+        cur.execute(
+            "SELECT count(*) FROM information_schema.columns "
+            "WHERE table_schema='public' AND table_name=%s "
+            "AND column_name IN ('rule1_dups','phash')",
+            (TABLE_SORTED,),
+        )
+        has_col = cur.fetchone()[0] == 2
         cur.execute(f"SELECT EXISTS(SELECT 1 FROM public.{TABLE_SORTED} LIMIT 1)")
         nonempty = cur.fetchone()[0]
         if not has_col or not nonempty:
@@ -484,27 +637,62 @@ def build_master() -> tuple[int, int]:
             cur.execute(f"DROP TABLE public.{TABLE_SORTED}")
             sorted_exists = False
     if not sorted_exists:
+        # 63-bit jid 只是完整 SHA256 的计算代理；在任何按 jid 分组之前先验证
+        # 不同 (platform_hash, raw_id) 不得碰撞到同一代理。
+        cur.execute(f"""
+            SELECT count(*) FROM (
+                SELECT jid
+                FROM public.{TABLE_STAGE}
+                GROUP BY jid
+                HAVING count(DISTINCT (phash, rid)) > 1
+            ) x
+        """)
+        proxy_collisions = int(cur.fetchone()[0])
+        if proxy_collisions:
+            conn.close()
+            raise RuntimeError(
+                f"稳定 job_id 63-bit 代理发生 {proxy_collisions} 个碰撞；"
+                "拒绝在碰撞键上执行规则1去重"
+            )
+
+        # §3.1：无法完整解析日期的记录进入隔离表，不参与正式按年样本。
+        cur.execute(f"DROP TABLE IF EXISTS public.{TABLE_ISOLATED}")
+        cur.execute(f"""
+            CREATE TABLE public.{TABLE_ISOLATED} AS
+            SELECT * FROM public.{TABLE_STAGE}
+            WHERE yr NOT BETWEEN 2014 AND 2025 OR day < 0
+        """)
+        conn.commit()
         # 段一：规则1（§6.2.1.1 平台+编号唯一记录，跨城重复折叠并计数）
-        # + join ent 聚合映射（min 消一 rid 多司），NULL→哨兵
+        # + join ent 城市内映射；一 rid 多司不任意裁决，NULL/冲突→哨兵
         cur.execute(f"""
             CREATE TABLE public.{TABLE_SORTED} AS
             WITH joined AS (
-                SELECT s.rid, s.plat, s.city, s.yr, s.day, s.posh, s.thash,
+                SELECT s.rid, s.jid, s.phash, s.plat, s.city, s.yr, s.day, s.posh, s.thash,
                        s.dlen, s.comp,
                        coalesce(e.company_id, 'UNK:' || s.rid) AS company_id,
                        (e.company_id IS NULL) AS company_unmatched
                 FROM public.{TABLE_STAGE} s
-                LEFT JOIN (SELECT recruit_id, min(company_id) AS company_id
-                           FROM public.{TABLE_ENTMAP} GROUP BY recruit_id) e
-                       ON e.recruit_id = s.rid
+                LEFT JOIN (
+                    SELECT city, recruit_id,
+                           CASE WHEN count(DISTINCT company_id)=1
+                                THEN min(company_id) ELSE NULL END AS company_id
+                    FROM public.{TABLE_ENTMAP}
+                    GROUP BY city, recruit_id
+                ) e
+                  ON e.city = s.city AND e.recruit_id = s.rid
+                WHERE s.yr BETWEEN 2014 AND 2025 AND s.day >= 0
             ), rid_rank AS (
                 SELECT *,
-                       row_number() OVER (PARTITION BY plat, rid
-                                          ORDER BY city, day, thash) AS rn_rid,
-                       count(*) OVER (PARTITION BY plat, rid) - 1 AS rule1_dups
+                       row_number() OVER (
+                           PARTITION BY jid
+                           ORDER BY comp DESC, dlen DESC, (day < 0) ASC,
+                                    day ASC, rid ASC, city ASC, thash ASC
+                       ) AS rn_rid,
+                       count(*) OVER (PARTITION BY jid) - 1 AS rule1_dups
                 FROM joined
             )
-            SELECT rid, plat, city, yr, day, posh, thash, dlen, comp,
+            SELECT rid, jid, phash, plat, city, yr, day, posh, thash, dlen, comp,
                    company_id, company_unmatched, rule1_dups
             FROM rid_rank WHERE rn_rid = 1
         """)
@@ -544,13 +732,16 @@ def build_master() -> tuple[int, int]:
                    count(*) OVER w AS grp_n,
                    min(day) OVER w AS gmin,
                    max(day) OVER w AS gmax,
-                   row_number() OVER (PARTITION BY company_id, posh, city, thash, yr, seg
-                                      ORDER BY comp DESC, dlen DESC, day ASC, rid ASC) AS pick
+                   row_number() OVER (
+                       PARTITION BY company_id, posh, city, thash, yr, seg
+                       ORDER BY comp DESC, dlen DESC, (day < 0) ASC,
+                                day ASC, rid ASC, jid ASC
+                   ) AS pick
             FROM public.{TABLE_SEG}
             WINDOW w AS (PARTITION BY company_id, posh, city, thash, yr, seg)
         )
-        SELECT row_number() OVER (ORDER BY company_id, yr, thash, rid) AS job_id,
-               rid AS job_id_raw, plat, city, yr AS year, company_id, thash,
+        SELECT jid AS job_id,
+               rid AS job_id_raw, phash, plat, city, yr AS year, company_id, thash,
                (company_id || ':' || posh || ':' || city || ':' || thash || ':'
                 || yr || ':' || seg) AS duplicate_group_id,
                grp_n AS records_collapsed,
@@ -569,11 +760,11 @@ def build_master() -> tuple[int, int]:
         CREATE TABLE public.{TABLE_GROUPMAP} AS
         SELECT (company_id || ':' || posh || ':' || city || ':' || thash || ':'
                 || yr || ':' || seg) AS duplicate_group_id,
-               plat, rid AS job_id_raw, day, comp, dlen
+               phash AS platform_hash, plat, rid AS job_id_raw, day, comp, dlen
         FROM public.{TABLE_SEG}
     """)
     cur.execute("CREATE TABLE public.job_master_pc AS "
-                "SELECT duplicate_group_id, count(DISTINCT plat) AS platform_count "
+                "SELECT duplicate_group_id, count(DISTINCT platform_hash) AS platform_count "
                 "FROM public." + TABLE_GROUPMAP + " GROUP BY 1")
     cur.execute(f"ALTER TABLE public.{TABLE_MASTER} "
                 "ADD COLUMN platform_count int")
@@ -600,22 +791,26 @@ def verify_invariants(metas: list[dict] | None = None) -> None:
     #   Σmaster.records_collapsed = groupmap 行数（分桶守恒）
     cur.execute(f"""
         SELECT (SELECT count(*) FROM public.{TABLE_STAGE}),
+               (SELECT count(*) FROM public.{TABLE_ISOLATED}),
                (SELECT count(*) FROM public.{TABLE_GROUPMAP}),
                (SELECT count(*) FROM public.{TABLE_MASTER}),
                (SELECT sum(records_collapsed) FROM public.{TABLE_MASTER}),
                (SELECT count(*) - count(DISTINCT duplicate_group_id) FROM public.{TABLE_MASTER}),
                (SELECT count(*) FROM (
-                   SELECT plat, job_id_raw FROM public.{TABLE_MASTER}
+                   SELECT phash, job_id_raw FROM public.{TABLE_MASTER}
                    GROUP BY 1,2 HAVING count(*)>1) z),
                (SELECT count(*) FROM public.{TABLE_STAGE} WHERE yr = 0),
                (SELECT count(*) FROM public.{TABLE_STAGE} WHERE plat = 255),
                (SELECT count(*) FROM public.{TABLE_MASTER}
-                WHERE latest_day - earliest_day > 30 AND records_collapsed > 1)
+                WHERE latest_day - earliest_day > 30 AND records_collapsed > 1),
+               (SELECT count(*) - count(DISTINCT job_id)
+                FROM public.{TABLE_MASTER})
     """)
-    (stage, map_n, master, collapsed, dup_groups, rid_dups, bad_years,
-     unk_plat_stage, span_over_groups) = cur.fetchone()
+    (stage, isolated, map_n, master, collapsed, dup_groups, rid_dups, bad_years,
+     unk_plat_stage, span_over_groups, stable_id_collisions) = cur.fetchone()
     conn.close()
-    rule1_sum = stage - map_n
+    eligible_stage = stage - isolated
+    rule1_sum = eligible_stage - map_n
     problems: list[str] = []
     if rule1_sum < 0:
         problems.append(f"groupmap {map_n} > stage {stage}（不可能状态）")
@@ -632,23 +827,33 @@ def verify_invariants(metas: list[dict] | None = None) -> None:
                             f"（须清理源数据后重跑）")
     if span_over_groups:
         problems.append(f"{span_over_groups} 组跨度>30 天（桶规则违例，实现缺陷）")
+    if stable_id_collisions:
+        problems.append(
+            f"稳定 job_id 发生 {stable_id_collisions} 个 SHA256-63 碰撞，拒绝发布")
     if collapsed != map_n:
         problems.append(f"分桶守恒失败: Σcollapsed {collapsed} != groupmap {map_n}")
-    if rule1_sum > stage * 0.02:
-        problems.append(f"规则1折叠 {rule1_sum} 超 stage 2%（rid 重复异常）")
+    if rule1_sum > eligible_stage * 0.02:
+        problems.append(
+            f"规则1折叠 {rule1_sum} 超 eligible stage 2%（rid 重复异常）"
+        )
     logger.info("规则1折叠行数（stage-groupmap）: %d", rule1_sum)
     if dup_groups != 0:
         problems.append(f"{dup_groups} 组出现多 canonical")
     if rid_dups != 0:
-        problems.append(f"{rid_dups} 个 (plat,rid) 出现多 canonical")
-    if bad_years / max(stage, 1) > BAD_YEAR_THRESHOLD:
-        problems.append(f"年份不可解析 {bad_years}/{stage} 超阻断线 {BAD_YEAR_THRESHOLD:.1%}")
+        problems.append(f"{rid_dups} 个 (platform_hash,rid) 出现多 canonical")
+    if bad_years > isolated:
+        problems.append(
+            f"yr=0 行 {bad_years} 大于日期隔离行 {isolated}（隔离逻辑异常）"
+        )
     if problems:
         for p in problems:
             logger.error("不变量: %s", p)
         raise SystemExit(2)
-    logger.info("M2 不变量通过: stage=%d collapsed=%s 组唯一 canonical=%d",
-                stage, collapsed, master)
+    logger.info(
+        "M2 不变量通过: stage=%d isolated_date=%d eligible=%d "
+        "collapsed=%s canonical=%d",
+        stage, isolated, eligible_stage, collapsed, master,
+    )
 
 
 def main() -> None:
@@ -672,8 +877,9 @@ def main() -> None:
     if args.bench:
         # 单城单年小片（~8M/32≈25 万行/片）测吞吐，先估后跑（§9 长跑纪律）
         s, c, lo, hi, yf = _plan_tasks(32, "2024")[0]
+        source_sha = _source_snapshot_sha()
         plats = _build_platform_dict()
-        _init_worker(plats)
+        _init_worker(plats, source_sha)
         (out_dir / "bench").mkdir(parents=True, exist_ok=True)
         meta = _scan_slice(s, c, lo, hi, str(out_dir / "bench"), yf)
         dur = (datetime.now() - t0).total_seconds()
@@ -682,8 +888,11 @@ def main() -> None:
                     meta["rows"], dur, rate, 101_000_000 / rate / 8 / 3600)
         return
 
-    copy_ent_map()
-    metas = pass1_scan(args.workers, args.slices, out_dir)
+    source_sha = _source_snapshot_sha()
+    copy_ent_map(source_sha, resume=args.resume)
+    metas = pass1_scan(
+        args.workers, args.slices, out_dir, source_sha
+    )
     for m in metas:
         m["file"] = str(out_dir / f"{m['task']}.rows.bin")
     copy_stage(metas, resume=args.resume)

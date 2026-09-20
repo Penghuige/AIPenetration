@@ -1,0 +1,31 @@
+# 正式 discovery frame 分层配置。
+# 源字段必须由 data_field_dictionary.xlsx / source audit 核定后填写。
+version: discovery_strata_v1
+
+source:
+  industry_source: TO_BE_CONFIRMED
+  industry_column: TO_BE_CONFIRMED
+  company_size_source: TO_BE_CONFIRMED
+  company_size_column: TO_BE_CONFIRMED
+
+position_group:
+  mode: normalized_position
+
+text_length:
+  # 对 job_description_match 可见字符数的确定性分箱；仅用于抽样分层。
+  bins: [0, 200, 500, 1000, 2000, 1000000000]
+  labels: [lt200, 200_499, 500_999, 1000_1999, ge2000]
+
+tech_flag:
+  # 技术/非技术仅用于候选发现分层，不进入最终 AI 岗判定。
+  # 必须在正式运行前由项目方冻结一个岗位名称正则；禁止代码自行猜测。
+  mode: position_regex
+  position_regex: TO_BE_CONFIRMED
+
+representative:
+  # §6.2.0 全局 DISTINCT(platform,text_hash) 后的代表记录选择。
+  order:
+    - industry_present_desc
+    - company_size_present_desc
+    - year_asc
+    - stable_job_id_asc

@@ -30,7 +30,7 @@ import pyarrow.parquet as pq
 from config.paths import get_project_paths
 
 from ..common import setup_logging
-from .anchors import ANCHOR_VERSIONS
+from .anchors import ANCHOR_VERSIONS, match_anchors, normalize_desc
 
 logger = logging.getLogger("ai_penetration.panel_v2.scoring")
 
@@ -162,20 +162,38 @@ def run(rel_dir: Path, bench: bool = False) -> None:
         firm = firm[firm.job_id.isin(keep_jobs)]
         jobs = keep_jobs
         logger.info("[bench] 截取 %d 岗位试算", len(jobs))
-    j_of = np.searchsorted(jobs, longs.job_id.to_numpy())
+    long_ids = longs.job_id.to_numpy()
+    j_of = np.searchsorted(jobs, long_ids)
+    valid_long = j_of < len(jobs)
+    if not valid_long.all() or not np.all(jobs[j_of[valid_long]] == long_ids[valid_long]):
+        raise RuntimeError("job_skill_long 含 classification/flags 外 job_id")
     s_of = longs.skill_code.to_numpy(np.int32)
     y_of = longs.year.to_numpy(np.int32)
     n_skill = int(rel.skill_code.max()) + 1
     years = np.sort(np.unique(flags.year.to_numpy()))
-    ymin = int(years[0])
-    yidx_pairs = y_of - ymin
-    # job → company 映射（firm 每 job 一行，按 job_id 对齐，防行序错配）
+    yidx_pairs = np.searchsorted(years, y_of)
+    valid_year = yidx_pairs < len(years)
+    if (not valid_year.all()
+            or not np.all(years[yidx_pairs[valid_year]] == y_of[valid_year])):
+        raise RuntimeError("job_skill_long 含 flags 年份集合外年份")
+    # job → company 映射（firm 必须与岗位全集一对一）
     company_of_job = np.zeros(len(jobs), np.int32)
     firm_job_arr = firm.job_id.to_numpy()
-    assert np.array_equal(np.sort(firm_job_arr), np.unique(firm_job_arr)), \
-        "firm 表 job 重复"
-    company_of_job[np.searchsorted(jobs, firm_job_arr)] = \
-        firm.company_code.to_numpy(np.int32)
+    if not np.array_equal(np.sort(firm_job_arr), np.unique(firm_job_arr)):
+        raise RuntimeError("firm 表 job 重复")
+    firm_pos = np.searchsorted(jobs, firm_job_arr)
+    firm_valid = firm_pos < len(jobs)
+    if (
+        not firm_valid.all()
+        or not np.all(jobs[firm_pos[firm_valid]] == firm_job_arr[firm_valid])
+    ):
+        raise RuntimeError("job_firm 含 flags 外 job_id")
+    if len(firm_job_arr) != len(jobs):
+        raise RuntimeError(
+            f"job_firm 覆盖不完整: {len(firm_job_arr)} != {len(jobs)}"
+        )
+    company_of_job[firm_pos] = firm.company_code.to_numpy(np.int32)
+
 
     anchor_arrays = {}
     for ver in VERSIONS:
@@ -186,18 +204,30 @@ def run(rel_dir: Path, bench: bool = False) -> None:
     dense = _dense_weights(rel, years, n_skill)
     n_y = len(years)
 
-    # job 属性表
+    # job 属性表：按实际 years 建显式索引，不假设年份连续或使用未定义 ymin。
     job_year = np.zeros(len(jobs), np.int32)
-    job_year[np.searchsorted(jobs, flags.job_id.to_numpy())] = \
-        flags.year.to_numpy(np.int32) - ymin
+    flag_pos = np.searchsorted(jobs, flags.job_id.to_numpy())
+    flag_years = flags.year.to_numpy(np.int32)
+    flag_year_idx = np.searchsorted(years, flag_years)
+    year_idx_valid = flag_year_idx < len(years)
+    if (
+        not year_idx_valid.all()
+        or not np.all(
+            years[flag_year_idx[year_idx_valid]]
+            == flag_years[year_idx_valid]
+        )
+    ):
+        raise RuntimeError("flags 含年份集合外年份")
+    job_year[flag_pos] = flag_year_idx
     matched = np.bincount(j_of, minlength=len(jobs)).astype(np.int32)
 
     # B1：每个 (ver,win,scoretype) 单元即算即落盘（dataset 分区），
     # 不累积 18 个全量帧；B2：weighted/coverage 由 isfinite 实测。
-    assert n_y <= 16, "留一 triple 键打包假设 yidx<16（M1 防扩年后静默错配）"
+    if n_y > 16:
+        raise RuntimeError("留一 triple 键打包假设 yidx<16（防扩年后静默错配）")
     score_dir = rel_dir / "job_ai_score"
     score_dir.mkdir(parents=True, exist_ok=True)
-    cls = pd.DataFrame({"job_id": jobs, "year": job_year + ymin})
+    cls = pd.DataFrame({"job_id": jobs, "year": years[job_year]})
     n_jobs = len(jobs)
     for ver in VERSIONS:
         for win in WINDOWS:
@@ -211,8 +241,10 @@ def run(rel_dir: Path, bench: bool = False) -> None:
                                  minlength=n_jobs)
                 weighted = np.bincount(j_of[finite], minlength=n_jobs)
                 bad = (matched > 0) & (weighted != matched)
-                assert not bad.any(), \
-                    f"§15.3.2 阻断：{ver}/{win}/{st} 有 {int(bad.sum())} 岗位技能权重缺失"
+                if bad.any():
+                    raise RuntimeError(
+                        f"§15.3.2 阻断：{ver}/{win}/{st} 有 "
+                        f"{int(bad.sum())} 岗位技能权重缺失")
                 cov = np.divide(sw, weighted, out=np.full(n_jobs, np.nan),
                                 where=weighted > 0)
                 pq.write_table(
@@ -240,6 +272,77 @@ def run(rel_dir: Path, bench: bool = False) -> None:
         if c.startswith("aijob_"):
             cls[c] = np.where(zero, 0, cls[c])
 
+    # §19.2 稳健性：不改主指标，仅输出两种 main×annual×raw 替代得分。
+    annual_w = dense[("main", "raw")][yidx_pairs, s_of]
+    if not np.isfinite(annual_w).all():
+        raise RuntimeError("robustness 前 main annual raw 存在缺失权重")
+
+    def variant_score(pair_mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        pj = j_of[pair_mask]
+        ww = annual_w[pair_mask]
+        cnt = np.bincount(pj, minlength=len(jobs)).astype(np.int32)
+        sm = np.bincount(
+            pj, weights=ww, minlength=len(jobs)
+        )
+        score = np.divide(
+            sm, cnt,
+            out=np.full(len(jobs), np.nan),
+            where=cnt > 0,
+        )
+        return score, cnt
+
+    if "confidence_tier" not in longs.columns:
+        raise RuntimeError(
+            "job_skill_long 缺 confidence_tier，无法计算 exclude-C 稳健性"
+        )
+    tier_mask = (
+        longs.confidence_tier.astype(str).to_numpy() != "C"
+    )
+    score_no_c, count_no_c = variant_score(tier_mask)
+
+    alias_df = pq.read_table(
+        rel_dir / "skill_alias_v1.parquet",
+        columns=["skill_id", "alias"],
+    ).to_pandas()
+    anchor_skill_ids = {
+        str(sid)
+        for sid, alias in zip(alias_df.skill_id, alias_df.alias)
+        if match_anchors("main", normalize_desc(str(alias))).flag
+    }
+    if "skill_id" not in longs.columns:
+        raise RuntimeError(
+            "job_skill_long 缺 skill_id，无法计算 remove-anchor 稳健性"
+        )
+    pair_sid = longs.skill_id.astype(str).to_numpy()
+    no_anchor_mask = ~np.isin(pair_sid, list(anchor_skill_ids))
+    score_no_anchor, count_no_anchor = variant_score(no_anchor_mask)
+
+    robust = pd.DataFrame({
+        "job_id": jobs,
+        "year": years[job_year],
+        "aiscore_main_annual_raw_exclude_c": score_no_c,
+        "matched_skill_count_exclude_c": count_no_c,
+        "aiscore_main_annual_raw_remove_anchor_skills": score_no_anchor,
+        "matched_skill_count_remove_anchor_skills": count_no_anchor,
+    })
+    primary005 = cls["aijob_main_annual_raw_005"].to_numpy(np.int8)
+    for label, score in (
+        ("exclude_c", score_no_c),
+        ("remove_anchor_skills", score_no_anchor),
+    ):
+        for thr, suffix in ((0.05, "005"), (0.10, "010"), (0.15, "015")):
+            flag = np.where(np.isnan(score), 0, score > thr).astype(np.int8)
+            robust[f"aijob_main_annual_raw_{label}_{suffix}"] = flag
+        robust[f"flip_vs_primary005_{label}"] = (
+            robust[f"aijob_main_annual_raw_{label}_005"].to_numpy(np.int8)
+            != primary005
+        ).astype(np.int8)
+    pq.write_table(
+        pa.Table.from_pandas(robust),
+        rel_dir / "job_ai_score_robustness.parquet",
+        compression="zstd",
+    )
+
     # §14.3 留一（main raw）：单位整数计数 dense 从 counts 重建（向量）
     anchored_main = anchor_arrays["main"] > 0
     pair_anchored = anchored_main[j_of]
@@ -263,7 +366,7 @@ def run(rel_dir: Path, bench: bool = False) -> None:
 
     loo = _job_loo_scores(j_of, s_of, yidx_pairs, company_of_job[j_of],
                           pair_anchored, unit_dense, n_y, len(jobs))
-    loo_frame = pd.DataFrame({"job_id": jobs, "year": job_year + ymin})
+    loo_frame = pd.DataFrame({"job_id": jobs, "year": years[job_year]})
     for win, (score, cov) in loo.items():
         loo_frame[f"loo_main_{win}_raw"] = score
         loo_frame[f"loo_main_{win}_coverage"] = cov

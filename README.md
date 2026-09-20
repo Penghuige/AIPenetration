@@ -71,7 +71,7 @@ logs/                 # 运行日志
 ## 外部技能词典冻结管线（exchange 交接·第二节四步）
 
 ```bash
-# 1. 频数计算（广深语料，去重口径 COUNT(DISTINCT platform×规范化text)，约1-2h）
+# 1. 频数计算（广深语料，分级/激活口径 COUNT(DISTINCT 规范化text_hash)）
 python -X utf8 -m src.ai_penetration.zh_alias_freq --force
 
 # 2-3. 阈值激活（先 dry-run 看候选，确认后 --apply）
@@ -96,10 +96,182 @@ python -m src.ai_penetration.freeze_external_dictionary
 
 写报告时请注明所用 `--method` 与 omega 快照时间戳。
 
+## 原始交接合规重跑（v2i）
+
+历史 v2h 只作为旧结果保留；不要覆盖或把旧结果重新标成 v2i。PR #4 的
+v2i 是一次整体迁移，正式发布要求“上游真实执行 manifest → v4 治理 →
+handoff scan → v2i”全部闭环。下面命令**不应在 GitHub Actions 中自动跑**，
+长任务在项目机器本地执行。
+
+### 0. 先冻结人工可核定配置
+
+1. `config/model_config_v1.yaml`：模型 revision、量化、tokenizer、vLLM、
+   CUDA、PyTorch 等不得保留 `TO_BE_CONFIRMED`。
+2. `config/discovery_strata_v1.yaml`：必须从
+   `data_field_dictionary.xlsx` 核定行业来源/字段、企业规模来源/字段，并冻结
+   `tech_flag.position_regex`；代码不会自行猜测。
+
+### 1. 源数据、翻译与 A 级冻结
+
+```bash
+python -m src.ai_penetration.panel_v2.source_audit \
+  --snapshot-id <固定数据库快照/备份ID>
+
+python -m src.ai_penetration.translation_completion \
+  --results-dir <170批result目录> \
+  --qc-dir <170批QC目录> \
+  --input-jsonl <完整中文化输入.jsonl> \
+  --batch-manifest <批次清单> \
+  --prompt-file <中文化prompt> \
+  --schema-file <中文化schema>
+
+python -m src.ai_penetration.zh_alias_freq
+python -m src.ai_penetration.zh_alias_activation --apply
+python -m src.ai_penetration.freeze_external_dictionary
+```
+
+冻结器必须生成三个 §7.6.7 Parquet，translation verifier 必须生成
+`external_translation_log_v1.jsonl`；缺任意一件时 v2i 拒绝发布。
+
+### 2. 主样本去重与当前全量 legacy 频数
+
+```bash
+python -m src.ai_penetration.panel_v2.dedup
+
+python -m src.ai_penetration.panel_v2.legacy_freq \
+  --tag legacy_df_freq_v1
+```
+
+`legacy_df_freq_v1.csv` 的 B/C 证据来自全量规范化文本：
+`df_unique_text / main_anchor_unique_text / candidate_anchor_cooc / first_year`。
+v3 不继承旧 proxy grade。
+
+### 3. 至少两个 Qwen 候选做技术基准，再冻结生产模型
+
+每个候选实际运行前，`config/model_runtime.yaml` 必须指向对应正在服务的模型。
+
+```bash
+python -m src.ai_penetration.panel_v2.model_benchmark run \
+  --phase technical --candidate-id qwen_candidate_1 \
+  --config-file <candidate1.yaml> \
+  --sample-file <1000条技术基准.jsonl>
+
+python -m src.ai_penetration.panel_v2.model_benchmark run \
+  --phase technical --candidate-id qwen_candidate_2 \
+  --config-file <candidate2.yaml> \
+  --sample-file <同一1000条技术基准.jsonl>
+```
+
+选定候选后，把**该候选同一份配置**写入 `config/model_config_v1.yaml`，
+并把 runtime 指向同一模型，再执行：
+
+```bash
+python -m src.ai_penetration.panel_v2.model_benchmark select \
+  --manifests <candidate1_manifest.json> <candidate2_manifest.json> \
+  --selected-candidate <被选candidate_id>
+
+python -m src.ai_penetration.panel_v2.model_benchmark run \
+  --phase prerun --candidate-id production \
+  --sample-file <10000条预运行.jsonl>
+```
+
+### 4. 用冻结 production Qwen 生成 pre-discovery v3，再构建 frame
+
+```bash
+python -m src.ai_penetration.panel_v2.lexicon_llm t1
+python -m src.ai_penetration.panel_v2.lexicon_llm t2
+python -m src.ai_penetration.panel_v2.lexicon_llm merge
+```
+
+T1/T2 会强制检查 `model_runtime.yaml` 与冻结的
+`model_config_v1.yaml` 是同一个 production 模型，并生成
+`skill_legacy_governance_manifest_v3.json`。
+
+随后构建正式 discovery corpus / frame：
+
+```bash
+python -m src.ai_penetration.panel_v2.discovery_frame
+
+python -m src.ai_penetration.panel_v2.discovery_formal baseline \
+  --frame output/dictionary/discovery_frame_v1.parquet \
+  --out output/dictionary/discovery_selected_r0.csv
+```
+
+`dictionary_discovery_corpus_v1.parquet` 严格按
+`DISTINCT(source_platform,text_hash)` 唯一化，并保存代表记录、原始出现次数、
+企业数、年份范围和来源岗位 ID 列表。
+
+### 5. discovery 迭代：抽取 → 全量频数 → 动态概念归一 → 指标
+
+对当前**累计 selected CSV**运行抽取；缓存会跳过已经成功的文本：
+
+```bash
+python -m src.ai_penetration.panel_v2.discovery_extract \
+  --sample output/dictionary/discovery_selected_r<N>.csv
+
+python -m src.ai_penetration.panel_v2.discovery_review \
+  --mentions output/llm_review/formal_discovery_v1/mentions.parquet \
+  --prepare-only
+
+python -m src.ai_penetration.panel_v2.legacy_freq \
+  --terms-file output/dictionary/formal_discovery_terms_v1.txt \
+  --tag formal_discovery_full_freq_v1
+
+python -m src.ai_penetration.panel_v2.discovery_review \
+  --mentions output/llm_review/formal_discovery_v1/mentions.parquet \
+  --full-freq output/dictionary/formal_discovery_full_freq_v1.csv
+
+python -m src.ai_penetration.panel_v2.discovery_formal metrics \
+  --selected output/dictionary/discovery_selected_r<N>.csv \
+  --candidate-audit output/dictionary/formal_discovery_candidate_audit_v1.csv \
+  --out output/dictionary/discovery_round_metrics.csv
+```
+
+如果尚未满足连续两个**增量轮次**新增 B/C 新概念均少于 5，则：
+
+```bash
+python -m src.ai_penetration.panel_v2.discovery_formal round \
+  --frame output/dictionary/discovery_frame_v1.parquet \
+  --selected output/dictionary/discovery_selected_r<N>.csv \
+  --round <N+1> \
+  --out output/dictionary/discovery_selected_r<N+1>.csv
+```
+
+然后重复本节。覆盖率增益只作为监测；如已计算，可用
+`discovery_formal metrics --coverage <coverage.csv>` 合并，不参与准入或停止。
+
+饱和后：
+
+```bash
+python -m src.ai_penetration.panel_v2.discovery_formal finalize \
+  --frame output/dictionary/discovery_frame_v1.parquet \
+  --frame-manifest output/dictionary/discovery_frame_manifest_v1.json \
+  --selected output/dictionary/discovery_selected_r<N>.csv \
+  --metrics output/dictionary/discovery_round_metrics.csv \
+  --candidate-audit output/dictionary/formal_discovery_candidate_audit_v1.csv \
+  --governance output/dictionary/skill_governed_ABCD_v4.csv
+```
+
+### 6. v4 正式匹配与 v2i 发布
+
+```bash
+# 默认就是 _handoff_scan；显式写出仅为可读性
+python -m src.ai_penetration.panel_v2.scan --out-tag _handoff_scan
+
+python -m src.ai_penetration.panel_v2.v2i --dry-run
+python -m src.ai_penetration.panel_v2.v2i \
+  --run-id YYYYMMDD_HHMM_v2i
+```
+
+`v2i --dry-run` 会验证所有上游 manifest、生产模型一致性、discovery frame、
+v4 治理表以及 handoff scan 哈希闭环。正式 release 采用 staging → 质量门 →
+manifest → 原子提升；默认拒绝覆盖已有 `panel_v2i`。
+
+
 ## 测试
 
 ```bash
-pytest src/tests/ -q          # 27 个离线单测，不需要数据库和 LLM
+pytest src/tests/ -q
 python -m compileall -q src config
 ```
 

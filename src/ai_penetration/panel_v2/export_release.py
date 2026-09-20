@@ -61,10 +61,20 @@ def _meta(p: Path, run_id: str, primary_key: str, source_files: str,
     if p.suffix == ".parquet":
         schema = str(_pq.read_schema(p))
         n = _pq.ParquetFile(p).metadata.num_rows
-    else:
+    elif p.suffix == ".csv":
         text = p.read_text(encoding="utf-8-sig")
         schema = "csv"
         n = max(text.count("\n") - 1, 0)
+    elif p.suffix == ".json":
+        obj = json.loads(p.read_text(encoding="utf-8"))
+        schema = "json:" + type(obj).__name__
+        n = len(obj) if isinstance(obj, (list, dict)) else None
+    elif p.suffix == ".md":
+        schema = "markdown"
+        n = None
+    else:
+        schema = p.suffix.lstrip(".") or "unknown"
+        n = None
     meta = {
         "file_name": p.name, "run_id": run_id,
         "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -151,17 +161,20 @@ def legacy_disposition_frame(legacy_terms: list[str], lex) -> pd.DataFrame:
 def export_legacy_disposition(rel: Path) -> pd.DataFrame:
     """用生产同源路径重建 union 词表并落 skill_legacy_v1.parquet。
 
-    断言强制对账：legacy_concept 计数 == lex.n_legacy，
+    显式异常强制对账：legacy_concept 计数 == lex.n_legacy，
     covered+duplicate == len(lex.overlap_terms)，全量 == len(terms)。
     """
     terms = load_merged_skills(include_llm=True)
     lex = build_union_lexicon(include_legacy=True, legacy_terms=terms)
     frame = legacy_disposition_frame(terms, lex)
     n = frame.disposition.value_counts()
-    assert int(n.get("legacy_concept", 0)) == lex.n_legacy, "legacy 计数失配"
-    assert int(n.get("covered_by_atier", 0)) + int(n.get("duplicate_term", 0)) \
-        == len(lex.overlap_terms), "重叠计数失配"
-    assert len(frame) == len(terms), "词数失配"
+    if int(n.get("legacy_concept", 0)) != lex.n_legacy:
+        raise RuntimeError("legacy 计数失配")
+    if (int(n.get("covered_by_atier", 0)) + int(n.get("duplicate_term", 0))
+            != len(lex.overlap_terms)):
+        raise RuntimeError("重叠计数失配")
+    if len(frame) != len(terms):
+        raise RuntimeError("词数失配")
     frame.to_parquet(rel / "skill_legacy_v1.parquet", index=False)
     logger.info("legacy 处置表: %d 词 → 合成概念 %d / 并入A级 %d / 内部重复 %d / 短词 %d",
                 len(frame), int(n.get("legacy_concept", 0)),

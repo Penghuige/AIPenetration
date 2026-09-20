@@ -31,11 +31,11 @@ logger = logging.getLogger("ai_penetration.panel_v2.counts")
 WINDOWS = ("annual", "pooled", "roll3_centered")
 
 
-def load_inputs(rel_dir: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+def load_inputs(rel_dir: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict, np.ndarray]:
     """读两个 parquet，job_id 重映射为连续行号。
 
     Returns:
-        (job_idx_of_pair, skill_code, year, flags_by_version)
+        (job_idx_of_pair, skill_code, pair_year, flags_by_version, all_years)
     """
     flags = pq.read_table(rel_dir / "job_anchor_flag.parquet").to_pandas()
     longs = pq.read_table(rel_dir / "job_skill_long.parquet",
@@ -43,27 +43,47 @@ def load_inputs(rel_dir: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict
     jid_arr = flags["job_id"].to_numpy()
     order = np.argsort(jid_arr)
     job_ids = jid_arr[order]
-    pos = np.searchsorted(job_ids, longs["job_id"].to_numpy())
-    assert np.all(job_ids[pos] == longs["job_id"].to_numpy()), \
-        "long 表存在 flag 表之外的 job_id"
-    flag_idx = {v: flags[f"anchor_{v}"].to_numpy()[order]
-                for v in ANCHOR_VERSIONS}
-    return pos.astype(np.int64), longs["skill_code"].to_numpy(np.int32), \
-        longs["year"].to_numpy(np.int16), flag_idx
+    long_ids = longs["job_id"].to_numpy()
+    pos = np.searchsorted(job_ids, long_ids)
+    valid = pos < len(job_ids)
+    if not valid.all() or not np.all(job_ids[pos[valid]] == long_ids[valid]):
+        raise RuntimeError("long 表存在 flag 表之外的 job_id")
+    flag_idx = {
+        v: flags[f"anchor_{v}"].to_numpy()[order]
+        for v in ANCHOR_VERSIONS
+    }
+    flag_year_sorted = flags["year"].to_numpy(np.int16)[order]
+    pair_year = longs["year"].to_numpy(np.int16)
+    if not np.array_equal(flag_year_sorted[pos], pair_year):
+        raise RuntimeError("job_skill_long year 与对应 job_anchor_flag year 不一致")
+    all_years = np.sort(np.unique(flag_year_sorted))
+    if len(all_years) > 1 and not np.all(np.diff(all_years) == 1):
+        raise RuntimeError(
+            f"正式年份集合不连续，不能按相邻索引构造 centered roll3: "
+            f"{all_years.tolist()}"
+        )
+    return (
+        pos.astype(np.int64),
+        longs["skill_code"].to_numpy(np.int32),
+        pair_year,
+        flag_idx,
+        all_years,
+    )
 
 
 def compute_counts(rel_dir: Path) -> pd.DataFrame:
     """§13.1–§13.3 全部计数 + §13.6 实现顺序。"""
-    job_idx, skill, year, flags = load_inputs(rel_dir)
+    job_idx, skill, year, flags, years = load_inputs(rel_dir)
     # §13.6.9 计算前基线日志
     # 标签修正（2026-09-09 审计：unique([job_idx, year]) 是岗位×年组合数，
     # 不是"岗位×技能×年"——键里根本没有 skill）
     logger.info("计数基线: 岗位=%d 岗位-技能行=%d 岗位×年组合数=%d",
                 len(flags["main"]) if isinstance(flags, dict) else 0,
-                len(skill), len(np.unique(np.stack([job_idx, year]))))
-    years = np.sort(np.unique(year))
+                len(skill), len(np.unique(np.stack([job_idx, year], axis=1), axis=0)))
     n_y = len(years)
     yidx = np.searchsorted(years, year)
+    if skill.size == 0:
+        raise RuntimeError("job_skill_long 为空，无法计算技能共现")
     n_skill_max = int(skill.max()) + 1
     cells = skill.astype(np.int64) * n_y + yidx
     out_frames = []
@@ -123,21 +143,43 @@ def compute_counts(rel_dir: Path) -> pd.DataFrame:
 
 
 def verify_counts(counts: pd.DataFrame) -> None:
-    """§13.7 计数不变量（任一失败 raise）。"""
-    g = counts.groupby(["anchor_version", "window_type", "year", "skill_code"])
-    assert g.size().max() == 1, "同一 skill×窗口×锚点出现多行"
+    """§13.7 计数不变量；任何失败均显式阻断。"""
+    g = counts.groupby(
+        ["anchor_version", "window_type", "year", "skill_code"]
+    )
+    if int(g.size().max()) != 1:
+        raise RuntimeError("同一 skill×窗口×锚点出现多行")
     bad = counts[counts["n_ai_cooccur"] > counts["n_skill"]]
-    assert bad.empty, f"{len(bad)} 行分子>分母"
-    assert (counts["n_skill"] > 0).all(), "n_skill<=0"
+    if not bad.empty:
+        raise RuntimeError(f"{len(bad)} 行分子>分母")
+    if not (counts["n_skill"] > 0).all():
+        raise RuntimeError("n_skill<=0")
     for ver in ANCHOR_VERSIONS:
-        ann = counts[(counts.anchor_version == ver) & (counts.window_type == "annual")]
-        pool = counts[(counts.anchor_version == ver) & (counts.window_type == "pooled")]
+        ann = counts[
+            (counts.anchor_version == ver)
+            & (counts.window_type == "annual")
+        ]
+        pool = counts[
+            (counts.anchor_version == ver)
+            & (counts.window_type == "pooled")
+        ]
         a = ann.groupby("skill_code")[["n_skill", "n_ai_cooccur"]].sum()
         p = pool.set_index("skill_code")[["n_skill", "n_ai_cooccur"]]
-        joined = a.join(p, how="outer", lsuffix="_a", rsuffix="_p").fillna(0)
-        assert np.allclose(joined["n_skill_a"], joined["n_skill_p"]) and \
-            np.allclose(joined["n_ai_cooccur_a"], joined["n_ai_cooccur_p"]), \
-            f"pooled 年度加总不守恒 ({ver})"
+        joined = a.join(
+            p, how="outer", lsuffix="_a", rsuffix="_p"
+        ).fillna(0)
+        ok = (
+            np.array_equal(
+                joined["n_skill_a"].to_numpy(np.int64),
+                joined["n_skill_p"].to_numpy(np.int64),
+            )
+            and np.array_equal(
+                joined["n_ai_cooccur_a"].to_numpy(np.int64),
+                joined["n_ai_cooccur_p"].to_numpy(np.int64),
+            )
+        )
+        if not ok:
+            raise RuntimeError(f"pooled 年度加总不守恒 ({ver})")
     logger.info("§13.7 计数不变量全部通过")
 
 

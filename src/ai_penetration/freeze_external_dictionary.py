@@ -27,6 +27,7 @@ from datetime import datetime
 from pathlib import Path
 
 import psycopg2
+import pandas as pd
 
 from config.paths import get_project_paths
 
@@ -79,6 +80,30 @@ def check_invariants() -> tuple[list[str], list[str], list[str]]:
     notes: list[str] = []
     try:
         cur = conn.cursor()
+        # 0) 上一任交接的 170 批中文化必须先真正完成，才能称为 frozen。
+        cur.execute("""
+            SELECT count(*) FROM ai_dict.skill_concepts
+            WHERE translation_status IS NULL
+               OR translation_status = ''
+               OR translation_status = 'pending_codex_zh'
+        """)
+        n_pending = int(cur.fetchone()[0])
+        (ok if n_pending == 0 else bad).append(
+            f"正式概念无 pending_codex_zh/空翻译状态: {n_pending} 违例"
+        )
+        cur.execute("""
+            SELECT count(DISTINCT dictionary_version),
+                   count(*) FILTER (WHERE skill_id IS NULL OR skill_id = '')
+            FROM ai_dict.skill_concepts
+        """)
+        n_versions, empty_skill_id = cur.fetchone()
+        (ok if int(n_versions) == 1 else bad).append(
+            f"概念表 dictionary_version 单一: {int(n_versions)} 个版本"
+        )
+        (ok if int(empty_skill_id) == 0 else bad).append(
+            f"概念 skill_id 全部非空: {int(empty_skill_id)} 违例"
+        )
+
         # 1) 歧义别名不得为激活态（限 zh/mixed；en 来源别名按指南 §7.6.4 豁免
         #    中文频数限制，其歧义由来源侧 activation_reason=unique_source_label 管理）
         cur.execute("""
@@ -168,6 +193,53 @@ ALIAS_COLUMNS = [
 ]
 
 
+def export_translation_delivery(out_dir: Path) -> dict[str, tuple[int, str]]:
+    """物化指南 §7.6.7 的三个 Parquet；log 由 translation_completion 生成。"""
+    conn = psycopg2.connect(**eps_conn_params())
+    try:
+        concepts = pd.read_sql_query(
+            "SELECT * FROM ai_dict.skill_concepts ORDER BY skill_id",
+            conn,
+        )
+        aliases = pd.read_sql_query(
+            """SELECT * FROM ai_dict.skill_aliases
+               WHERE language IN ('zh','mixed')
+               ORDER BY alias_id""",
+            conn,
+        )
+        cur = conn.cursor()
+        cur.execute("SELECT to_regclass('ai_dict.alias_ambiguity')")
+        ambiguity_exists = cur.fetchone()[0] is not None
+        if ambiguity_exists:
+            ambiguous = pd.read_sql_query(
+                """SELECT s.*
+                   FROM ai_dict.skill_aliases s
+                   LEFT JOIN ai_dict.alias_ambiguity a
+                     ON a.alias = s.alias
+                   WHERE s.ambiguity_flag='1' OR a.alias IS NOT NULL
+                   ORDER BY s.alias_id""",
+                conn,
+            )
+        else:
+            ambiguous = aliases[
+                aliases.ambiguity_flag.astype(str) == "1"
+            ].copy()
+    finally:
+        conn.close()
+
+    files = {
+        "external_skill_translation_v1.parquet": concepts,
+        "external_skill_alias_zh_v1.parquet": aliases,
+        "external_skill_ambiguous_v1.parquet": ambiguous,
+    }
+    result: dict[str, tuple[int, str]] = {}
+    for name, df in files.items():
+        path = out_dir / name
+        df.to_parquet(path, index=False, compression="zstd")
+        result[str(path)] = (len(df), _sha256_file(path))
+    return result
+
+
 def export_and_report(stamp: str) -> dict[str, str]:
     """导出两表 + 生成 QC 报告。
 
@@ -179,19 +251,30 @@ def export_and_report(stamp: str) -> dict[str, str]:
     concept_csv = out_dir / f"skill_concept_{VERSION}.csv"
     alias_csv = out_dir / f"skill_alias_active_{VERSION}.csv"
 
+    concept_select = ", ".join(
+        f"'{VERSION}' AS dictionary_version" if col == "dictionary_version" else col
+        for col in CONCEPT_COLUMNS
+    )
+    alias_select = ", ".join(
+        f"'{VERSION}' AS dictionary_version" if col == "dictionary_version" else col
+        for col in ALIAS_COLUMNS
+    )
     n_concept = _copy_query_to_csv(
         "ai_dict",
-        f"SELECT {', '.join(CONCEPT_COLUMNS)} FROM ai_dict.skill_concepts ORDER BY skill_id",
+        f"SELECT {concept_select} FROM ai_dict.skill_concepts ORDER BY skill_id",
         concept_csv, CONCEPT_COLUMNS,
     )
     n_alias = _copy_query_to_csv(
         "ai_dict",
-        f"""SELECT {', '.join(ALIAS_COLUMNS)} FROM ai_dict.skill_aliases
+        f"""SELECT {alias_select} FROM ai_dict.skill_aliases
             WHERE is_active='1' ORDER BY alias_id""",
         alias_csv, ALIAS_COLUMNS,
     )
     sha = {str(concept_csv): _sha256_file(concept_csv), str(alias_csv): _sha256_file(alias_csv)}
     ok, bad, notes = check_invariants()
+    delivery = {} if bad else export_translation_delivery(out_dir)
+    for p, (_n, digest) in delivery.items():
+        sha[p] = digest
     lang_stats = stats_by_language()
     manifest = _latest_activation_manifest(paths.report_dir)
 
@@ -200,7 +283,7 @@ def export_and_report(stamp: str) -> dict[str, str]:
         "",
         f"- 运行时间: {datetime.now():%Y-%m-%d %H:%M:%S}",
         f"- 发布状态: `complete_candidate_not_frozen` → `a_level_frozen_{VERSION}`",
-        "- 语料依据: eps 广深 2014–2024，去重口径 COUNT(DISTINCT platform×规范化text_hash)",
+        "- 语料依据: eps 广深 2014–2024，激活频数口径 COUNT(DISTINCT 规范化text_hash)",
         "",
         "## 导出",
         "",
@@ -216,6 +299,13 @@ def export_and_report(stamp: str) -> dict[str, str]:
     ]
     for lang, active, cnt in lang_stats:
         lines.append(f"| {lang} | {active} | {cnt} |")
+    if delivery:
+        lines += ["", "## §7.6.7 中文化交付件", "", "| 文件 | 行数 | SHA-256 |",
+                  "|---|---:|---|"]
+        for p, (n_rows, digest) in delivery.items():
+            lines.append(
+                f"| {Path(p).name} | {n_rows} | `{digest[:16]}…` |"
+            )
     if manifest:
         lines += [
             "",

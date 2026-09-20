@@ -1,26 +1,15 @@
-"""panel_v2 M4-a：自动化质量门（指南 §17.3–§17.6）与统计报告。
+"""panel_v2 §17 自动质量门与可审计警告输出。
 
-§17.6 十项阻断检查任一失败 → raise（停止发布）；警告项与 §17.4/§17.5
-统计进入 quality_control_report.md（警告不阻断）。
+阻断项覆盖：岗位/技能唯一性、三态文本与完整稳定ID、正式词典闭环、
+longest-match/span证据、整数计数不变量、raw/smoothed范围、pooled/roll3
+守恒、岗位得分覆盖、阈值单调性以及同目录重跑一致性。任一阻断失败均退出
+非零，且不得推进成功 baseline。
 
-**警告六类覆盖披露（2026-09-09 审计修订）**——指南要求六类警告全部入报并
-附年份/行业/岗位/技能明细表，本实现覆盖情况如实如下：
-① 低频 0/1 原始权重（已实现，rare01_skills）；② 锚点口径差异（已实现，
-exposure_rate_by_anchor）；③ LLM/TRANS 增量（已实现，anchor_jobs）；
-④ 年份无技能比例（以 zero_skill_by_year 等价实现，行业维度缺失）；
-⑤ 歧义锚点×行业集中度（**未实现**：master 无行业字段，需数据源增强）；
-⑥ 年度断点（**未实现**：判据未定义，留交接方澄清）。
-明细表（逐岗位/逐技能清单）未生成——阻断级检查均在全量上验证，警告触发时
-的量级可由 quality_stats.json 反查。⑤⑥为正式偏离，随全国重跑申报。
-
-"原文跨度回填"（§17.6.3）在 v2a 记为 waived：词典匹配为确定性子串命中，
-证据可由 match 文本 + 词表重算（无 LLM 生成词），非缺失场景。
-重跑一致项（§17.6.10）：同一发布目录已经存在 quality_stats.json 时，
-本次运行必须与上一轮保持相同行数和关键统计量；漂移属于阻断错误。
-
-用法::
-    python -X utf8 -m src.ai_penetration.panel_v2.quality
+警告层会物化年度零技能率、锚点口径差异、低频0/1技能、A/B/C命中构成和
+§19.2 robustness 翻转率。指南未定义自动阈值的“歧义锚点×非技术行业集中度”
+与“无法由覆盖变化解释的年度断点”明确登记为待人工判据，不伪装为通过。
 """
+
 from __future__ import annotations
 
 import argparse
@@ -41,6 +30,8 @@ from .anchors import ANCHOR_RULES_VERSION
 
 logger = logging.getLogger("ai_penetration.panel_v2.quality")
 
+CHECKSUM_SCHEMA_VERSION = 2
+
 
 def _sha_stats(df: pd.DataFrame, cols: list[str]) -> str:
     """对指定关键列做稳定的全行校验和。
@@ -59,19 +50,31 @@ def _sha_stats(df: pd.DataFrame, cols: list[str]) -> str:
 
 
 def _rerun_drift(prev: dict, stats: dict) -> list[str]:
-    """返回 §17.6.10 同目录重跑发生漂移的关键统计项。"""
+    """返回 §17.6.10 真正的数据/结果漂移项。
+
+    checksum schema 升级本身不是数据漂移：若 schema 不同，只比较与算法无关
+    的行数和关键比例；这些相同则允许成功迁移到新 schema。
+    """
     if not prev:
         return []
-    keys = (
+    stable_keys = (
         "n_jobs",
         "n_pairs",
-        "checksum_flags",
-        "checksum_counts",
         "main_annual_raw_005_rate",
         "main_annual_raw_015_rate",
         "zero_skill_rate",
     )
-    return [k for k in keys if k in prev and k in stats and prev[k] != stats[k]]
+    stable_drift = [
+        k for k in stable_keys
+        if k in prev and k in stats and prev[k] != stats[k]
+    ]
+    if prev.get("checksum_schema_version") != stats.get("checksum_schema_version"):
+        return stable_drift
+    checksum_keys = ("checksum_flags", "checksum_counts")
+    return stable_drift + [
+        k for k in checksum_keys
+        if k in prev and k in stats and prev[k] != stats[k]
+    ]
 
 
 def gate_checks(rel: Path) -> tuple[list[str], dict]:
@@ -83,8 +86,115 @@ def gate_checks(rel: Path) -> tuple[list[str], dict]:
     counts = pq.read_table(rel / "skill_ai_counts.parquet").to_pandas()
     rel_df = pq.read_table(rel / "skill_ai_relevance.parquet").to_pandas()
     cls = pq.read_table(rel / "job_ai_classification.parquet").to_pandas()
+    text_path = rel / "job_text_clean.parquet"
+    text_rows = None
+    if not text_path.exists():
+        fails.append("缺少 §6.4 job_text_clean.parquet")
+    else:
+        pf_text = pq.ParquetFile(text_path)
+        text_rows = int(pf_text.metadata.num_rows)
+        text_cols = set(pf_text.schema_arrow.names)
+        required_text = {
+            "job_id", "job_id_sha256", "job_id_raw", "source_platform", "year",
+            "job_description_raw", "job_description_clean",
+            "job_description_match", "text_hash",
+        }
+        missing_text = required_text - text_cols
+        if missing_text:
+            fails.append(
+                "job_text_clean 缺三态文本字段: "
+                + ", ".join(sorted(missing_text))
+            )
+        if {"job_id", "job_id_sha256"} <= text_cols:
+            # 只读身份列；raw/clean/match 大文本无需进入 Pandas 内存。
+            ids = pq.read_table(
+                text_path, columns=["job_id", "job_id_sha256"]
+            ).to_pandas()
+            if ids.job_id.duplicated().any():
+                fails.append("job_text_clean job_id 不唯一")
+            sha = ids.job_id_sha256.astype(str)
+            if sha.duplicated().any():
+                fails.append("完整 SHA256 stable job_id 不唯一")
+            if not sha.str.fullmatch(r"[0-9a-f]{64}").all():
+                fails.append("job_id_sha256 格式非法")
+
+    # §18 正式发布词典必须能独立解释正式长表。
+    concept_path = rel / "skill_concept_v1.parquet"
+    alias_path = rel / "skill_alias_v1.parquet"
+    source_path = rel / "source_skill_record_v1.parquet"
+    if not concept_path.exists() or not alias_path.exists():
+        fails.append("缺少 §18 正式 skill_concept/skill_alias 发布件")
+    else:
+        concepts = pq.read_table(concept_path).to_pandas()
+        aliases = pq.read_table(alias_path).to_pandas()
+        required_concept_cols = {
+            "skill_id", "canonical_zh", "canonical_en", "skill_type",
+            "skill_category", "confidence_tier", "dictionary_version",
+            "valid_from", "valid_to",
+        }
+        missing_concept_cols = sorted(required_concept_cols - set(concepts.columns))
+        if missing_concept_cols:
+            fails.append(
+                "正式概念词典缺 §7.2 字段: " + ", ".join(missing_concept_cols)
+            )
+        required_alias_cols = {
+            "alias_id", "skill_id", "alias", "alias_normalized", "language",
+            "source", "matching_rule", "ambiguity_flag", "confidence_tier",
+            "dictionary_version",
+        }
+        missing_alias_cols = sorted(required_alias_cols - set(aliases.columns))
+        if missing_alias_cols:
+            fails.append(
+                "正式别名词典缺 §7.3 字段: " + ", ".join(missing_alias_cols)
+            )
+        concept_ids = set(concepts.skill_id.astype(str))
+        if concepts.skill_id.astype(str).duplicated().any():
+            fails.append("正式词典 skill_id 不唯一")
+        if aliases.alias_id.astype(str).duplicated().any():
+            fails.append("正式别名 alias_id 不唯一")
+        dangling_alias = set(aliases.skill_id.astype(str)) - concept_ids
+        if dangling_alias:
+            fails.append(f"正式别名存在无概念引用（{len(dangling_alias)} skill_id）")
+        if "skill_id" in longs.columns:
+            dangling_long = set(longs.skill_id.astype(str)) - concept_ids
+            if dangling_long:
+                fails.append(
+                    f"job_skill_long 含正式词典外 skill_id（{len(dangling_long)}）"
+                )
+            if longs[["job_id", "skill_id"]].duplicated().any():
+                fails.append("(job_id, skill_id) 不唯一")
+
+        if not source_path.exists():
+            fails.append("缺少 §7.4.1 source_skill_record_v1.parquet")
+        else:
+            source_records = pq.read_table(source_path).to_pandas()
+            required_source_cols = {
+                "source_name", "source_version", "source_skill_id",
+                "source_label", "source_description", "source_category",
+                "internal_skill_id", "mapping_type", "mapping_evidence",
+            }
+            missing_source_cols = sorted(
+                required_source_cols - set(source_records.columns)
+            )
+            if missing_source_cols:
+                fails.append(
+                    "source_skill_record 缺字段: "
+                    + ", ".join(missing_source_cols)
+                )
+            dangling_source = (
+                set(source_records.internal_skill_id.astype(str)) - concept_ids
+                if "internal_skill_id" in source_records.columns else set()
+            )
+            if dangling_source:
+                fails.append(
+                    f"source_skill_record 存在正式概念外引用（{len(dangling_source)}）"
+                )
 
     # 1 job_id 唯一 + 引用完整
+    anchor_detail_cols = {"matched_anchor_groups_main", "matched_anchor_terms_main"}
+    missing_anchor_detail = anchor_detail_cols - set(flags.columns)
+    if missing_anchor_detail:
+        fails.append("job_anchor_flag 缺命中明细: " + ", ".join(sorted(missing_anchor_detail)))
     if flags.job_id.duplicated().any():
         fails.append("job_id 不唯一")
     jset = np.sort(flags.job_id.to_numpy())
@@ -93,16 +203,42 @@ def gate_checks(rel: Path) -> tuple[list[str], dict]:
         fails.append("long 表存在 flag 外 job_id")
     stats["n_jobs"] = len(flags)
     stats["n_pairs"] = len(longs)
+    if text_rows is not None and text_rows != len(flags):
+        fails.append(
+            f"job_text_clean 行数 {text_rows} != job_anchor_flag {len(flags)}")
 
-    # 2 (job, skill) 唯一：int64 复合键全局查重（4 亿规模内存可行）
-    ck = (longs.job_id.to_numpy(np.int64) << 32) | longs.skill_code.to_numpy(np.int64)
-    if np.unique(ck).size != ck.size:
+    # 2 (job, skill) 唯一：job_id 为稳定 63-bit 哈希，禁止位移打包
+    # （左移会 int64 溢出并制造伪碰撞/漏碰撞）。
+    if longs.duplicated(["job_id", "skill_code"]).any():
         fails.append("(job_id, skill_code) 不唯一")
-    del ck
 
-    # 3 跨度回填：v2a waived（确定性子串匹配可重算）
-    stats["span_backfill"] = "waived_deterministic"
-
+    # 3 原文跨度回填：指南 §11.1.4/§17.6 为阻断项，不允许 waiver。
+    evidence_cols = {
+        "skill_id", "surface_form", "start", "end", "mention_count",
+        "match_method", "ambiguity_flag", "confidence_tier",
+        "dictionary_version", "span_verified",
+        "covered_candidate_count", "covered_candidates",
+    }
+    missing_evidence = sorted(evidence_cols - set(longs.columns))
+    if missing_evidence:
+        fails.append("job_skill_long 缺少交接要求证据字段: "
+                     + ", ".join(missing_evidence))
+        stats["span_backfill"] = "failed_missing_columns"
+    else:
+        bad_span = (
+            (longs["start"] < 0)
+            | (longs["end"] <= longs["start"])
+            | (longs["mention_count"] < 1)
+            | (longs["covered_candidate_count"] < 0)
+            | (longs["span_verified"] != 1)
+            | (longs["surface_form"].astype(str).str.len()
+               != (longs["end"] - longs["start"]))
+        )
+        if bad_span.any():
+            fails.append(f"原文跨度回填失败（{int(bad_span.sum())} 行）")
+            stats["span_backfill"] = "failed"
+        else:
+            stats["span_backfill"] = "verified"
     # 4 分子≤分母
     if (counts.n_ai_cooccur > counts.n_skill).any():
         fails.append("计数分子>分母")
@@ -186,6 +322,7 @@ def gate_checks(rel: Path) -> tuple[list[str], dict]:
 
     # 10 重跑一致性：稳定关键统计落盘，run() 与同目录上一轮比较并阻断漂移
     stats["anchor_rules_version"] = ANCHOR_RULES_VERSION
+    stats["checksum_schema_version"] = CHECKSUM_SCHEMA_VERSION
     flags_sorted = flags.sort_values("job_id")
     stats["checksum_flags"] = _sha_stats(
         flags_sorted,
@@ -236,9 +373,20 @@ def warning_checks(rel: Path) -> tuple[list[str], dict]:
     cls = pq.read_table(rel / "job_ai_classification.parquet").to_pandas()
     rel_df = pq.read_table(rel / "skill_ai_relevance.parquet").to_pandas()
 
-    info["zero_skill_by_year"] = (
-        cls.groupby("year").zero_skill_override.mean().round(4).to_dict()
+    zero_by_year = (
+        cls.groupby("year", as_index=False)
+        .agg(n_jobs=("job_id", "size"),
+             zero_skill_rate=("zero_skill_override", "mean"))
     )
+    zero_by_year.to_csv(
+        rel / "quality_detail_zero_skill_by_year.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    info["zero_skill_by_year"] = dict(zip(
+        zero_by_year.year.astype(int),
+        zero_by_year.zero_skill_rate.round(4),
+    ))
     raw_s = pq.read_table(
         rel / "job_ai_score" / "main_annual_raw.parquet",
         columns=["job_id", "ai_score"],
@@ -255,17 +403,30 @@ def warning_checks(rel: Path) -> tuple[list[str], dict]:
         if col in cls.columns:
             rates[ver] = round(float(cls[col].mean()), 5)
     info["exposure_rate_by_anchor"] = rates
+    pd.DataFrame(
+        [{"anchor_version": k, "main_005_rate": v} for k, v in rates.items()]
+    ).to_csv(
+        rel / "quality_detail_anchor_rates.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
     if rates:
         lo, hi = min(rates.values()), max(rates.values())
         if lo > 0 and (hi - lo) / lo > 1.0:
             warns.append(f"锚点口径 AI 率差异过大 main/cn/babina={rates}")
 
-    rare01 = rel_df[
+    rare01_rows = rel_df[
         (rel_df.window_type == "annual")
         & (rel_df.n_skill < 10)
         & ((rel_df.ai_rate_raw < 1e-9)
            | ((1 - rel_df.ai_rate_raw).abs() < 1e-9))
-    ].skill_code.nunique()
+    ].copy()
+    rare01_rows.to_csv(
+        rel / "quality_detail_rare01_skills.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    rare01 = rare01_rows.skill_code.nunique()
     info["rare01_skills"] = int(rare01)
     if int(rare01) > rel_df.skill_code.nunique() * 0.5:
         warns.append(f"低频 0/1 原始权重技能占比 {rare01} 偏高")
@@ -278,6 +439,58 @@ def warning_checks(rel: Path) -> tuple[list[str], dict]:
         "year")["aijob_main_annual_raw_015"].mean().round(5).to_dict()
     info["exposure_005_by_year"] = cls.groupby(
         "year")["aijob_main_annual_raw_005"].mean().round(5).to_dict()
+    robust_path = rel / "job_ai_score_robustness.parquet"
+    if not robust_path.exists():
+        warns.append(
+            "缺 §19.2 exclude-C / remove-anchor-skills 稳健性结果"
+        )
+    else:
+        robust = pq.read_table(
+            robust_path,
+            columns=[
+                "job_id",
+                "flip_vs_primary005_exclude_c",
+                "flip_vs_primary005_remove_anchor_skills",
+            ],
+        ).to_pandas()
+        if len(robust) != len(cls) or robust.job_id.duplicated().any():
+            warns.append("robustness job_id 行数/唯一性异常")
+        info["robustness_flip_rate"] = {
+            "exclude_c": round(
+                float(robust.flip_vs_primary005_exclude_c.mean()), 6
+            ),
+            "remove_anchor_skills": round(
+                float(
+                    robust.flip_vs_primary005_remove_anchor_skills.mean()
+                ), 6
+            ),
+        }
+
+    if "confidence_tier" in longs.columns:
+        tier_detail = (
+            longs.groupby(["year", "confidence_tier"], as_index=False)
+            .size().rename(columns={"size": "matched_pairs"})
+        )
+        tier_detail.to_csv(
+            rel / "quality_detail_tier_contribution.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        info["tier_pair_share"] = (
+            longs.confidence_tier.value_counts(normalize=True).round(4).to_dict()
+        )
+    else:
+        warns.append("§17 警告明细不完整：job_skill_long 缺 confidence_tier，无法输出 A/B/C 构成")
+
+    # 指南没有给这两类 warning 的自动阈值；不得擅自伪造判据。
+    warns.append(
+        "§17 待人工判据：歧义锚点×非技术行业集中度尚无“非技术行业”正式定义；"
+        "需在 job_context/行业口径冻结后执行"
+    )
+    warns.append(
+        "§17 待人工判据：年度 AI 比例“无法由覆盖变化解释的断点”未给数值阈值；"
+        "已输出年度 AI 率与 zero-skill 明细供判读"
+    )
     return warns, info
 
 
@@ -310,7 +523,7 @@ def run(rel: Path | None = None) -> None:
     ]
     report += (
         [f"- ❌ {f}" for f in fails]
-        or ["- ✅ 十项全部通过（含跨度回填 waived 声明）"]
+        or ["- ✅ 十项全部通过（含原文跨度回填验证）"]
     )
     report += ["", "## 警告与披露", ""]
     report += ([f"- ⚠️ {w}" for w in warns] or ["- （无警告）"])
@@ -327,7 +540,19 @@ def run(rel: Path | None = None) -> None:
     (rel / "quality_control_report.md").write_text(
         "\n".join(report), encoding="utf-8"
     )
-    stats_path.write_text(json.dumps(stats, indent=1), encoding="utf-8")
+    if fails:
+        # 失败运行不得推进 §17.6.10 的成功基线。否则第一次真实漂移会把
+        # quality_stats.json 覆盖成新值，第二次原样重跑就会“新对新”误通过。
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        failed_stats = rel / f"quality_stats.failed_{stamp}.json"
+        failed_stats.write_text(json.dumps(stats, indent=1), encoding="utf-8")
+        logger.error(
+            "质量门失败；成功基线未更新。候选统计写入 %s", failed_stats.name
+        )
+    else:
+        tmp = rel / ".quality_stats.json.tmp"
+        tmp.write_text(json.dumps(stats, indent=1), encoding="utf-8")
+        tmp.replace(stats_path)
     logger.info("质量门: fail=%d warn=%d", len(fails), len(warns))
     if fails:
         raise SystemExit(2)

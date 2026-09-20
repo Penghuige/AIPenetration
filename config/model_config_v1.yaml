@@ -1,0 +1,30 @@
+# 指南 §8.4 固定生产环境。TO_BE_CONFIRMED 字段必须由本机实测填写后，
+# model_benchmark 才允许生成 formal_pass manifest。
+model:
+  repository: Qwen/Qwen3-8B
+  revision: TO_BE_CONFIRMED
+  quantization: TO_BE_CONFIRMED
+  tokenizer_version: TO_BE_CONFIRMED
+  tokenizer_path: TO_BE_CONFIRMED
+runtime:
+  framework: vllm
+  framework_version: TO_BE_CONFIRMED
+  cuda_version: TO_BE_CONFIRMED
+  pytorch_version: TO_BE_CONFIRMED
+generation:
+  do_sample: false
+  temperature: 0.0
+  top_p: 1.0
+  seed: 20260822
+  max_model_len: 8192
+  max_input_tokens: 6000
+  max_output_tokens: 2000
+  guided_json: true
+  retry_invalid_json: 1
+text:
+  chunk_target_tokens: 5000
+  chunk_overlap_chars: 200
+  truncation_policy: sentence_or_bullet_chunk
+protocol:
+  prompt_version: skill_extraction_prompt_v1
+  schema_version: skill_extraction_schema_v1

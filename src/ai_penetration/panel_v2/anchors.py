@@ -17,10 +17,6 @@
 
 产出：ai_anchor_dictionary_v1 记录（§12.4 字段）与岗位锚点标记
 （job_anchor_flag：三列 0/1 + main 命中组 bitmask）。
-**已知偏离（2026-09-09 审计确认，已向交接方申报）**：§12.6.7 要求持久化
-"命中词明细"列，本实现只落组级 bitmask，词级命中未跨扫描持久化；影响是词级
-歧义审计只能到组粒度复现。
-
 锚点规则版本 ``ANCHOR_RULES_VERSION``（扫描日志与 QC 报告落戳）：
 - ``20260908_a``：发布面板（v2ac）所用规则——LLM 全拼复数不可命中、
   TRANS 英文无尾界、语言字段按"含小写字母即 en"误判全大写缩写。
@@ -149,11 +145,15 @@ def match_anchors(version: str, norm_text: str) -> AnchorHit:
     """
     groups_hit: list[str] = []
     terms_hit: list[str] = []
-    for grp, term, _rule, pat in _COMPILED[version]:
-        if pat.search(norm_text):
+    for grp, _term, _rule, pat in _COMPILED[version]:
+        matches = list(pat.finditer(norm_text))
+        if matches:
             if grp not in groups_hit:
                 groups_hit.append(grp)
-            terms_hit.append(term)
+            for match in matches:
+                surface = match.group(0)
+                if surface not in terms_hit:
+                    terms_hit.append(surface)
     return AnchorHit(
         flag=1 if groups_hit else 0,
         groups=tuple(groups_hit),

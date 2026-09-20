@@ -16,22 +16,29 @@ JSONL 断点续跑（按 item id 去重）、解析失败单条重试一轮后�
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import re
 import threading
+from datetime import datetime
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from config.paths import get_project_paths
+from config.paths import get_project_paths, load_config_yaml
 
 from ..common import setup_logging
 from src.model_platform.llm import create_llm_client
 
 logger = logging.getLogger("ai_penetration.panel_v2.lexicon_llm")
 
-NO_THINK = {"chat_template_kwargs": {"enable_thinking": False}}
+REVIEW_SEED = 20260822
+REVIEW_PROTOCOL_VERSION = "handoff_v2_20260919"
+NO_THINK = {
+    "chat_template_kwargs": {"enable_thinking": False},
+    "seed": REVIEW_SEED,
+}
 BUDGET_CHARS = 2600          # 请求字符预算（留 reply+模板余量）
 _LOCK = threading.Lock()
 
@@ -57,6 +64,24 @@ SYS_T2 = (
     "ambiguity: 是否存在明显跨领域同形风险（如裸 ai、ml 缩写、产品名撞名）true/false。\n"
     "只输出 JSON 数组 [{\"i\":<int>,\"s\":true|false,\"c\":\"...\",\"n\":true|false,"
     "\"r\":<int>,\"a\":true|false}]，条数一致，无其他文字。")
+
+
+def _require_production_model() -> dict:
+    cfg = load_config_yaml("model_config_v1.yaml")
+    runtime = load_config_yaml("model_runtime.yaml")
+    expected = str(cfg.get("model", {}).get("repository", "")).strip()
+    revision = str(cfg.get("model", {}).get("revision", "")).strip()
+    actual = str(runtime.get("llm", {}).get("model", "")).strip()
+    if expected in {"", "TO_BE_CONFIRMED"} or revision in {
+        "", "TO_BE_CONFIRMED"
+    }:
+        raise RuntimeError("lexicon governance 前必须冻结 model_config_v1")
+    if actual != expected:
+        raise RuntimeError(
+            f"model_runtime 当前模型 {actual!r} != "
+            f"冻结 production 模型 {expected!r}"
+        )
+    return cfg
 
 
 def _client():
@@ -155,45 +180,34 @@ def batch_review(items: list[dict], system: str, build_user, out: Path,
 # ------------------------------------------------------------------ T1
 
 def candidates_t1() -> list[dict]:
-    """T1 候选面：legacy 全键 + A 级高频别名 TOP 8000 + 8 个时代缺词。"""
+    """T1 只审当前 legacy 全键 + 明示时代补充词，不读取旧 panel_v2 结果。"""
     import pandas as pd
     paths = get_project_paths()
     dic = paths.output_dir / "dictionary"
-    rel = paths.output_dir / "release" / "panel_v2"
-    out: list[dict] = []
-    lg = pd.read_csv(dic / "legacy_df_freq_v1.csv", encoding="utf-8-sig")
-    out += [{"term": t, "tier": "legacy", "id": i}
-            for i, t in enumerate(lg.match_key)]
-    base = len(out)
-    counts = pd.read_parquet(rel / "skill_ai_counts.parquet")
-    cm = counts[(counts.anchor_version == "main")
-                & (counts.window_type == "pooled")]
-    vocab = json.loads((paths.output_dir / "panel_v2" / "pass2" / "skill_vocab.json")
-                       .read_text(encoding="utf-8"))
-    code2sid = {v: k for k, v in vocab.items()}
-    ali = pd.read_parquet(rel / "skill_alias_v1.parquet")
-    sid_keys = ali.groupby("skill_id").alias.min()  # 代表别名（确定性）
-    hot = cm.nlargest(8000, "n_skill")
-    rows = []
-    for c, fq in zip(hot.skill_code, hot.n_skill):
-        sid = code2sid.get(c)
-        if sid is None or str(sid).startswith("legacy:"):
-            continue
-        key = _norm_key(str(sid_keys.get(sid, "")))
-        if key and len(key) >= 2:
-            rows.append({"term": key, "tier": "atier",
-                         "id": base + len(rows), "freq": int(fq)})
-    out += rows
-    for j, t in enumerate(["ollama", "dify", "coze", "deepseek", "sora",
-                           "mcp", "gpt4", "multimodal", "aigc 内容", "提示词工程"]):
-        out.append({"term": t, "tier": "era_missing", "id": 900000 + j})
+    lg = pd.read_csv(
+        dic / "legacy_df_freq_v1.csv", encoding="utf-8-sig"
+    )
+    out = [
+        {"term": str(t), "tier": "legacy", "id": i}
+        for i, t in enumerate(lg.match_key)
+    ]
+    for j, term in enumerate([
+        "ollama", "dify", "coze", "deepseek", "sora",
+        "mcp", "gpt4", "multimodal", "aigc 内容", "提示词工程",
+    ]):
+        out.append({
+            "term": term,
+            "tier": "era_missing",
+            "id": 900000 + j,
+        })
     return out
 
 
 def run_t1(workers: int = 3) -> None:
+    _require_production_model()
     paths = get_project_paths()
     items = candidates_t1()
-    out = paths.output_dir / "llm_review" / "t1_stopword.jsonl"
+    out = paths.output_dir / "llm_review" / "t1_stopword_v2.jsonl"
     out.parent.mkdir(parents=True, exist_ok=True)
 
     def user(batch: list[dict]) -> str:
@@ -213,38 +227,60 @@ def _bigram_index(aliases: list[str]) -> dict[str, list[int]]:
 
 
 def candidates_t2() -> list[dict]:
-    """legacy 全键 + 确定性 top-10 已有词条（§10.3.4 检索段）。"""
+    """legacy 全键 + 与正式 matcher 同一 A 级消歧别名 Top-10。"""
     import pandas as pd
     paths = get_project_paths()
-    lg = pd.read_csv(paths.output_dir / "dictionary" / "legacy_df_freq_v1.csv",
-                     encoding="utf-8-sig")
-    ali = pd.read_parquet(paths.output_dir / "release" / "panel_v2"
-                          / "skill_alias_v1.parquet")
-    aliases = sorted({_norm_key(a) for a in ali.alias.astype(str)
-                      if len(_norm_key(str(a))) >= 2})
+    lg = pd.read_csv(
+        paths.output_dir / "dictionary" / "legacy_df_freq_v1.csv",
+        encoding="utf-8-sig",
+    )
+    required = {
+        "match_key", "df_unique_text",
+        "main_anchor_unique_text", "candidate_anchor_cooc",
+    }
+    missing = required - set(lg.columns)
+    if missing:
+        raise RuntimeError(
+            "legacy_df_freq_v1.csv 尚未按 handoff 频数协议重算: "
+            + ", ".join(sorted(missing))
+        )
+
+    from .lexicon import _load_atier_alias_records
+    resolved = _load_atier_alias_records()
+    aliases = sorted({_norm_key(r.alias) for r in resolved if _norm_key(r.alias)})
     aidx = _bigram_index(aliases)
     out = []
-    for i, key in enumerate(lg.match_key):
-        key = str(key)
-        bgs = {_norm_key(key)[k:k + 2] for k in range(len(key) - 1)}
+    for i, row in enumerate(lg.itertuples(index=False)):
+        key = _norm_key(str(row.match_key))
+        bgs = {key[k:k + 2] for k in range(len(key) - 1)}
         score: dict[int, int] = {}
         for bg in bgs:
             for j in aidx.get(bg, ()):
                 score[j] = score.get(j, 0) + 1
-        top = [aliases[j] for j, _ in
-               sorted(score.items(), key=lambda kv: (-kv[1], kv[0]))[:10]]
-        out.append({"id": i, "term": key,
-                    "df": int(lg.df_unique_text.iloc[i]),
-                    "cand": top})
+        top = [
+            aliases[j] for j, _ in
+            sorted(
+                score.items(),
+                key=lambda kv: (-kv[1], aliases[kv[0]], kv[0]),
+            )[:10]
+        ]
+        out.append({
+            "id": i,
+            "term": key,
+            "df": int(row.df_unique_text),
+            "cand_cooc": float(row.candidate_anchor_cooc),
+            "cand": top,
+        })
     return out
 
 
 def run_t2(limit: int = 0, workers: int = 3) -> None:
+    _require_production_model()
     paths = get_project_paths()
     items = candidates_t2()
     if limit:
         items = items[:limit]
-    out = paths.output_dir / "llm_review" / "t2_legacy_review.jsonl"
+    out = paths.output_dir / "llm_review" / "t2_legacy_review_v2.jsonl"
     out.parent.mkdir(parents=True, exist_ok=True)
 
     def user(batch: list[dict]) -> str:
@@ -265,100 +301,284 @@ NON_SKILL_CATS = {"task_fragment", "soft_trait", "edu_req", "exp_req",
                   "benefit", "job_title", "company", "goods_service", "other"}
 
 
-def merge_final() -> None:
-    """T1∧T2 信号合并进 v2e 分级 → 终版词表 v1.3（只出不进）。
+def _atier_alias_to_sid() -> dict[str, str]:
+    """返回已按 primary_skill_id 消歧的 A 级别名键 → skill_id。"""
+    from .lexicon import _load_atier_alias_records
+    out: dict[str, str] = {}
+    for rec in _load_atier_alias_records():
+        key = _norm_key(rec.alias)
+        if key in out and out[key] != rec.skill_id:
+            raise RuntimeError(
+                f"A级别名消歧后仍多概念: {key!r} -> {out[key]!r}/{rec.skill_id!r}"
+            )
+        out[key] = rec.skill_id
+    return out
 
-    降级规则（相对 v2e grade，任一命中即 D）：
-    ① T2 is_skill=false；② T1 类别 ∈ 非技能集；③ 真歧义 ∧ 同义反复
-    （裸锚点词如 ai：既被 T2 标 ambiguity 又在 taut 枚举——v2e 里它们靠 df
-    入了 B，正是 S6 带 46% 误判元凶，按用户"最准确结合"裁决清除）。
-    id→term 用 candidates_t1()/candidates_t2() 确定性重建（与评审运行同
-    输入同序）；评审 jsonl 与重建词表条数不一致即硬失败（防漂移）。
-    输出：skill_legacy_graded_BCD_v2.csv（final_grade/demote_reason 列）+
-    non_skill_stopword_v1.csv（B 表：T1 非技能类别全清单，含 A 级热词面）。
+
+def merge_final() -> None:
+    """把 T1/T2 真正落实到概念映射，生成 handoff-compliant v3 治理表。
+
+    与旧 v2 的关键区别：
+    - T2 r=0..9 的 MATCH_EXISTING 不再被忽略，而是映射回 A 级 skill_id；
+    - NEW_CONCEPT 的 B/C 技能按规范名+首次发现年份生成稳定 UUIDv5；
+    - AMBIGUOUS / 非技能 / 非技能停用表命中均降 D；
+    - 产物显式保存 final_skill_id / mapping_action / T2 类型与首次年份。
     """
     import pandas as pd
+    from .governance import stable_bc_skill_id
+
     paths = get_project_paths()
     rd = paths.output_dir / "llm_review"
     dic = paths.output_dir / "dictionary"
 
     def load_jsonl(name: str) -> list[dict]:
-        return [json.loads(ln) for ln in
-                (rd / name).read_text(encoding="utf-8").splitlines()]
+        path = rd / name
+        if not path.exists():
+            raise RuntimeError(f"缺少治理评审结果: {path}")
+        return [
+            json.loads(ln)
+            for ln in path.read_text(encoding="utf-8").splitlines()
+            if ln.strip()
+        ]
 
     t1_items = candidates_t1()
     t2_items = candidates_t2()
     id2t1 = {it["id"]: it for it in t1_items}
     id2t2 = {it["id"]: it for it in t2_items}
+    t2_item_by_term = {str(it["term"]): it for it in t2_items}
+    alias_to_sid = _atier_alias_to_sid()
+
     t1_cat: dict[str, str] = {}
     t1_rows: list[dict] = []
     covered: set[int] = set()
-    for r in load_jsonl("t1_stopword.jsonl"):
-        iid = int(r["id"])
+    for rec in load_jsonl("t1_stopword_v2.jsonl"):
+        iid = int(rec["id"])
         it = id2t1.get(iid)
-        assert it is not None, "T1 结果含重建外 id（词表漂移？）"
+        if it is None:
+            raise RuntimeError("T1 结果含重建外 id（词表漂移）")
         covered.add(iid)
-        res = r.get("res") or {}
+        res = rec.get("res") or {}
+        if "error" in res:
+            raise RuntimeError(f"T1 存在失败记录 id={iid}: {res}")
         cat = res.get("c")
-        t1_cat[str(it["term"])] = str(cat)  # 跨层重复词同判，后写无害
-        t1_rows.append({"term": it["term"], "tier": it["tier"],
-                        "category": cat})
-    assert covered == set(id2t1), \
-        f"T1 覆盖不齐 {len(covered)}/{len(id2t1)}"
-    t2_by_term: dict[str, dict] = {}
-    for r in load_jsonl("t2_legacy_review.jsonl"):
-        it = id2t2.get(int(r["id"]))
-        assert it is not None, "T2 结果含重建外 id"
-        t2_by_term[str(it["term"])] = r.get("res") or {}
-    assert len(t2_by_term) == len(t2_items), "T2 覆盖不齐"
+        if cat is None:
+            raise RuntimeError(f"T1 缺类别 id={iid}")
+        t1_cat[str(it["term"])] = str(cat)
+        t1_rows.append({
+            "term": it["term"], "tier": it["tier"], "category": cat
+        })
+    if covered != set(id2t1):
+        raise RuntimeError(f"T1 覆盖不齐 {len(covered)}/{len(id2t1)}")
 
-    g = pd.read_csv(dic / "skill_legacy_graded_BCD_v1.csv", encoding="utf-8-sig")
+    t2_by_term: dict[str, dict] = {}
+    covered_t2: set[int] = set()
+    for rec in load_jsonl("t2_legacy_review_v2.jsonl"):
+        iid = int(rec["id"])
+        it = id2t2.get(iid)
+        if it is None:
+            raise RuntimeError("T2 结果含重建外 id（候选列表漂移）")
+        res = rec.get("res") or {}
+        if "error" in res:
+            raise RuntimeError(f"T2 存在失败记录 id={iid}: {res}")
+        required = {"s", "c", "n", "r", "a"}
+        if not required.issubset(res):
+            raise RuntimeError(
+                f"T2 结果缺字段 id={iid}: {sorted(required - set(res))}"
+            )
+        t2_by_term[str(it["term"])] = res
+        covered_t2.add(iid)
+    if covered_t2 != set(id2t2):
+        raise RuntimeError(f"T2 覆盖不齐 {len(covered_t2)}/{len(id2t2)}")
+
+    freq = pd.read_csv(
+        dic / "legacy_df_freq_v1.csv", encoding="utf-8-sig"
+    )
+    required_freq = {
+        "match_key", "skill_id", "df_unique_text",
+        "candidate_anchor_cooc", "first_year",
+    }
+    missing_freq = required_freq - set(freq.columns)
+    if missing_freq:
+        raise RuntimeError(
+            "legacy_df_freq_v1.csv 缺当前分级所需字段: "
+            + ", ".join(sorted(missing_freq))
+        )
+    freq["term"] = freq.match_key.astype(str).map(_norm_key)
+    if freq.term.duplicated().any():
+        raise RuntimeError("legacy_df_freq_v1 term 不唯一")
     rows = []
-    for _, row in g.iterrows():
+    for row in freq.itertuples(index=False):
         term = str(row.term)
-        r2 = t2_by_term.get(term, {})
+        source_sid = str(row.skill_id)
+        r2 = t2_by_term.get(term)
+        item = t2_item_by_term.get(term)
+        if r2 is None or item is None:
+            raise RuntimeError(f"T2 未覆盖 legacy 词: {term!r}")
         c1 = t1_cat.get(term)
-        final, reason = str(row.grade), ""
-        if row.grade != "D":
-            rs = []
-            if r2.get("s") is False:
-                rs.append("t2_not_skill")
-            if c1 in NON_SKILL_CATS:
-                rs.append(f"t1_{c1}")
-            if r2.get("a") is True and int(row.tautological) == 1:
-                rs.append("ambig_taut")
-            if rs:
-                final, reason = "D", "|".join(rs)
-        rows.append({"term": term, "skill_id": row.skill_id,
-                     "df_freq": int(row.df_freq),
-                     "taut": int(row.tautological),
-                     "v2e_grade": row.grade, "t1_cat": c1,
-                     "t2_skill": r2.get("s"), "t2_new_tech": r2.get("n"),
-                     "t2_ambig": r2.get("a"), "final_grade": final,
-                     "demote_reason": reason})
+        df = int(row.df_unique_text)
+        cand_cooc = float(row.candidate_anchor_cooc)
+        relation = int(r2["r"])
+        reasons: list[str] = []
+        mapping_action = ""
+        final_skill_id = ""
+        final = "D"
+
+        if r2.get("s") is False:
+            reasons.append("t2_not_skill")
+        if c1 in NON_SKILL_CATS:
+            reasons.append(f"t1_{c1}")
+        if relation == -3:
+            reasons.append("t2_not_skill_relation")
+        if relation == -2:
+            reasons.append("t2_ambiguous")
+
+        if reasons:
+            mapping_action = "REJECT_D"
+        elif relation >= 0:
+            cands = list(item.get("cand") or [])
+            if relation >= len(cands):
+                raise RuntimeError(
+                    f"T2 选择越界 term={term!r}: "
+                    f"r={relation}, candidates={len(cands)}"
+                )
+            alias = _norm_key(cands[relation])
+            final_skill_id = alias_to_sid.get(alias, "")
+            if not final_skill_id:
+                raise RuntimeError(
+                    f"T2 MATCH_EXISTING 无法解析 A 级 skill_id: "
+                    f"{term!r} -> {alias!r}"
+                )
+            final = "A"
+            mapping_action = "MATCH_EXISTING"
+        elif relation == -1:
+            # §10.3.1：B/C 只由全量不同文本频数、候选主锚点共现率和
+            # Qwen new_tech 语义条件决定；不继承旧 proxy grade。
+            if df >= 100:
+                final = "B"
+            elif 10 <= df < 100:
+                final = "C"
+            elif df >= 5 and (
+                cand_cooc >= 0.50 or bool(r2.get("n"))
+            ):
+                final = "C"
+            else:
+                final = "D"
+                reasons.append("below_BC_admission")
+            mapping_action = (
+                "NEW_CONCEPT" if final in {"B", "C"} else "REJECT_D"
+            )
+            if final in {"B", "C"}:
+                fy = int(row.first_year)
+                if not 2014 <= fy <= 2025:
+                    raise RuntimeError(
+                        f"正式 B/C 候选缺有效全量 first_year: "
+                        f"{term!r} first_year={fy}"
+                    )
+                final_skill_id = stable_bc_skill_id(term, fy)
+        else:
+            raise RuntimeError(
+                f"未知 T2 relation: term={term!r}, r={relation}"
+            )
+
+        fy = int(row.first_year)
+        rows.append({
+            "term": term,
+            "source_skill_id": source_sid,
+            "final_skill_id": final_skill_id,
+            "df_freq": df,
+            "cand_cooc": cand_cooc,
+            "first_year": int(fy),
+            "taut": 0,
+            "v2e_grade": "",
+            "t1_cat": c1,
+            "t2_skill": r2.get("s"),
+            "t2_cat": r2.get("c"),
+            "t2_new_tech": r2.get("n"),
+            "t2_relation": relation,
+            "t2_ambig": r2.get("a"),
+            "mapping_action": mapping_action,
+            "final_grade": final,
+            "demote_reason": "|".join(reasons),
+            "source": "legacy_full_corpus_governance_v3",
+        })
+
     out = pd.DataFrame(rows).sort_values(
-        ["final_grade", "term"], kind="stable").reset_index(drop=True)
-    out.to_csv(dic / "skill_legacy_graded_BCD_v2.csv", index=False,
-               encoding="utf-8-sig")
+        ["final_grade", "term"], kind="stable"
+    ).reset_index(drop=True)
+    formal = out[out.final_grade.isin(["A", "B", "C"])]
+    if (formal.final_skill_id.astype(str).str.len() == 0).any():
+        raise RuntimeError("A/B/C 存在空 final_skill_id")
+    out.to_csv(
+        dic / "skill_legacy_graded_BCD_v3.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    def sha256_path(path: Path) -> str:
+        h = hashlib.sha256()
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    production_cfg = _require_production_model()
+    runtime_cfg = load_config_yaml("model_runtime.yaml")
+    llm_cfg = runtime_cfg.get("llm", {}) if isinstance(runtime_cfg, dict) else {}
+    model_config_path = paths.config_dir / "model_config_v1.yaml"
+    manifest = {
+        "protocol_version": REVIEW_PROTOCOL_VERSION,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "model": str(llm_cfg.get("model", "")),
+        "model_repository": str(production_cfg["model"]["repository"]),
+        "model_revision": str(production_cfg["model"]["revision"]),
+        "model_config_sha256": sha256_path(model_config_path),
+        "base_url_recorded": str(llm_cfg.get("base_url", "")),
+        "temperature": 0.0,
+        "seed": REVIEW_SEED,
+        "thinking": False,
+        "prompt_sha256": {
+            "t1": hashlib.sha256(SYS_T1.encode("utf-8")).hexdigest(),
+            "t2": hashlib.sha256(SYS_T2.encode("utf-8")).hexdigest(),
+        },
+        "candidate_frame_sha256": {
+            "t1": hashlib.sha256(
+                json.dumps(t1_items, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest(),
+            "t2": hashlib.sha256(
+                json.dumps(t2_items, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest(),
+        },
+        "frequency_input_sha256": sha256_path(
+            dic / "legacy_df_freq_v1.csv"
+        ),
+        "review_output_sha256": {
+            "t1": sha256_path(rd / "t1_stopword_v2.jsonl"),
+            "t2": sha256_path(rd / "t2_legacy_review_v2.jsonl"),
+        },
+        "output_sha256": sha256_path(dic / "skill_legacy_graded_BCD_v3.csv"),
+        "status": "complete",
+    }
+    (dic / "skill_legacy_governance_manifest_v3.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
     fc = out.final_grade.value_counts()
-    vc = out.v2e_grade.value_counts()
-    dem = out[out.demote_reason != ""]
-    logger.info("v1.3: B %d / C %d / D %d（v2e 为 B %d/C %d/D %d；"
-                "本轮降级 %d 词，样例 %s）",
-                int(fc.get("B", 0)), int(fc.get("C", 0)), int(fc.get("D", 0)),
-                int(vc.get("B", 0)), int(vc.get("C", 0)), int(vc.get("D", 0)),
-                len(dem), dem.term.head(20).tolist())
-    # B 表：T1 全部非技能判定（legacy + A 级热词面；A 级本体不回删）
+    logger.info(
+        "v1.4 handoff治理: A映射 %d / B %d / C %d / D %d；"
+        "MATCH_EXISTING=%d / NEW_CONCEPT=%d",
+        int(fc.get("A", 0)), int(fc.get("B", 0)),
+        int(fc.get("C", 0)), int(fc.get("D", 0)),
+        int((out.mapping_action == "MATCH_EXISTING").sum()),
+        int((out.mapping_action == "NEW_CONCEPT").sum()),
+    )
+
     sb = pd.DataFrame(t1_rows)
     sb = sb[sb.category.isin(NON_SKILL_CATS)].drop_duplicates("term")
     sb = sb.sort_values(["tier", "category", "term"], kind="stable")
-    sb.to_csv(dic / "non_skill_stopword_v1.csv", index=False,
-              encoding="utf-8-sig")
-    logger.info("停用表 v1: %d 词条（legacy %d / atier %d / era %d），"
-                "A 级不回删，表供入级闸门与敏感性分析", len(sb),
-                int((sb.tier == "legacy").sum()),
-                int((sb.tier == "atier").sum()),
-                int((sb.tier == "era_missing").sum()))
+    sb.to_csv(
+        dic / "non_skill_stopword_v1.csv", index=False, encoding="utf-8-sig"
+    )
 
 
 def main() -> None:
@@ -369,7 +589,8 @@ def main() -> None:
     args = ap.parse_args()
     paths = get_project_paths()
     setup_logging(paths.log_dir / f"lexicon_llm_{args.task}.log")
-    assert args.workers <= 4, "GPU 共享纪律：并发 ≤4"
+    if args.workers > 4:
+        raise SystemExit("GPU 共享纪律：并发 ≤4")
     if args.task == "t1":
         run_t1(args.workers)
     elif args.task == "t2":
