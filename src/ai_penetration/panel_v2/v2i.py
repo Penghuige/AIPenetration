@@ -431,7 +431,8 @@ def main() -> None:
     rel_df.to_parquet(rel3 / "skill_ai_relevance.parquet", index=False)
     logger.info("skill_ai_relevance: %d 行", len(rel_df))
 
-    # 4) 先物化正式词典；scoring 的 §19.2 robustness 需要正式 alias 表。\n    base_concepts = pd.read_csv(frozen_concepts, encoding="utf-8-sig", dtype=str)
+    # 4) 先物化正式词典；scoring 的 §19.2 robustness 需要正式 alias 表。
+    base_concepts = pd.read_csv(frozen_concepts, encoding="utf-8-sig", dtype=str)
     pending = base_concepts.translation_status.fillna("").astype(str).isin(
         ["", "pending_codex_zh"]
     )
@@ -543,6 +544,10 @@ def main() -> None:
     manifest_inputs += translation_delivery
     manifest_inputs += handoff_manifests
     manifest_outputs = [rel3 / name for name, _, _ in specs]
+    manifest_outputs += [
+        (rel3 / name).with_suffix((rel3 / name).suffix + ".metadata.json")
+        for name, _, _ in specs
+    ]
     # staging manifest 先验证所有文件可哈希/计数。
     write_run_manifest(
         rel3,
@@ -568,6 +573,10 @@ def main() -> None:
         raise
 
     final_outputs = [target / name for name, _, _ in specs]
+    final_outputs += [
+        (target / name).with_suffix((target / name).suffix + ".metadata.json")
+        for name, _, _ in specs
+    ]
     try:
         manifest = write_run_manifest(
             target,
