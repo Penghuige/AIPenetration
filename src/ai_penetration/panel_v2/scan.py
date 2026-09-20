@@ -43,7 +43,7 @@ logger = logging.getLogger("ai_penetration.panel_v2.scan")
 GROUP_BITS = {"AI": 1, "ML": 2, "NLP": 4, "CVISION": 8,
               "CIMAGE": 16, "LLM": 32, "TRANS": 64}
 FLUSH_ROWS = 500_000  # 每子批落盘行数（B1：禁止全切片累积）
-SCAN_PIPELINE_VERSION = "handoff_v3_longest_span_primary_20260919"
+SCAN_PIPELINE_VERSION = "handoff_v4_full_evidence_20260920"
 
 _WORKER: dict = {}
 
@@ -559,9 +559,11 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--slices", type=int, default=4)
     parser.add_argument("--bench", action="store_true")
-    parser.add_argument("--out-tag", default="",
-                        help="输出目录标签：pass2<tag> 与 release/panel_v2<tag>"
-                             "（v2h 重扫用，避免覆盖 v2ac 基底）")
+    parser.add_argument(
+        "--out-tag", default="_handoff_scan",
+        help="输出目录标签；默认隔离到 pass2_handoff_scan / panel_v2_handoff_scan，"
+             "避免覆盖历史 panel_v2",
+    )
     args = parser.parse_args()
     if args.workers > 8:
         raise SystemExit("--workers 不得超过 8（大表 IO 纪律）")
@@ -570,6 +572,10 @@ def main() -> None:
     out_dir = paths.output_dir / "panel_v2" / f"pass2{args.out_tag}"
     rel_out = paths.output_dir / "release" / f"panel_v2{args.out_tag}"
     out_dir.mkdir(parents=True, exist_ok=True)
+    rel_out.mkdir(parents=True, exist_ok=True)
+    scan_manifest_path = rel_out / "scan_manifest.json"
+    # 任何新 scan 一开始先撤销旧“完整”凭证；只有全链成功后才重建。
+    scan_manifest_path.unlink(missing_ok=True)
     logger.info("锚点规则版本: %s | 主样本版号: %s",
                 ANCHOR_RULES_VERSION, MASTER_VERSION)
     t0 = datetime.now()
@@ -610,6 +616,33 @@ def main() -> None:
         raise SystemExit(
             f"守恒失败: flag={n_flag}, text={n_text}, master={n_master}"
             f"（Σcanonical={canon} 本地去重 {dup_hits}）")
+    from .reproducibility import sha256_file
+    governed_path = (
+        paths.output_dir / "dictionary" / "skill_governed_ABCD_v4.csv"
+    )
+    scan_files = [
+        rel_out / "job_anchor_flag.parquet",
+        rel_out / "job_skill_long.parquet",
+        rel_out / "job_firm.parquet",
+        rel_out / "job_text_clean.parquet",
+    ]
+    scan_manifest = {
+        "status": "formal_pass",
+        "master_version": MASTER_VERSION,
+        "scan_pipeline_version": SCAN_PIPELINE_VERSION,
+        "anchor_rules_version": ANCHOR_RULES_VERSION,
+        "governance_sha256": sha256_file(governed_path),
+        "n_master": int(n_master),
+        "n_flag": int(n_flag),
+        "n_text": int(n_text),
+        "files": {
+            p.name: sha256_file(p) for p in scan_files
+        },
+    }
+    scan_manifest_path.write_text(
+        json.dumps(scan_manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     dur = (datetime.now() - t0).total_seconds() / 3600
     print(f"pass2 完成: canonical={canon:,}(dup hits {dup_hits:,}) "
           f"pairs={sum(s['skill_pairs'] for s in stats):,} "
