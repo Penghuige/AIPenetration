@@ -30,7 +30,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from config.paths import get_project_paths
+from config.paths import get_project_paths, load_config_yaml
 
 from ..common import setup_logging
 from . import quality, scoring
@@ -114,9 +114,7 @@ def require_handoff_manifests(paths) -> list[Path]:
         raise RuntimeError(
             "prerun 模型签名与 model selection 选中模型不一致"
         )
-    cfg = json.loads(json.dumps(
-        __import__("yaml").safe_load(model_cfg.read_text(encoding="utf-8"))
-    ))
+    cfg = load_config_yaml("model_config_v1.yaml")
     expected_revision = str(cfg["model"]["revision"])
     expected_repo = str(cfg["model"]["repository"])
     if extraction.get("model_revision") != expected_revision:
