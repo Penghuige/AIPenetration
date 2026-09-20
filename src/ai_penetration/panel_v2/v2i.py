@@ -46,6 +46,9 @@ from .lexicon import _load_atier_alias_records
 from .export_release import _meta
 from .relevance import compute_relevance, decode_skill_ids
 from .reproducibility import sha256_file, write_run_manifest
+from .scan import SCAN_PIPELINE_VERSION
+from .dedup import MASTER_VERSION
+from .anchors import ANCHOR_RULES_VERSION
 
 logger = logging.getLogger("ai_penetration.panel_v2.v2i")
 
@@ -78,6 +81,44 @@ def require_handoff_manifests(paths) -> list[Path]:
                 f"上游 manifest 未通过: {path.name} status={payload.get('status')!r}"
             )
     return required
+
+
+def verify_scan_manifest(rel2: Path, governance_path: Path) -> Path:
+    """只接受一次完整、同版、哈希闭合的 handoff scan。"""
+    manifest_path = rel2 / "scan_manifest.json"
+    if not manifest_path.exists():
+        raise RuntimeError(
+            "缺少 handoff scan_manifest.json；拒绝使用可能混代的 pass2 产物"
+        )
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    expected = {
+        "status": "formal_pass",
+        "master_version": MASTER_VERSION,
+        "scan_pipeline_version": SCAN_PIPELINE_VERSION,
+        "anchor_rules_version": ANCHOR_RULES_VERSION,
+        "governance_sha256": sha256_file(governance_path),
+    }
+    for key, value in expected.items():
+        if payload.get(key) != value:
+            raise RuntimeError(
+                f"scan manifest 不匹配 {key}: "
+                f"{payload.get(key)!r} != {value!r}"
+            )
+    files = payload.get("files")
+    if not isinstance(files, dict):
+        raise RuntimeError("scan manifest 缺 files 哈希表")
+    required = (
+        "job_anchor_flag.parquet", "job_skill_long.parquet",
+        "job_firm.parquet", "job_text_clean.parquet",
+    )
+    for name in required:
+        path = rel2 / name
+        expected_hash = files.get(name)
+        if not path.exists() or not expected_hash:
+            raise RuntimeError(f"scan manifest 缺正式产物: {name}")
+        if sha256_file(path) != expected_hash:
+            raise RuntimeError(f"scan 产物哈希不匹配: {name}")
+    return manifest_path
 
 
 def filter_longs(rel2: Path, codes: np.ndarray,
@@ -171,6 +212,8 @@ def main() -> None:
         / "skill_alias_active_bilingual_a_frozen_v1.1.csv"
     )
     rel2 = release_root / "panel_v2_handoff_scan"  # 新扫描输入
+    gcsv = paths.output_dir / "dictionary" / "skill_governed_ABCD_v4.csv"
+    scan_manifest_path = verify_scan_manifest(rel2, gcsv)
     target = release_root / "panel_v2i"
     rel3 = release_root / f".panel_v2i_{args.run_id}.tmp"
 
@@ -186,7 +229,7 @@ def main() -> None:
     preflight_files += [
         frozen_concepts,
         frozen_aliases,
-        paths.output_dir / "dictionary" / "skill_governed_ABCD_v4.csv",
+        gcsv,
         paths.output_dir / "panel_v2" / "pass2_handoff_scan" / "skill_vocab.json",
     ] + translation_delivery
     missing_preflight = [str(p) for p in preflight_files if not p.exists()]
@@ -217,10 +260,16 @@ def main() -> None:
         shutil.copy2(rel2 / f, rel3 / f)
 
     # 2) v1.3 D 级过滤
-    gcsv = paths.output_dir / "dictionary" / "skill_governed_ABCD_v4.csv"
     governance_manifest = paths.output_dir / "dictionary" / "formal_discovery_review_manifest_v1.json"
     if not governance_manifest.exists():
         raise RuntimeError("缺少 formal discovery review provenance manifest")
+    review_manifest = json.loads(
+        governance_manifest.read_text(encoding="utf-8")
+    )
+    if review_manifest.get("governance_sha256") != sha256_file(gcsv):
+        raise RuntimeError(
+            "formal discovery review manifest 与当前 v4 治理表哈希不一致"
+        )
     grade = pd.read_csv(gcsv, encoding="utf-8-sig")
     discovery_manifest = json.loads(
         (paths.output_dir / "dictionary" / "formal_discovery_manifest_v1.json")
@@ -365,6 +414,7 @@ def main() -> None:
 
     # 7) 指南 §4.2：把本次正式运行的代码/配置、输入、输出绑定成一个总账。
     manifest_inputs = [rel2 / f for f in scan_inputs]
+    manifest_inputs.append(scan_manifest_path)
     manifest_inputs += [frozen_concepts, frozen_aliases, gcsv,
                         governance_manifest, vocab_path]
     manifest_inputs += translation_delivery
@@ -395,18 +445,28 @@ def main() -> None:
         raise
 
     final_outputs = [target / name for name, _, _ in specs]
-    manifest = write_run_manifest(
-        target,
-        run_id=args.run_id,
-        started_at=t0,
-        input_paths=manifest_inputs,
-        output_paths=final_outputs,
-        dictionary_version=LEX_VERSION,
-        anchor_version="main,cn_paper,babina@20260909_b",
-    )
-    (target / "RELEASE_COMPLETE").write_text(
-        args.run_id + "\n", encoding="utf-8"
-    )
+    try:
+        manifest = write_run_manifest(
+            target,
+            run_id=args.run_id,
+            started_at=t0,
+            input_paths=manifest_inputs,
+            output_paths=final_outputs,
+            dictionary_version=LEX_VERSION,
+            anchor_version="main,cn_paper,babina@20260909_b",
+        )
+        (target / "RELEASE_COMPLETE").write_text(
+            args.run_id + "\n", encoding="utf-8"
+        )
+    except Exception:
+        failed = release_root / (".panel_v2i_failed_" + args.run_id)
+        if target.exists():
+            if failed.exists():
+                shutil.rmtree(failed)
+            target.replace(failed)
+        if backup is not None and backup.exists():
+            backup.replace(target)
+        raise
     print(f"panel_v2i 发布: {len(specs)} 件 + metadata + {manifest.name} @ {target}，用时 "
           f"{(datetime.now() - t0).total_seconds() / 60:.1f} 分钟")
 
