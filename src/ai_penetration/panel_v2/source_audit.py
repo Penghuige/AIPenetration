@@ -108,7 +108,10 @@ def audit(snapshot_id: str):
         if "company_id" not in e_names:
             warnings.append(ent_table + " 缺 company_id，去重/LOO能力下降")
         if "industry_code" not in e_names:
-            warnings.append(ent_table + " 缺 industry_code，正式分层发现无法完成")
+            warnings.append(
+                ent_table + " 无常见 industry_code 字段；请在 data_field_dictionary "
+                "中核定实际行业字段后填写 discovery_strata_v1.yaml"
+            )
         ent_total = _one(cur, f"SELECT count(*) FROM public.{ent_table}")
         table_stats[ent_table] = {
             "city": city,
