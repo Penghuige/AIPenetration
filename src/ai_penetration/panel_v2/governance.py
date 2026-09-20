@@ -151,14 +151,21 @@ def materialize_source_skill_records(
             "primary_source_record",
             "frozen_concept.source_primary/source_id_primary",
         )
+        primary_name = _text(row.get("source_primary")).upper()
+        primary_version = _text(
+            row.get("source_version_primary"), "UNKNOWN_LOCAL_SNAPSHOT"
+        )
         add(
-            sid, "ESCO", _text(row.get("source_version_primary"), "UNKNOWN_LOCAL_SNAPSHOT"),
+            sid, "ESCO",
+            primary_version if primary_name == "ESCO" else "UNKNOWN_LOCAL_SNAPSHOT",
             _text(row.get("esco_uri")), label, desc, cat,
             "source_crosswalk",
             "frozen_concept.esco_uri",
         )
         add(
-            sid, "O*NET", "UNKNOWN_LOCAL_SNAPSHOT",
+            sid, "O*NET",
+            primary_version
+            if primary_name in {"O*NET", "ONET"} else "UNKNOWN_LOCAL_SNAPSHOT",
             _text(row.get("onet_element_ids")), label, desc, cat,
             "source_crosswalk",
             "frozen_concept.onet_element_ids (preserved verbatim)",
