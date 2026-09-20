@@ -307,11 +307,7 @@ def main() -> None:
     rel_df.to_parquet(rel3 / "skill_ai_relevance.parquet", index=False)
     logger.info("skill_ai_relevance: %d 行", len(rel_df))
 
-    # 4) scoring
-    scoring.run(rel3)
-
-    # 5) 装配：§18 正式词典必须与实际 matcher 同一 A/B/C 概念集合。
-    base_concepts = pd.read_csv(frozen_concepts, encoding="utf-8-sig", dtype=str)
+    # 4) 先物化正式词典；scoring 的 §19.2 robustness 需要正式 alias 表。\n    base_concepts = pd.read_csv(frozen_concepts, encoding="utf-8-sig", dtype=str)
     pending = base_concepts.translation_status.fillna("").astype(str).isin(
         ["", "pending_codex_zh"]
     )
@@ -354,6 +350,9 @@ def main() -> None:
     )
     shutil.copy2(gcsv, rel3 / gcsv.name)
     shutil.copy2(governance_manifest, rel3 / governance_manifest.name)
+
+    # 5) scoring：主公式不变；robustness 使用上一步正式 alias 表。
+    scoring.run(rel3)
 
     # 6) 正式词典、长表、得分全部到位后再跑 §17 质量门。
     quality.run(rel3)
