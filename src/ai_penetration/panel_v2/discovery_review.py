@@ -211,6 +211,7 @@ class Retriever:
         self.registry = registry.reset_index(drop=True)
         self.alias_bigrams = [_bigrams(x) for x in self.registry.alias]
         self.index: dict[str, list[int]] = {}
+        self._dynamic_additions: list[str] = []
         for i, bgs in enumerate(self.alias_bigrams):
             for bg in bgs:
                 self.index.setdefault(bg, []).append(i)
@@ -271,17 +272,13 @@ class Retriever:
         self.alias_bigrams.append(bgs)
         for bg in bgs:
             self.index.setdefault(bg, []).append(i)
+        self._dynamic_additions.append(
+            "|".join([key, str(skill_id), str(tier), str(skill_type)])
+        )
 
     def dynamic_signature(self) -> str:
-        """当前检索库状态哈希，进入 review cache key。"""
-        payload = (
-            self.registry[[
-                "alias", "skill_id", "tier", "category"
-            ]]
-            .fillna("").astype(str)
-            .to_csv(index=False, lineterminator="\n")
-            .encode("utf-8")
-        )
+        """只哈希本轮新增概念序列；初始 registry 由 registry_sha 单独绑定。"""
+        payload = "\n".join(self._dynamic_additions).encode("utf-8")
         return hashlib.sha256(payload).hexdigest()
 
 SYSTEM = (
@@ -447,7 +444,7 @@ def review(candidates: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
                         "registry_sha256": registry_sha,
                         "review_prompt_sha256": prompt_sha,
                         "retrieval_version": RETRIEVAL_VERSION,
-        "dynamic_new_concept_registry": True,
+                        "dynamic_new_concept_registry": True,
                     }
                     fh.write(
                         json.dumps(rec, ensure_ascii=False) + "\n"
@@ -472,7 +469,8 @@ def review(candidates: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
                     exact.setdefault(term, set()).add(sid)
             results.append(rec)
 
-    review_df = pd.DataFrame(results)    audit = candidates.merge(
+    review_df = pd.DataFrame(results)
+    audit = candidates.merge(
         review_df, on="term", how="left", validate="one_to_one"
     )
     grades = []
@@ -637,6 +635,7 @@ def write_outputs(
         ).hexdigest(),
         "review_version": REVIEW_VERSION,
         "retrieval_version": RETRIEVAL_VERSION,
+        "dynamic_new_concept_registry": True,
         "mentions_sha256": hashlib.sha256(
             mentions_path.read_bytes()
         ).hexdigest(),
