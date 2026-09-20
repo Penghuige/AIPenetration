@@ -566,8 +566,15 @@ def write_outputs(
         paths.output_dir / "llm_review" / "formal_discovery_v1"
         / "candidate_review.jsonl"
     )
+    model_cfg_path = paths.config_dir / "model_config_v1.yaml"
+    model_cfg = load_config_yaml("model_config_v1.yaml")
     manifest = {
         "status": "complete",
+        "model_revision": str(model_cfg["model"]["revision"]),
+        "model_repository": str(model_cfg["model"]["repository"]),
+        "model_config_sha256": hashlib.sha256(
+            model_cfg_path.read_bytes()
+        ).hexdigest(),
         "review_version": REVIEW_VERSION,
         "retrieval_version": RETRIEVAL_VERSION,
         "mentions_sha256": hashlib.sha256(
