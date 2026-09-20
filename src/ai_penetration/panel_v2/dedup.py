@@ -2,12 +2,12 @@
 
 数据事实（2026-09-07 实测+评审确认）：广深 recruit_id 平台内唯一（v2b 起
 规则1 跨城折叠兜底残余重复）；job↔ent join 覆盖高；ent.recruit_id 有重复
-（聚合取 min(company_id)，确定性选择；未命中数入披露并断言）。
+（按 city+recruit_id 唯一映射；多企业冲突进入 UNK，不做任意 min 裁决）。
 所有写入仅在结果库；eps 只读。
 
 流程（2026-09-09 审计修复版：断点版号绑定 + WAL 强制 + 谓词单源）：
-1. ``copy_ent_map``：ent (recruit_id, company_id) 流式导出结果库（无主键，
-   join 时 GROUP BY 聚合去重）。
+1. ``copy_ent_map``：ent (city,recruit_id,company_id) 流式导出结果库；
+   只有 city+recruit_id 唯一映射到一个企业时才采用，否则进入 UNK。
 2. ``pass1_scan``：ctid 切片（≤8 路，HDD 纪律）扫 job 表全行（准入谓词
    ``ADMISSION_WHERE`` 单源定义，scan 阶段复用防漂移），Python 侧算
    match 文本 hash、pos_norm_hash、日期、描述长度、**字段完整度**
@@ -26,10 +26,9 @@
    canonical 选择，物化 job_master_gzsz；另建 dup_group_map（§6.2.2 平台
    数/编号映射，仅含规则1 幸存行，被折叠行以聚合差值披露——指南"跨年互标"
    与全量映射明细为已申报偏离）。
-5. ``verify_invariants``：count(stage)==Σmetas==Σflags、
-   Σ(collapsed)=groupmap 行数、(plat,rid) 全量唯一、plat=255==Σmeta
-   unknown_platform、long_rid==0、company 未命中披露、bad_year>0.1% 阻断、
-   组跨度>30 天=0 断言（桶规则推论）。
+5. ``verify_invariants``：stage/隔离/eligible/groupmap/master 守恒、
+   Σ(collapsed)=groupmap 行数、(platform_hash,rid) 唯一、平台诊断计数守恒、
+   company 未命中披露、日期隔离守恒、组跨度>30 天=0。
 
 §6.1.1 三态文本声明：raw 由 eps 原表永久保留替代，match 态可由
 text_clean.match_from_raw 重算，中间表只存 hash（设计文档 §决策 记录）。
@@ -225,9 +224,11 @@ def _scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str,
                         n = 0
                     r = buf[n]
                     srid = str(rid).encode("utf-8")
-                    if len(srid) > 32:  # 审计 D11：S32 超长为静默截断，
-                        long_rid += 1   # 两条 rid 可同键致规则1误折叠
-                        srid = srid[:32]
+                    if len(srid) > 32:
+                        raise RuntimeError(
+                            f"recruit_id UTF-8 长度 {len(srid)} > 32，"
+                            "拒绝在定长槽中截断；请先扩展 ROW_DTYPE"
+                        )
                     r["rid"] = srid
                     r["jid"] = _stable_job_id(pkey, str(rid))
                     r["phash"] = _stable_platform_hash(pkey)
@@ -498,8 +499,9 @@ def copy_stage(metas: list[dict], resume: bool) -> int:
         for row in arr:
             rid = bytes(row["rid"]).rstrip(b"\x00").decode()
             bio.write(
-                f"{rid}\t{int(row['jid'])}\t{int(row['plat'])}\t"
-                f"{int(row['city'])}\t{int(row['yr'])}\t{int(row['day'])}\t"
+                f"{rid}\t{int(row['jid'])}\t{int(row['phash'])}\t"
+                f"{int(row['plat'])}\t{int(row['city'])}\t"
+                f"{int(row['yr'])}\t{int(row['day'])}\t"
                 f"{int(row['posh'])}\t{int(row['thash'])}\t"
                 f"{int(row['dlen'])}\t{int(row['comp'])}\n"
             )
