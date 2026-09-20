@@ -26,7 +26,7 @@ import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from config.paths import get_project_paths
+from config.paths import get_project_paths, load_config_yaml
 
 from ..common import setup_logging
 from src.model_platform.llm import create_llm_client
@@ -64,6 +64,24 @@ SYS_T2 = (
     "ambiguity: 是否存在明显跨领域同形风险（如裸 ai、ml 缩写、产品名撞名）true/false。\n"
     "只输出 JSON 数组 [{\"i\":<int>,\"s\":true|false,\"c\":\"...\",\"n\":true|false,"
     "\"r\":<int>,\"a\":true|false}]，条数一致，无其他文字。")
+
+
+def _require_production_model() -> dict:
+    cfg = load_config_yaml("model_config_v1.yaml")
+    runtime = load_config_yaml("model_runtime.yaml")
+    expected = str(cfg.get("model", {}).get("repository", "")).strip()
+    revision = str(cfg.get("model", {}).get("revision", "")).strip()
+    actual = str(runtime.get("llm", {}).get("model", "")).strip()
+    if expected in {"", "TO_BE_CONFIRMED"} or revision in {
+        "", "TO_BE_CONFIRMED"
+    }:
+        raise RuntimeError("lexicon governance 前必须冻结 model_config_v1")
+    if actual != expected:
+        raise RuntimeError(
+            f"model_runtime 当前模型 {actual!r} != "
+            f"冻结 production 模型 {expected!r}"
+        )
+    return cfg
 
 
 def _client():
@@ -162,42 +180,31 @@ def batch_review(items: list[dict], system: str, build_user, out: Path,
 # ------------------------------------------------------------------ T1
 
 def candidates_t1() -> list[dict]:
-    """T1 候选面：legacy 全键 + A 级高频别名 TOP 8000 + 8 个时代缺词。"""
+    """T1 只审当前 legacy 全键 + 明示时代补充词，不读取旧 panel_v2 结果。"""
     import pandas as pd
     paths = get_project_paths()
     dic = paths.output_dir / "dictionary"
-    rel = paths.output_dir / "release" / "panel_v2"
-    out: list[dict] = []
-    lg = pd.read_csv(dic / "legacy_df_freq_v1.csv", encoding="utf-8-sig")
-    out += [{"term": t, "tier": "legacy", "id": i}
-            for i, t in enumerate(lg.match_key)]
-    base = len(out)
-    counts = pd.read_parquet(rel / "skill_ai_counts.parquet")
-    cm = counts[(counts.anchor_version == "main")
-                & (counts.window_type == "pooled")]
-    vocab = json.loads((paths.output_dir / "panel_v2" / "pass2" / "skill_vocab.json")
-                       .read_text(encoding="utf-8"))
-    code2sid = {v: k for k, v in vocab.items()}
-    ali = pd.read_parquet(rel / "skill_alias_v1.parquet")
-    sid_keys = ali.groupby("skill_id").alias.min()  # 代表别名（确定性）
-    hot = cm.nlargest(8000, "n_skill")
-    rows = []
-    for c, fq in zip(hot.skill_code, hot.n_skill):
-        sid = code2sid.get(c)
-        if sid is None or str(sid).startswith("legacy:"):
-            continue
-        key = _norm_key(str(sid_keys.get(sid, "")))
-        if key and len(key) >= 2:
-            rows.append({"term": key, "tier": "atier",
-                         "id": base + len(rows), "freq": int(fq)})
-    out += rows
-    for j, t in enumerate(["ollama", "dify", "coze", "deepseek", "sora",
-                           "mcp", "gpt4", "multimodal", "aigc 内容", "提示词工程"]):
-        out.append({"term": t, "tier": "era_missing", "id": 900000 + j})
+    lg = pd.read_csv(
+        dic / "legacy_df_freq_v1.csv", encoding="utf-8-sig"
+    )
+    out = [
+        {"term": str(t), "tier": "legacy", "id": i}
+        for i, t in enumerate(lg.match_key)
+    ]
+    for j, term in enumerate([
+        "ollama", "dify", "coze", "deepseek", "sora",
+        "mcp", "gpt4", "multimodal", "aigc 内容", "提示词工程",
+    ]):
+        out.append({
+            "term": term,
+            "tier": "era_missing",
+            "id": 900000 + j,
+        })
     return out
 
 
 def run_t1(workers: int = 3) -> None:
+    _require_production_model()
     paths = get_project_paths()
     items = candidates_t1()
     out = paths.output_dir / "llm_review" / "t1_stopword_v2.jsonl"
@@ -268,6 +275,7 @@ def candidates_t2() -> list[dict]:
 
 
 def run_t2(limit: int = 0, workers: int = 3) -> None:
+    _require_production_model()
     paths = get_project_paths()
     items = candidates_t2()
     if limit:
@@ -513,13 +521,17 @@ def merge_final() -> None:
                 h.update(chunk)
         return h.hexdigest()
 
-    from config.paths import load_config_yaml
-    model_cfg = load_config_yaml("model_runtime.yaml")
-    llm_cfg = model_cfg.get("llm", {}) if isinstance(model_cfg, dict) else {}
+    production_cfg = _require_production_model()
+    runtime_cfg = load_config_yaml("model_runtime.yaml")
+    llm_cfg = runtime_cfg.get("llm", {}) if isinstance(runtime_cfg, dict) else {}
+    model_config_path = paths.config_dir / "model_config_v1.yaml"
     manifest = {
         "protocol_version": REVIEW_PROTOCOL_VERSION,
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "model": str(llm_cfg.get("model", "")),
+        "model_repository": str(production_cfg["model"]["repository"]),
+        "model_revision": str(production_cfg["model"]["revision"]),
+        "model_config_sha256": sha256_path(model_config_path),
         "base_url_recorded": str(llm_cfg.get("base_url", "")),
         "temperature": 0.0,
         "seed": REVIEW_SEED,
