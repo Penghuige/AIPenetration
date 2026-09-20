@@ -89,14 +89,17 @@ def export_master(out_dir: Path) -> None:
     company = np.empty(n, np.int32)
     city = np.empty(n, np.int16)
     thash = np.empty(n, np.int64)
-    comps: dict[str, int] = {}
+    company_ids = sorted({str(row[3]) for row in rows})
+    comps: dict[str, int] = {
+        cid: i for i, cid in enumerate(company_ids)
+    }
     # key 直接使用 §3.2 稳定 job_id = SHA256(platform|raw_id) 的 63-bit 代理。
     # pass2 对原始行用同一公式重算，避免任何 rid-only/平台编码旁路。
     for i, (jid, city_id, y, comp, hash_value) in enumerate(rows):
         key[i] = int(jid)
         job_id[i] = int(jid)
         year[i] = int(y)
-        company[i] = comps.setdefault(str(comp), len(comps))
+        company[i] = comps[str(comp)]
         city[i] = int(city_id)
         thash[i] = int(hash_value)
     order = np.argsort(key, kind="stable")
