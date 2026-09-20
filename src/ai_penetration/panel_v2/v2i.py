@@ -284,6 +284,16 @@ def main() -> None:
     vocab_path = pass2b / "skill_vocab.json"
     vocab = json.loads(vocab_path.read_text(encoding="utf-8"))
     formal_grade = grade[grade.final_grade.isin(["A", "B", "C"])].copy()
+    grade_conflict = (
+        formal_grade.groupby(
+            formal_grade.final_skill_id.astype(str)
+        ).final_grade.nunique()
+    )
+    if (grade_conflict > 1).any():
+        bad = grade_conflict[grade_conflict > 1].index.tolist()[:5]
+        raise RuntimeError(
+            f"同一 final_skill_id 出现多个 A/B/C tier: {bad}"
+        )
     if formal_grade.final_skill_id.isna().any():
         raise RuntimeError("治理表 A/B/C 存在空 final_skill_id")
     grade_by_sid = dict(zip(
