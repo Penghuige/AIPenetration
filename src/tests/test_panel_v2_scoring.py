@@ -23,11 +23,15 @@ def _fixture(tmp_path):
         "job_id": pa.array([1, 1, 2, 3, 4], pa.int64()),
         "year": pa.array([2014, 2014, 2014, 2015, 2015], pa.int32()),
         "skill_code": pa.array([0, 1, 1, 0, 1], pa.int32()),
+        "skill_id": pa.array(
+            ["skill-ml", "skill-excel", "skill-excel", "skill-ml", "skill-excel"]
+        ),
+        "confidence_tier": pa.array(["A", "B", "B", "A", "B"]),
     })
     firm = pa.table({
-        "job_id": pa.array([1, 2, 3, 4], pa.int64()),
-        "year": pa.array([2014, 2014, 2015, 2015], pa.int32()),
-        "company_code": pa.array([0, 1, 0, 2], pa.int32()),
+        "job_id": pa.array([1, 2, 3, 4, 5], pa.int64()),
+        "year": pa.array([2014, 2014, 2015, 2015, 2014], pa.int32()),
+        "company_code": pa.array([0, 1, 0, 2, 3], pa.int32()),
     })
     for t, name in ((flags, "job_anchor_flag"), (longs, "job_skill_long"),
                     (firm, "job_firm")):
@@ -71,6 +75,10 @@ def _fixture(tmp_path):
                      "ai_rate_smoothed": (c1 + 0.5) / (n1 + 1.0),
                      "confidence_tier": "B"})
     pd.DataFrame(rows).to_parquet(tmp_path / "skill_ai_relevance.parquet")
+    pd.DataFrame([
+        {"alias_id": "a1", "skill_id": "skill-ml", "alias": "machine learning"},
+        {"alias_id": "a2", "skill_id": "skill-excel", "alias": "excel"},
+    ]).to_parquet(tmp_path / "skill_alias_v1.parquet", index=False)
     # counts（main 子集供留一）
     pd.DataFrame([
         {"skill_code": s, "year": y, "n_skill": n, "n_ai_cooccur": c,
