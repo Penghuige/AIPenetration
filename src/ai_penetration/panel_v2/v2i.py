@@ -225,7 +225,13 @@ def filter_longs(rel2: Path, codes: np.ndarray,
             ]
             t = t.rename_columns(names)
             sids = t["skill_id"].to_pylist()
-            tiers = [grade_by_sid.get(str(sid), "A") for sid in sids]
+            missing_sid = sorted({str(sid) for sid in sids} - set(grade_by_sid))
+            if missing_sid:
+                raise RuntimeError(
+                    "job_skill_long 含 tier map 外 skill_id: "
+                    + ", ".join(missing_sid[:10])
+                )
+            tiers = [grade_by_sid[str(sid)] for sid in sids]
             t = t.append_column("confidence_tier", pa.array(tiers, pa.string()))
             t = t.append_column(
                 "dictionary_version",
@@ -362,10 +368,26 @@ def main() -> None:
         )
     if formal_grade.final_skill_id.isna().any():
         raise RuntimeError("治理表 A/B/C 存在空 final_skill_id")
-    grade_by_sid = dict(zip(
+    base_a_ids = {
+        str(r.skill_id) for r in _load_atier_alias_records()
+    }
+    grade_by_sid = {sid: "A" for sid in base_a_ids}
+    for sid, tier in zip(
         formal_grade.final_skill_id.astype(str),
         formal_grade.final_grade.astype(str),
-    ))
+    ):
+        old = grade_by_sid.get(sid)
+        if old is not None and old != str(tier):
+            raise RuntimeError(
+                f"skill_id {sid} 同时属于基础 A 和 v4 {tier}"
+            )
+        grade_by_sid[sid] = str(tier)
+    vocab_missing_tier = sorted(set(vocab) - set(grade_by_sid))
+    if vocab_missing_tier:
+        raise RuntimeError(
+            "scan vocab 含正式 tier map 外 skill_id: "
+            + ", ".join(vocab_missing_tier[:10])
+        )
     # handoff-compliant scan 已只加载 A/B/C；此处不再“先扫 D 后删除”。
     filter_longs(rel3, np.array([], np.int32), grade_by_sid)
 
@@ -374,9 +396,11 @@ def main() -> None:
     counts.to_parquet(rel3 / "skill_ai_counts.parquet", index=False)
     logger.info("skill_ai_counts: %d 行", len(counts))
     n_vocab = max(vocab.values()) + 1
-    tier_map = np.full(n_vocab, "A", dtype=object)
+    tier_map = np.full(n_vocab, "", dtype=object)
     for sid, code in vocab.items():
-        tier_map[int(code)] = grade_by_sid.get(str(sid), "A")
+        tier_map[int(code)] = grade_by_sid[str(sid)]
+    if (tier_map == "").any():
+        raise RuntimeError("skill_vocab code 不连续或存在未分级槽位")
     rel_df = decode_skill_ids(
         compute_relevance(counts, tier_map), vocab_path
     )
