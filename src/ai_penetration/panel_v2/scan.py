@@ -1,16 +1,13 @@
 """panel_v2 M3-a：Pass2 识别扫描（§12.5 job_anchor_flag + job_skill_long）。
 
 输入 M2 产物 job_master_gzsz（结果库）；eps 只读；产物写
-output/panel_v2/pass2/。审计修复版（B1/B3/M9）：
+output/panel_v2/pass2_handoff_scan/。交接合规版：
 
-- master 导出为**裸 .npy + np.load(mmap_mode="r")**（npz 成员不真 mmap，
-  实证每 worker 会私载全量——已修正），按 key=blake2b-63(recruit_id) 排序；
+- master 导出为**裸 .npy + np.load(mmap_mode="r")**；按 §3.2 稳定 job_id 的
+  63-bit 计算代理排序；
   目录含 .stamp.json 版号戳（MASTER_VERSION+n），复用前校验。
-- 命中键最终定稿 **rid-only**（master rid 实证全局唯一）：同一 rid 的多份
-  raw 拷贝全部映射到同一 job_id，跨切片重复由 worker hit_seen 片内去重 +
-  merge 端 PG DISTINCT ON 仲裁；keep-first 的"多拷贝识别等价"假设由
-  merge_parts 冲突计数**实测披露**（flag/firm 逐 job 多值计数），全国重跑
-  预检须复核该计数（审计 D4）。
+- raw 行通过 `SHA256(platform|job_id_raw)` 的同一 63-bit 代理回到 master；
+  再用 canonical city + text_hash 双重确认，只扫描去重阶段选中的那条描述。
 - skill 词表由**主进程单点构建**并原子落盘（含 ORDER BY 的别名查询消除
   36 个实证碰撞键的跨 worker 分歧），worker 读文件 + 一致性断言。
 - 产物**按批落盘为 parquet dataset 分区**（flags/long/firm 三目录），
@@ -196,12 +193,13 @@ def _init_worker(npy_dir: str) -> None:
         for n in ("key", "job_id", "year", "company", "city", "thash")
     }
     from .lexicon import _load_atier_alias_records, build_union_lexicon
-    governed, governance_hash = _load_governed_legacy_map()
+    governed, ambiguous, governance_hash = _load_governed_legacy_map()
     aliases = _load_atier_alias_records()
     lex = build_union_lexicon(
         legacy_terms=sorted(governed),
         aliases=aliases,
         legacy_id_map=governed,
+        legacy_ambiguous_keys=ambiguous,
     )
     vocab_path = Path(npy_dir).parent / "skill_vocab.json"
     vocab = json.loads(vocab_path.read_text(encoding="utf-8"))
