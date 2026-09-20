@@ -192,6 +192,7 @@ def saturation_pass(metrics: pd.DataFrame) -> bool:
 
 def finalize(
     frame_path: Path,
+    frame_manifest_path: Path,
     selected_path: Path,
     metrics_path: Path,
     candidate_audit_path: Path,
@@ -200,6 +201,19 @@ def finalize(
     """只有“抽样饱和 + 候选已接入最终治理表”同时满足才 formal_pass。"""
     df = pd.read_parquet(frame_path)
     validate_frame(df)
+    if not frame_manifest_path.exists():
+        raise FileNotFoundError(
+            f"缺 discovery frame manifest: {frame_manifest_path}"
+        )
+    frame_manifest = json.loads(
+        frame_manifest_path.read_text(encoding="utf-8")
+    )
+    if frame_manifest.get("status") != "formal_pass":
+        raise ValueError("discovery frame manifest 未 formal_pass")
+    if frame_manifest.get("frame_sha256") != _sha(frame_path):
+        raise ValueError(
+            "discovery frame 与 frame manifest 哈希不一致"
+        )
     selected = pd.read_csv(selected_path)
     if selected.job_id.duplicated().any():
         raise ValueError("候选发现样本存在重复 job_id")
@@ -298,6 +312,7 @@ def finalize(
         "seed": SEED,
         "sampling_protocol": "handoff_20260824_year_industry_10k_saturation_v2",
         "frame_sha256": _sha(frame_path),
+        "frame_manifest_sha256": _sha(frame_manifest_path),
         "selected_sha256": _sha(selected_path),
         "round_metrics_sha256": _sha(metrics_path),
         "candidate_audit_sha256": _sha(candidate_audit_path),
@@ -338,6 +353,7 @@ def main() -> None:
     r.add_argument("--out", type=Path, required=True)
     f = sub.add_parser("finalize")
     f.add_argument("--frame", type=Path, required=True)
+    f.add_argument("--frame-manifest", type=Path, required=True)
     f.add_argument("--selected", type=Path, required=True)
     f.add_argument("--metrics", type=Path, required=True)
     f.add_argument("--candidate-audit", type=Path, required=True)
@@ -352,11 +368,18 @@ def main() -> None:
     elif args.cmd == "round":
         df = pd.read_parquet(args.frame)
         selected = pd.read_csv(args.selected)
-        out = incremental_round(df, set(selected.job_id), args.round)
+        new_round = incremental_round(
+            df, set(selected.job_id), args.round
+        )
+        out = pd.concat(
+            [selected, new_round], ignore_index=True, sort=False
+        )
+        if out.job_id.duplicated().any():
+            raise RuntimeError("累计 discovery selected 出现重复 job_id")
         args.out.parent.mkdir(parents=True, exist_ok=True)
         out.to_csv(args.out, index=False, encoding="utf-8-sig")
     else:
-        finalize(args.frame, args.selected, args.metrics,
+        finalize(args.frame, args.frame_manifest, args.selected, args.metrics,
                  args.candidate_audit, args.governance)
 
 
