@@ -200,10 +200,22 @@ def aggregate_counts(metas: list[dict], tmp_dir: Path | None,
     Returns:
         uint64 数组 freq[alias序号] = distinct normalized text 命中数。
     """
-    keys = np.concatenate([np.fromfile(m["keys_file"], dtype=np.uint64)
-                           for m in metas if m["pairs"] > 0]) if metas else np.empty(0, np.uint64)
-    aids = np.concatenate([np.fromfile(m["aids_file"], dtype=np.uint32)
-                           for m in metas if m["pairs"] > 0]) if metas else np.empty(0, np.uint32)
+    key_parts = []
+    aid_parts = []
+    for m in metas:
+        if int(m.get("pairs", 0)) <= 0:
+            continue
+        kk = np.fromfile(m["keys_file"], dtype=np.uint64)
+        aa = np.fromfile(m["aids_file"], dtype=np.uint32)
+        if len(kk) != len(aa):
+            raise RuntimeError(
+                f"{m.get('task')} keys/aids 长度不一致: "
+                f"{len(kk)} != {len(aa)}"
+            )
+        key_parts.append(kk)
+        aid_parts.append(aa)
+    keys = np.concatenate(key_parts) if key_parts else np.empty(0, np.uint64)
+    aids = np.concatenate(aid_parts) if aid_parts else np.empty(0, np.uint32)
     n_pairs = keys.size
     logger.info("全局合并: %d 对 (aid,key)，排序去重中…", n_pairs)
     order = np.lexsort((keys, aids))
