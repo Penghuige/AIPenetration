@@ -97,3 +97,104 @@ def test_materialized_release_dictionary_contains_formal_abc_only():
     assert "新框架" in set(out_a.alias.astype(str))
     assert "新方法" in set(out_a.alias.astype(str))
     assert "噪声词" not in set(out_a.alias.astype(str))
+
+
+
+def test_saturation_uses_two_consecutive_incremental_rounds_only():
+    from src.ai_penetration.panel_v2.discovery_formal import saturation_pass
+
+    metrics = pd.DataFrame([
+        {"round": 0, "new_standard_concepts": 1, "coverage_gain_pp": 99.0},
+        {"round": 1, "new_standard_concepts": 4, "coverage_gain_pp": 99.0},
+    ])
+    assert not saturation_pass(metrics)
+
+    metrics = pd.concat([
+        metrics,
+        pd.DataFrame([{
+            "round": 2, "new_standard_concepts": 3,
+            "coverage_gain_pp": 99.0,
+        }]),
+    ], ignore_index=True)
+    assert saturation_pass(metrics)
+
+
+def test_saturation_rejects_nonconsecutive_incremental_rounds():
+    from src.ai_penetration.panel_v2.discovery_formal import saturation_pass
+
+    metrics = pd.DataFrame([
+        {"round": 1, "new_standard_concepts": 2, "coverage_gain_pp": 0.0},
+        {"round": 3, "new_standard_concepts": 1, "coverage_gain_pp": 0.0},
+    ])
+    assert not saturation_pass(metrics)
+
+
+def test_discovery_text_group_id_is_platform_and_text_bound():
+    from src.ai_penetration.panel_v2.discovery_frame import _discovery_id
+
+    a = _discovery_id("platform-a", 123)
+    assert a == _discovery_id("platform-a", 123)
+    assert a != _discovery_id("platform-b", 123)
+    assert a != _discovery_id("platform-a", 124)
+    assert len(a) == 64
+
+
+def test_translation_missing_ids_can_only_backfill_with_order_evidence():
+    from src.ai_penetration.translation_completion import _resolve_batch_ids
+
+    source = [
+        {"source_skill_id": "s1", "canonical_en": "Python"},
+        {"source_skill_id": "s2", "canonical_en": "PyTorch"},
+    ]
+    result = [
+        {"canonical_en": "Python", "canonical_zh": "Python"},
+        {"canonical_en": "PyTorch", "canonical_zh": "PyTorch"},
+    ]
+    ids, backfilled, ratio = _resolve_batch_ids(result, source, 1)
+    assert ids == ["s1", "s2"]
+    assert backfilled is True
+    assert ratio == 1.0
+
+
+def test_translation_backfill_rejects_wrong_order():
+    import pytest
+    from src.ai_penetration.translation_completion import _resolve_batch_ids
+
+    source = [
+        {"source_skill_id": "s1", "canonical_en": "Python"},
+        {"source_skill_id": "s2", "canonical_en": "PyTorch"},
+    ]
+    result = [
+        {"canonical_en": "PyTorch"},
+        {"canonical_en": "Python"},
+    ]
+    with pytest.raises(ValueError, match="98%"):
+        _resolve_batch_ids(result, source, 1)
+
+
+def test_benchmark_effective_span_accepts_deterministic_fallback():
+    from src.ai_penetration.panel_v2.model_benchmark import _validate
+
+    text = "熟悉 Python 数据分析"
+    parsed = {
+        "job_id": "j1",
+        "skills": [{
+            "surface": "Python",
+            "canonical_suggestion": "Python",
+            "skill_type": "programming_language",
+            "evidence": "熟悉 Python 数据分析",
+            "start": 0,
+            "end": 1,
+            "existing_skill_id": None,
+        }],
+    }
+    got = _validate(
+        parsed, "j1", text, {"programming_language"}
+    )
+    valid, direct, effective, total, hallucinated, evidence_ok, *_ = got
+    assert valid is True
+    assert direct == 0
+    assert effective == 1
+    assert total == 1
+    assert hallucinated == 0
+    assert evidence_ok == 1
