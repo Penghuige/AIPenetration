@@ -108,7 +108,7 @@ handoff scan → v2i”全部闭环。下面命令**不应在 GitHub Actions 中
 1. `config/model_config_v1.yaml`：模型 revision、量化、tokenizer、vLLM、
    CUDA、PyTorch 等不得保留 `TO_BE_CONFIRMED`。
 2. `config/discovery_strata_v1.yaml`：必须从
-   `data_field_dictionary.xlsx` 核定企业规模真实源字段，并冻结
+   `data_field_dictionary.xlsx` 核定行业来源/字段、企业规模来源/字段，并冻结
    `tech_flag.position_regex`；代码不会自行猜测。
 
 ### 1. 源数据、翻译与 A 级冻结
@@ -222,6 +222,7 @@ python -m src.ai_penetration.panel_v2.discovery_review \
   --full-freq output/dictionary/formal_discovery_full_freq_v1.csv
 
 python -m src.ai_penetration.panel_v2.discovery_formal metrics \
+  --selected output/dictionary/discovery_selected_r<N>.csv \
   --candidate-audit output/dictionary/formal_discovery_candidate_audit_v1.csv \
   --out output/dictionary/discovery_round_metrics.csv
 ```
