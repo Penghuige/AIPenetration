@@ -63,6 +63,7 @@ def require_handoff_manifests(paths) -> list[Path]:
         paths.output_dir / "dictionary" / "external_translation_completion_manifest_v1.json",
         paths.report_dir / "model_selection_manifest_v1.json",
         paths.report_dir / "model_benchmark_prerun_manifest_v1.json",
+        paths.output_dir / "dictionary" / "skill_legacy_governance_manifest_v3.json",
         paths.output_dir / "dictionary" / "discovery_frame_manifest_v1.json",
         paths.output_dir / "dictionary" / "formal_discovery_manifest_v1.json",
         paths.output_dir / "llm_review" / "formal_discovery_v1" / "extraction_manifest.json",
@@ -74,7 +75,10 @@ def require_handoff_manifests(paths) -> list[Path]:
         payload = json.loads(path.read_text(encoding="utf-8"))
         expected = (
             "complete"
-            if path.name == "formal_discovery_review_manifest_v1.json"
+            if path.name in {
+                "formal_discovery_review_manifest_v1.json",
+                "skill_legacy_governance_manifest_v3.json",
+            }
             else "formal_pass"
         )
         if payload.get("status") != expected:
@@ -126,6 +130,26 @@ def require_handoff_manifests(paths) -> list[Path]:
         raise RuntimeError("formal discovery review 模型 repository 与生产配置不一致")
     if review.get("model_config_sha256") != model_cfg_sha:
         raise RuntimeError("formal discovery review 未绑定当前 model_config_v1")
+    legacy_manifest_path = (
+        paths.output_dir / "dictionary"
+        / "skill_legacy_governance_manifest_v3.json"
+    )
+    legacy_manifest = json.loads(
+        legacy_manifest_path.read_text(encoding="utf-8")
+    )
+    v3_path = (
+        paths.output_dir / "dictionary"
+        / "skill_legacy_graded_BCD_v3.csv"
+    )
+    if legacy_manifest.get("output_sha256") != sha256_file(v3_path):
+        raise RuntimeError(
+            "legacy governance manifest 与当前 v3 治理表哈希不一致"
+        )
+    if legacy_manifest.get("model_config_sha256") != model_cfg_sha:
+        raise RuntimeError(
+            "legacy T1/T2 governance 未使用当前 production model_config"
+        )
+
     frame_manifest_path = (
         paths.output_dir / "dictionary" / "discovery_frame_manifest_v1.json"
     )
