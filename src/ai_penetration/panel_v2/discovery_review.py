@@ -306,6 +306,14 @@ def _new_concept_grade(row, new_tech: bool) -> str:
 def review(candidates: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     paths = get_project_paths()
     cfg = load_config_yaml("model_config_v1.yaml")
+    runtime = load_config_yaml("model_runtime.yaml")
+    actual_model = str(runtime.get("llm", {}).get("model", "")).strip()
+    expected_model = str(cfg.get("model", {}).get("repository", "")).strip()
+    if actual_model != expected_model:
+        raise RuntimeError(
+            f"model_runtime 当前模型 {actual_model!r} != "
+            f"冻结 production 模型 {expected_model!r}"
+        )
     revision = str(cfg.get("model", {}).get("revision", "")).strip()
     if revision in {"", "TO_BE_CONFIRMED"}:
         raise RuntimeError("model_config_v1 尚未冻结 revision")
