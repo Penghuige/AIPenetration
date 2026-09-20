@@ -146,8 +146,26 @@ def _blocks(cur, shard: str) -> int:
 _WORKER: dict = {}
 
 
-def _init_worker(platforms: dict[str, int]) -> None:
+def _source_snapshot_sha() -> str:
+    """正式 dedup 必须绑定 source_audit 的固定数据快照。"""
+    import hashlib
+    path = (
+        get_project_paths().output_dir / "data_audit"
+        / "source_db_manifest_v1.json"
+    )
+    if not path.exists():
+        raise RuntimeError(
+            "缺 source_db_manifest_v1.json；正式 dedup 前先运行 source_audit"
+        )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("status") != "formal_pass":
+        raise RuntimeError("source_db_manifest_v1 未 formal_pass")
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _init_worker(platforms: dict[str, int], source_snapshot_sha: str) -> None:
     _WORKER["platforms"] = platforms
+    _WORKER["source_snapshot_sha"] = source_snapshot_sha
 
 
 def _completeness(edu, wtype, exp, rcnt, age) -> int:
@@ -170,7 +188,9 @@ def _scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str,
         # 断点复用三校验（审计 D2：旧版仅凭文件存在性复用，--slices 改变
         # 时同名任务范围不同会被静默截空；准入规则变更需重扫）
         if (meta.get("version") == MASTER_VERSION and meta.get("lo") == lo
-                and meta.get("hi") == hi):
+                and meta.get("hi") == hi
+                and meta.get("source_snapshot_sha")
+                    == _WORKER.get("source_snapshot_sha")):
             logger.info("切片 %s 断点复用（%d 行，版号一致）", task, meta["rows"])
             return meta
         logger.warning("切片 %s 断点版号/范围不符（meta=%s/%s-%s 现=%s/%s-%s），"
@@ -249,7 +269,8 @@ def _scan_slice(shard: str, city_id: int, lo: int, hi: int, out_dir: str,
         conn.close()
     meta = {"task": task, "rows": total, "bad_year": bad_year, "bad_day": bad_day,
             "unknown_platform": unk_plat, "long_rid": long_rid,
-            "version": MASTER_VERSION, "lo": int(lo), "hi": int(hi)}
+            "version": MASTER_VERSION, "lo": int(lo), "hi": int(hi),
+            "source_snapshot_sha": _WORKER.get("source_snapshot_sha")}
     meta_path.write_text(json.dumps(meta), encoding="utf-8")  # meta 最后落=完整性标记
     logger.info("切片完成 %s: rows=%d bad_year=%d bad_day=%d", task, total,
                 bad_year, bad_day)
@@ -289,6 +310,7 @@ def _build_platform_dict() -> dict[str, int]:
 
 
 def pass1_scan(workers: int, slices: int, out_dir: Path,
+               source_snapshot_sha: str,
                year_filter: str | None = None) -> list[dict]:
     """并行 pass1（workers≤8 HDD 纪律）。"""
     from concurrent.futures import ProcessPoolExecutor
@@ -299,8 +321,9 @@ def pass1_scan(workers: int, slices: int, out_dir: Path,
     tasks = _plan_tasks(slices, year_filter)
     out_dir.mkdir(parents=True, exist_ok=True)
     metas = []
-    with ProcessPoolExecutor(max_workers=workers, initializer=_init_worker,
-                             initargs=(plats,)) as pool:
+    with ProcessPoolExecutor(
+            max_workers=workers, initializer=_init_worker,
+            initargs=(plats, source_snapshot_sha)) as pool:
         futs = [pool.submit(_scan_slice, s, c, lo, hi, str(out_dir), yf)
                 for s, c, lo, hi, yf in tasks]
         for f in futs:
@@ -314,41 +337,63 @@ def _results_conn():
     return _p.connect(**rp)
 
 
-def copy_ent_map() -> None:
-    """ent 映射按 city+recruit_id 导出；多企业键不做任意 min 裁决。"""
+def copy_ent_map(source_snapshot_sha: str, resume: bool = False) -> None:
+    """导出企业映射；resume 只复用与当前 source snapshot 严格绑定的表。"""
+    paths = get_project_paths()
+    manifest_path = paths.output_dir / "panel_v2" / "ent_map_manifest.json"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+
     conn = _results_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT to_regclass(%s)", (f"public.{TABLE_ENTMAP}",)
-    )
-    exists = cur.fetchone()[0] is not None
-    if exists:
+    try:
+        cur = conn.cursor()
         cur.execute(
-            "SELECT count(*) FROM information_schema.columns "
-            "WHERE table_schema='public' AND table_name=%s "
-            "AND column_name='city'",
-            (TABLE_ENTMAP,),
+            "SELECT to_regclass(%s)", (f"public.{TABLE_ENTMAP}",)
         )
-        if cur.fetchone()[0] == 0:
+        exists = cur.fetchone()[0] is not None
+        current_schema = False
+        existing_rows = 0
+        if exists:
+            cur.execute(
+                "SELECT count(*) FROM information_schema.columns "
+                "WHERE table_schema='public' AND table_name=%s "
+                "AND column_name IN ('city','recruit_id','company_id')",
+                (TABLE_ENTMAP,),
+            )
+            current_schema = cur.fetchone()[0] == 3
+            cur.execute(f"SELECT count(*) FROM public.{TABLE_ENTMAP}")
+            existing_rows = int(cur.fetchone()[0])
+
+        if resume and exists and current_schema and manifest_path.exists():
+            meta = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if (
+                meta.get("master_version") == MASTER_VERSION
+                and meta.get("source_snapshot_sha") == source_snapshot_sha
+                and int(meta.get("rows", -1)) == existing_rows
+            ):
+                logger.info(
+                    "ent 映射 resume 复用: %d 行，source snapshot 一致",
+                    existing_rows,
+                )
+                return
+            raise RuntimeError(
+                "--resume 检测到 ent_map 与当前 source snapshot/版号不一致；"
+                "请去掉 --resume 重新导出"
+            )
+
+        if exists:
             cur.execute(f"DROP TABLE public.{TABLE_ENTMAP}")
-            exists = False
-    if not exists:
         cur.execute(
             f"CREATE TABLE public.{TABLE_ENTMAP} "
             "(city smallint NOT NULL, recruit_id text, company_id text)"
         )
         conn.commit()
-    cur.execute(f"SELECT count(*) FROM public.{TABLE_ENTMAP}")
-    has = cur.fetchone()[0]
-    conn.commit()
-    conn.close()
-    if has:
-        logger.info("ent 映射已有 %d 行，跳过导出", has)
-        return
+    finally:
+        conn.close()
 
     eps = psycopg2.connect(**eps_conn_params())
     try:
         ent_specs = (("ent_p0387", 0), ("ent_p0389", 1))
+        total = 0
         for ent_shard, city_id in ent_specs:
             cur = eps.cursor(f"entmap_{ent_shard}")
             cur.itersize = 200000
@@ -357,35 +402,47 @@ def copy_ent_map() -> None:
                 "WHERE recruit_id IS NOT NULL AND company_id IS NOT NULL"
             )
             conn2 = _results_conn()
-            cur2 = conn2.cursor()
-            n = 0
-            bio = io.StringIO()
-            while True:
-                batch = cur.fetchmany(200000)
-                if not batch:
-                    break
-                for rid, cid in batch:
-                    bio.write(f"{city_id}\t{rid}\t{cid}\n")
-                    n += 1
-                if bio.tell() > 200 << 20:
-                    bio.seek(0)
-                    cur2.copy_expert(
-                        f"COPY public.{TABLE_ENTMAP} FROM STDIN "
-                        "WITH (FORMAT text)",
-                        bio,
-                    )
-                    conn2.commit()
-                    bio = io.StringIO()
-            bio.seek(0)
-            cur2.copy_expert(
-                f"COPY public.{TABLE_ENTMAP} FROM STDIN WITH (FORMAT text)",
-                bio,
-            )
-            conn2.commit()
-            conn2.close()
-            logger.info("ent 映射导出 %s: %d 行", ent_shard, n)
+            try:
+                cur2 = conn2.cursor()
+                n = 0
+                bio = io.StringIO()
+                while True:
+                    batch = cur.fetchmany(200000)
+                    if not batch:
+                        break
+                    for rid, cid in batch:
+                        bio.write(f"{city_id}\t{rid}\t{cid}\n")
+                        n += 1
+                    if bio.tell() > 200 << 20:
+                        bio.seek(0)
+                        cur2.copy_expert(
+                            f"COPY public.{TABLE_ENTMAP} FROM STDIN "
+                            "WITH (FORMAT text)",
+                            bio,
+                        )
+                        conn2.commit()
+                        bio = io.StringIO()
+                bio.seek(0)
+                cur2.copy_expert(
+                    f"COPY public.{TABLE_ENTMAP} FROM STDIN WITH (FORMAT text)",
+                    bio,
+                )
+                conn2.commit()
+                total += n
+                logger.info("ent 映射导出 %s: %d 行", ent_shard, n)
+            finally:
+                conn2.close()
     finally:
         eps.close()
+
+    manifest_path.write_text(
+        json.dumps({
+            "master_version": MASTER_VERSION,
+            "source_snapshot_sha": source_snapshot_sha,
+            "rows": total,
+        }, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 def _ensure_logged(cur, table: str) -> None:
@@ -820,8 +877,9 @@ def main() -> None:
     if args.bench:
         # 单城单年小片（~8M/32≈25 万行/片）测吞吐，先估后跑（§9 长跑纪律）
         s, c, lo, hi, yf = _plan_tasks(32, "2024")[0]
+        source_sha = _source_snapshot_sha()
         plats = _build_platform_dict()
-        _init_worker(plats)
+        _init_worker(plats, source_sha)
         (out_dir / "bench").mkdir(parents=True, exist_ok=True)
         meta = _scan_slice(s, c, lo, hi, str(out_dir / "bench"), yf)
         dur = (datetime.now() - t0).total_seconds()
@@ -830,8 +888,11 @@ def main() -> None:
                     meta["rows"], dur, rate, 101_000_000 / rate / 8 / 3600)
         return
 
-    copy_ent_map()
-    metas = pass1_scan(args.workers, args.slices, out_dir)
+    source_sha = _source_snapshot_sha()
+    copy_ent_map(source_sha, resume=args.resume)
+    metas = pass1_scan(
+        args.workers, args.slices, out_dir, source_sha
+    )
     for m in metas:
         m["file"] = str(out_dir / f"{m['task']}.rows.bin")
     copy_stage(metas, resume=args.resume)
