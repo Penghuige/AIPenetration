@@ -171,6 +171,8 @@ def scan_slice(table: str, b_start: int, b_end: int, tmp_dir: str,
                 rows += 1
                 year_s = str(publish_time or "")[:4]
                 year = int(year_s) if year_s.isdigit() else 0
+                if not 2014 <= year <= 2025:
+                    continue
                 # 匹配文本与生产 matcher 同义；文档频数键严格按指南 §10.3.2
                 # 使用纯规范化 text_hash，不再把 platform 拼入 distinct key。
                 norm = match_from_raw(str(desc))
@@ -182,7 +184,7 @@ def scan_slice(table: str, b_start: int, b_end: int, tmp_dir: str,
                         if not _boundary_ok(k, norm, s0, end + 1):
                             continue
                     aid = idx[k]
-                    if 2014 <= year <= 2025 and year < int(local_first_year[aid]):
+                    if year < int(local_first_year[aid]):
                         local_first_year[aid] = year
                     buf_k[pos] = key
                     buf_a[pos] = aid
