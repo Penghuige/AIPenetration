@@ -5,7 +5,7 @@
 # 本文件、对应模块常量、设计文档。运行期真正生效的绑定在代码（如
 # dedup.ADMISSION_WHERE、scoring.THRESHOLDS）。
 panel_version: v2i
-dictionary_version: bilingual_a_frozen_v1.1+governed_v1.4
+dictionary_version: bilingual_a_frozen_v1.1+governed_v1.5
 
 
 identity:
@@ -61,8 +61,10 @@ job_score:                     # §15–§16
   zero_skill_rule: {keep_row: true, score: missing, flags: 0, override: zero_skill_override}
   require_coverage_one: true   # §15.3 score_skill_coverage<1 阻断
 
-robustness:                    # §14.3 企业留一（主锚点、三窗口、原始率）
+robustness:
   leave_one_firm: {enabled: true, anchors: [main], score_type: raw}
+  exclude_tier_c: {enabled: true, anchor: main, window: annual, score_type: raw}
+  remove_anchor_skills: {enabled: true, anchor: main, window: annual, score_type: raw}
 
 release:                       # §17.6/§18
   quality_gate_fail_blocks: true
