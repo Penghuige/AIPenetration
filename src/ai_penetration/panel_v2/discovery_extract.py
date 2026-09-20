@@ -27,6 +27,14 @@ def _sha_text(text: str) -> str:
 
 def _fixed_config() -> tuple[dict, object]:
     cfg = load_config_yaml("model_config_v1.yaml")
+    runtime = load_config_yaml("model_runtime.yaml")
+    actual_model = str(runtime.get("llm", {}).get("model", "")).strip()
+    expected_model = str(cfg.get("model", {}).get("repository", "")).strip()
+    if actual_model != expected_model:
+        raise RuntimeError(
+            f"model_runtime 当前模型 {actual_model!r} != "
+            f"冻结 production 模型 {expected_model!r}"
+        )
     needed = [
         ("model", "revision"), ("model", "tokenizer_version"),
         ("model", "tokenizer_path"), ("runtime", "framework_version"),
