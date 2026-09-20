@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 from datetime import datetime
@@ -25,17 +26,38 @@ def _sha(path: Path) -> str:
     return h.hexdigest()
 
 
+def _find_field(obj, names: tuple[str, ...]):
+    """在历史结果可能的浅/嵌套对象中确定性查找字段。"""
+    if isinstance(obj, dict):
+        for name in names:
+            if name in obj and obj[name] not in (None, ""):
+                return obj[name]
+        for key in sorted(obj):
+            value = _find_field(obj[key], names)
+            if value not in (None, ""):
+                return value
+    elif isinstance(obj, list):
+        for value in obj:
+            found = _find_field(value, names)
+            if found not in (None, ""):
+                return found
+    return None
+
+
 def _source_id(rec: dict) -> str:
-    for key in ("source_skill_id", "skill_id", "source_id"):
-        value = str(rec.get(key, "")).strip()
-        if value:
-            return value
-    return ""
+    value = _find_field(
+        rec, ("source_skill_id", "skill_id", "source_id")
+    )
+    return str(value or "").strip()
 
 
-def _read_jsonl_ids(path: Path, expected_rows: int | None = None) -> set[str]:
-    ids: set[str] = set()
-    rows = 0
+def _canonical_en(rec: dict) -> str:
+    value = _find_field(rec, ("canonical_en",))
+    return str(value or "").strip().casefold()
+
+
+def _read_jsonl(path: Path) -> list[dict]:
+    rows: list[dict] = []
     for line_no, line in enumerate(
         path.read_text(encoding="utf-8").splitlines(), 1
     ):
@@ -44,43 +66,111 @@ def _read_jsonl_ids(path: Path, expected_rows: int | None = None) -> set[str]:
         try:
             rec = json.loads(line)
         except json.JSONDecodeError as exc:
-            raise ValueError(f"{path.name}:{line_no} JSON 无效") from exc
-        sid = _source_id(rec)
-        if not sid:
-            raise ValueError(f"{path.name}:{line_no} 缺 source skill id")
-        if sid in ids:
-            raise ValueError(f"{path.name} 内 source skill id 重复: {sid}")
-        ids.add(sid)
-        rows += 1
-    if expected_rows is not None and rows != expected_rows:
+            raise ValueError(
+                f"{path.name}:{line_no} JSON 无效"
+            ) from exc
+        if not isinstance(rec, dict):
+            raise ValueError(
+                f"{path.name}:{line_no} 必须是 JSON object"
+            )
+        rows.append(rec)
+    return rows
+
+
+def _input_records(path: Path) -> list[dict]:
+    rows = _read_jsonl(path)
+    if len(rows) != EXPECTED_TOTAL:
         raise ValueError(
-            f"{path.name} 行数 {rows} != 预期 {expected_rows}"
+            f"完整翻译输入 {len(rows)} != {EXPECTED_TOTAL}"
         )
-    return ids
+    ids = [_source_id(r) for r in rows]
+    if any(not sid for sid in ids):
+        raise ValueError("完整翻译输入存在空 source skill id")
+    if len(set(ids)) != len(ids):
+        raise ValueError("完整翻译输入 source skill id 不唯一")
+    return rows
+
+
+def _resolve_batch_ids(
+    result_rows: list[dict],
+    expected_input: list[dict],
+    batch: int,
+) -> tuple[list[str], bool, float]:
+    """显式ID优先；缺ID时按交接要求做>=98%顺序证据回填。"""
+    if len(result_rows) != len(expected_input):
+        raise ValueError(
+            f"batch={batch} 结果行数 {len(result_rows)} "
+            f"!= 输入 {len(expected_input)}"
+        )
+    expected_ids = [_source_id(r) for r in expected_input]
+    result_ids = [_source_id(r) for r in result_rows]
+    explicit = [bool(x) for x in result_ids]
+
+    for i, (has_id, rid, eid) in enumerate(
+        zip(explicit, result_ids, expected_ids)
+    ):
+        if has_id and rid != eid:
+            raise ValueError(
+                f"batch={batch} line={i+1} 显式 source id "
+                f"{rid!r} != 输入 {eid!r}"
+            )
+
+    if all(explicit):
+        return result_ids, False, 1.0
+
+    comparable = matched = 0
+    for result, source in zip(result_rows, expected_input):
+        r_name = _canonical_en(result)
+        s_name = _canonical_en(source)
+        if r_name and s_name:
+            comparable += 1
+            matched += int(r_name == s_name)
+    ratio = matched / comparable if comparable else 0.0
+    if ratio < 0.98:
+        raise ValueError(
+            f"batch={batch} 缺 source id 且 canonical_en 顺序匹配率 "
+            f"{ratio:.2%} < 98%，禁止按顺序回填"
+        )
+    resolved = [
+        rid if rid else eid
+        for rid, eid in zip(result_ids, expected_ids)
+    ]
+    return resolved, True, ratio
+
+
+def _qc_state(obj) -> tuple[bool, bool]:
+    """返回(has_pass, has_fail)；任意显式 fail 优先于 pass。"""
+    has_pass = has_fail = False
+    if isinstance(obj, dict):
+        for key in ("passed", "valid", "ok"):
+            value = obj.get(key)
+            if isinstance(value, bool):
+                has_pass |= value
+                has_fail |= not value
+        if "status" in obj:
+            status = str(obj["status"]).strip().lower()
+            has_pass |= status in {
+                "pass", "passed", "success", "valid",
+                "completed", "complete", "ok",
+            }
+            has_fail |= status in {
+                "fail", "failed", "invalid", "error", "blocked",
+            }
+        for value in obj.values():
+            p, f = _qc_state(value)
+            has_pass |= p
+            has_fail |= f
+    elif isinstance(obj, list):
+        for value in obj:
+            p, f = _qc_state(value)
+            has_pass |= p
+            has_fail |= f
+    return has_pass, has_fail
 
 
 def _qc_passed(obj) -> bool:
-    """只接受显式 pass 信号；未知 QC schema fail-closed。"""
-    if isinstance(obj, dict):
-        for key in ("passed", "valid", "ok"):
-            if key in obj and isinstance(obj[key], bool):
-                if obj[key] is True:
-                    return True
-        if "status" in obj:
-            status = str(obj["status"]).strip().lower()
-            if status in {
-                "pass", "passed", "success", "valid",
-                "completed", "complete", "ok",
-            }:
-                return True
-            if status in {
-                "fail", "failed", "invalid", "error", "blocked",
-            }:
-                return False
-        return any(_qc_passed(v) for v in obj.values())
-    if isinstance(obj, list):
-        return any(_qc_passed(v) for v in obj)
-    return False
+    passed, failed = _qc_state(obj)
+    return passed and not failed
 
 
 def verify(
@@ -102,8 +192,10 @@ def verify(
             "中文化验收缺少上游固定件:\n" + "\n".join(missing)
         )
 
-    input_ids = _read_jsonl_ids(input_jsonl, EXPECTED_TOTAL)
+    input_records = _input_records(input_jsonl)
+    input_ids = {_source_id(r) for r in input_records}
     records = []
+    resolved_batches: list[tuple[int, Path, list[dict], list[str]]] = []
     global_ids: set[str] = set()
     total = 0
 
@@ -119,7 +211,17 @@ def verify(
             raise FileNotFoundError(
                 f"缺少翻译 QC {batch}: {qc_path}"
             )
-        ids = _read_jsonl_ids(result_path, expected)
+        result_rows = _read_jsonl(result_path)
+        lo = (batch - 1) * 100
+        expected_input = input_records[lo:lo + expected]
+        resolved_ids, backfilled, order_ratio = _resolve_batch_ids(
+            result_rows, expected_input, batch
+        )
+        ids = set(resolved_ids)
+        if len(ids) != expected:
+            raise ValueError(
+                f"batch={batch} 回填后 source id 不唯一"
+            )
         overlap = global_ids & ids
         if overlap:
             raise ValueError(
@@ -134,11 +236,14 @@ def verify(
             ) from exc
         if not _qc_passed(qc_obj):
             raise ValueError(
-                f"QC 未找到显式通过状态 batch={batch}: {qc_path}"
+                f"QC 未显式通过或含失败信号 batch={batch}: {qc_path}"
             )
 
         global_ids |= ids
         total += len(ids)
+        resolved_batches.append(
+            (batch, result_path, result_rows, resolved_ids)
+        )
         records.append({
             "batch": batch,
             "result_file": str(result_path.resolve()),
@@ -146,6 +251,8 @@ def verify(
             "result_sha256": _sha(result_path),
             "qc_file": str(qc_path.resolve()),
             "qc_sha256": _sha(qc_path),
+            "ids_backfilled_by_order": backfilled,
+            "canonical_en_order_match_rate": order_ratio,
         })
 
     if total != EXPECTED_TOTAL or len(global_ids) != EXPECTED_TOTAL:
@@ -164,19 +271,17 @@ def verify(
     out_dir = get_project_paths().output_dir / "dictionary"
     out_dir.mkdir(parents=True, exist_ok=True)
     log_path = out_dir / "external_translation_log_v1.jsonl"
+    rec_by_batch = {int(r["batch"]): r for r in records}
     with log_path.open("w", encoding="utf-8") as log_fh:
-        for batch_rec in records:
-            batch = int(batch_rec["batch"])
-            batch_path = Path(batch_rec["result_file"])
-            for line_no, line in enumerate(
-                batch_path.read_text(encoding="utf-8").splitlines(), 1
+        for batch, batch_path, result_rows, resolved_ids in resolved_batches:
+            batch_rec = rec_by_batch[batch]
+            for line_no, (payload, sid) in enumerate(
+                zip(result_rows, resolved_ids), 1
             ):
-                if not line.strip():
-                    continue
-                payload = json.loads(line)
                 log_fh.write(json.dumps({
                     "batch": batch,
                     "line_no": line_no,
+                    "source_skill_id": sid,
                     "source_result_file": str(batch_path),
                     "source_result_sha256": batch_rec["result_sha256"],
                     "qc_file": batch_rec["qc_file"],
