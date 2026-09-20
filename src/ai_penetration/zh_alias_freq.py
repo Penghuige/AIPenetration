@@ -25,7 +25,7 @@ from .text_clean import match_from_raw, text_hash as canonical_text_hash
 
 logger = logging.getLogger("ai_penetration.zh_alias_freq")
 
-FREQ_PROTOCOL_VERSION = "distinct_text_hash_v2_20260919"
+FREQ_PROTOCOL_VERSION = "distinct_text_hash_period_v3_20260920"
 
 # 语料城市：交接口径下的字典发现语料（用户 2026-09-06 决策：仅广深）
 FREQ_CITIES = ("广州市", "深圳市")
@@ -141,7 +141,7 @@ def scan_slice(table: str, b_start: int, b_end: int, tmp_dir: str) -> dict:
         cur = conn.cursor(f"freq_{task}")
         cur.itersize = 50000
         sql = f"""
-            SELECT job_description FROM public.{table}
+            SELECT publish_time, job_description FROM public.{table}
             WHERE ctid >= '(%s,0)'::tid AND ctid < '(%s,0)'::tid
               AND job_description IS NOT NULL AND job_description != ''
               AND position IS NOT NULL AND position != ''
@@ -151,8 +151,11 @@ def scan_slice(table: str, b_start: int, b_end: int, tmp_dir: str) -> dict:
             batch = cur.fetchmany(100000)
             if not batch:
                 break
-            for (desc,) in batch:
+            for publish_time, desc in batch:
                 rows += 1
+                year_s = str(publish_time or "")[:4]
+                if not year_s.isdigit() or not 2014 <= int(year_s) <= 2025:
+                    continue
                 norm = normalize_desc(str(desc))
                 key = canonical_text_hash(norm)
                 if key in local_seen:
