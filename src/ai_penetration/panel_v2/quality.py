@@ -1,26 +1,15 @@
-"""panel_v2 M4-a：自动化质量门（指南 §17.3–§17.6）与统计报告。
+"""panel_v2 §17 自动质量门与可审计警告输出。
 
-§17.6 十项阻断检查任一失败 → raise（停止发布）；警告项与 §17.4/§17.5
-统计进入 quality_control_report.md（警告不阻断）。
+阻断项覆盖：岗位/技能唯一性、三态文本与完整稳定ID、正式词典闭环、
+longest-match/span证据、整数计数不变量、raw/smoothed范围、pooled/roll3
+守恒、岗位得分覆盖、阈值单调性以及同目录重跑一致性。任一阻断失败均退出
+非零，且不得推进成功 baseline。
 
-**警告六类覆盖披露（2026-09-09 审计修订）**——指南要求六类警告全部入报并
-附年份/行业/岗位/技能明细表，本实现覆盖情况如实如下：
-① 低频 0/1 原始权重（已实现，rare01_skills）；② 锚点口径差异（已实现，
-exposure_rate_by_anchor）；③ LLM/TRANS 增量（已实现，anchor_jobs）；
-④ 年份无技能比例（以 zero_skill_by_year 等价实现，行业维度缺失）；
-⑤ 歧义锚点×行业集中度（**未实现**：master 无行业字段，需数据源增强）；
-⑥ 年度断点（**未实现**：判据未定义，留交接方澄清）。
-明细表（逐岗位/逐技能清单）未生成——阻断级检查均在全量上验证，警告触发时
-的量级可由 quality_stats.json 反查。⑤⑥为正式偏离，随全国重跑申报。
-
-"原文跨度回填"（§17.6.3）为阻断项：正式 job_skill_long 必须持久化
-surface/start/end 等证据，并由 span_verified=1 证明扫描时可直接回填。
-重跑一致项（§17.6.10）：同一发布目录已经存在 quality_stats.json 时，
-本次运行必须与上一轮保持相同行数和关键统计量；漂移属于阻断错误。
-
-用法::
-    python -X utf8 -m src.ai_penetration.panel_v2.quality
+警告层会物化年度零技能率、锚点口径差异、低频0/1技能、A/B/C命中构成和
+§19.2 robustness 翻转率。指南未定义自动阈值的“歧义锚点×非技术行业集中度”
+与“无法由覆盖变化解释的年度断点”明确登记为待人工判据，不伪装为通过。
 """
+
 from __future__ import annotations
 
 import argparse
@@ -465,8 +454,7 @@ def warning_checks(rel: Path) -> tuple[list[str], dict]:
             ],
         ).to_pandas()
         if len(robust) != len(cls) or robust.job_id.duplicated().any():
-            fails = "robustness job_id 行数/唯一性异常"
-            warns.append(fails)
+            warns.append("robustness job_id 行数/唯一性异常")
         info["robustness_flip_rate"] = {
             "exclude_c": round(
                 float(robust.flip_vs_primary005_exclude_c.mean()), 6
