@@ -30,12 +30,17 @@ logger = logging.getLogger(__name__)
 
 
 def _load_existing_records(raw_path: Path) -> list[dict]:
-    """读取断点 raw 文件为记录列表，容忍末尾撕裂行。
+    """读取断点 raw 文件为记录列表，并把末尾撕裂行截断掉。
 
     强杀进程可能在 flush 中途留下半行 JSON（单条记录含完整 LLM 原文，可达
-    数十 KB，flush 不保证单行原子落盘）。末尾撕裂行丢弃并告警；**非末尾**
-    行损坏说明文件深层损坏，fail-closed 报出行号——静默跳过中间记录会导致
-    该 chunk 被当作"已发出未完成"永久 pending。
+    数十 KB，flush 不保证单行原子落盘）。只"读时忽略"不截断的话，resume 的
+    第一笔 append 会粘在撕裂片段后生成新的粘结行，第二次中断后断点文件即
+    不可用——因此检测到撕裂尾行时把文件截断到最后一条完整记录。
+
+    按 ``b"\\n"`` 字节切行而非 ``str.splitlines``：后者会把 U+2028/U+2029/
+    \\x85 当行界，而 ``json.dumps(ensure_ascii=False)`` 不转义它们，会把
+    单条合法记录误判为损坏。**非末尾**行损坏说明文件深层损坏，fail-closed
+    报出行号——静默跳过中间记录会导致该 chunk 永久 pending。
 
     Args:
         raw_path: 断点 jsonl 文件。
@@ -45,28 +50,39 @@ def _load_existing_records(raw_path: Path) -> list[dict]:
     """
     if not raw_path.exists():
         return []
-    try:
-        text = raw_path.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
-        text = raw_path.read_bytes().decode("utf-8", errors="replace")
-        logger.warning("断点文件含非法 UTF-8（疑似撕裂尾行），按 replace 解码")
-    lines = text.splitlines()
+    data = raw_path.read_bytes()
+    lines = data.split(b"\n")
     out: list[dict] = []
+    good_bytes = 0  # 已确认完整的字节长度（含各自换行）
+    torn_tail = False
     for i, line in enumerate(lines):
-        if not line.strip():
+        line_len = len(line) + (1 if i < len(lines) - 1 else 0)
+        stripped = line.strip()
+        if not stripped:
+            good_bytes += line_len
             continue
+        rec = None
         try:
-            rec = json.loads(line)
-        except json.JSONDecodeError:
+            rec = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            rec = None
+        if rec is None or not isinstance(rec, dict):
             if i == len(lines) - 1:
-                logger.warning("忽略断点文件末尾撕裂行（上次进程被强杀）")
+                torn_tail = True
                 break
             raise RuntimeError(
                 f"断点 raw 文件第 {i + 1} 行损坏（非末行），请人工检查: "
                 f"{raw_path}"
-            ) from None
-        if isinstance(rec, dict):
-            out.append(rec)
+            )
+        out.append(rec)
+        good_bytes += line_len
+    if torn_tail:
+        with raw_path.open("r+b") as fh:
+            fh.truncate(good_bytes)
+        logger.warning(
+            "断点文件末尾撕裂行已截断至 %s 字节（上次进程被强杀）",
+            good_bytes,
+        )
     return out
 
 
@@ -539,8 +555,12 @@ def run(sample_csv: Path) -> tuple[Path, Path]:
     # 仍留在 raw 文件里，不必重跑。
     #
     # 并发上限由服务端 --max-num-seqs 决定（AIPEN_EXTRACT_WORKERS 可覆盖）。
-    # 差异仅在于：批次内新增的跨 chunk 缓存复用不再发生（结果由固定 seed +
-    # temperature=0 决定，内容等价）。
+    # 与串行版的语义差异：批次内新增 chunk 的跨样本缓存复用不再发生（同文本
+    # 不同岗位各自独立调用）。注意这不是严格"内容等价"——技术基准实测
+    # （model_benchmark 的 repeat_exact 记录）vLLM 连续批处理下
+    # temperature=0 的一致性约 0.90，同文本的两次独立调用有小概率产出不同
+    # 抽取；跨批次的缓存复用（content_cache 命中）仍保证同文本同结果。
+    # workers 数写入 manifest 以便追溯。
     workers = max(1, int(os.getenv("AIPEN_EXTRACT_WORKERS", "8")))
     logger.info(
         "阶段 2 开始: 待调用 chunk %s，并发 %s（缓存命中 %s 条已在阶段 1 落盘）",

@@ -112,6 +112,16 @@ def test_http_4xx_fails_fast_without_retry(monkeypatch):
     assert len(calls) == 1  # 确定性失败不重试
 
 
+def test_http_429_is_retried(monkeypatch):
+    # 429 是限流（暂态），重试是正确行为；归入 4xx 快速失败会误伤。
+    seq = [_FakeResp(429), _FakeResp(200)]
+
+    monkeypatch.setattr(llm_mod.requests, "post", lambda *a, **kw: seq.pop(0))
+    out = _client(retry=2)._post_chat({"model": "m"})
+    assert out["choices"][0]["message"]["content"] == "ok"
+    assert seq == []
+
+
 def test_transient_connection_error_retries_then_succeeds(monkeypatch):
     seq = [
         requests.exceptions.ConnectionError("reset"),

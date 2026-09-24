@@ -597,8 +597,9 @@ def run(
     #   并发  4 -> 167 tok/s    并发 12 -> 352 tok/s（零抢占）
     #   并发  8 -> 296 tok/s    并发 16 -> 348 tok/s（无增益）
     # 12 档饱和，瓶颈是每步都要算的受控解码语法掩码这类与批大小无关的开销，
-    # 而非显存带宽（理论上限约 500）。故 technical 用 8（与 repeat_exact
-    # 实测时的批行为一致），prerun 无重复运行要求、用 12 提速。
+    # 而非显存带宽（理论上限约 500）。当前对所有 phase 统一默认 8（technical
+    # 与 repeat_exact 实测时的批行为一致）；prerun 如需提速用
+    # AIPEN_BENCH_WORKERS=12 覆盖。
     tasks = [
         (rep, str(row["job_id"]), str(row["text"]))
         for rep in range(repeats)
@@ -609,9 +610,10 @@ def run(
         jid: json.dumps({"job_id": jid, "text": text}, ensure_ascii=False)
         for _rep, jid, text in tasks
     }
-    if len(payloads) != len({t[1] for t in tasks}):
+    if len(payloads) != len(tasks):
         # payload 按 job_id 建字典：样本含重复 job_id 时前一重复行会拿到
         # 最后一行的文本发给模型、却用自己的文本校验 span，指标被污染。
+        # （len(payloads)=唯一 jid 数，须与任务总数比，而非与另一个唯一数比。）
         raise ValueError("基准样本存在重复 job_id，并发 payload 构造会错位")
     logger.info(
         "调用阶段开始: tasks=%s workers=%s", len(tasks), workers

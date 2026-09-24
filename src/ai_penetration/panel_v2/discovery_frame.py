@@ -483,7 +483,9 @@ def _scan_source(cfg: dict, lex, progress: dict) -> dict:
         progress: 断点 dict（就地更新并周期性落盘）。
 
     Returns:
-        三分片合计的 {rows_seen, rows_kept, invalid_year}。
+        各分片合计的 {rows_seen, rows_kept, invalid_year}。断点按 job_table
+        记、清理按 source_city 删——当前 SHARDS 两者一一对应；未来若同城
+        多表（GD_SHARDS 模式）需改为按表清理。
     """
     bins = [float(x) for x in cfg["text_length"]["bins"]]
     labels = [str(x) for x in cfg["text_length"]["labels"]]
@@ -657,16 +659,20 @@ def _export_table(table: str, out: Path, columns: list[str],
             # COPY 中途失败时 tmp 是半写的孤儿文件（实测可达 19GB），
             # 旧实现此路径无任何清理。
             _unlink_with_retry(tmp)
-    reader = pcsv.open_csv(
-        tmp,
-        read_options=pcsv.ReadOptions(block_size=1 << 24),
-        # 岗位描述正文含换行符：PG 的 COPY TO CSV 会正确加引号，但 pyarrow
-        # 默认不接受单元格内换行（newlines_in_values=False），会报
-        # "CSV parser got out of sync with chunker" 并解析错位。开启后
-        # pyarrow 无法再按块并行读，代价是这一遍转换变慢——正确性优先。
-        parse_options=pcsv.ParseOptions(newlines_in_values=True),
-        convert_options=pcsv.ConvertOptions(column_types=types),
-    )
+    try:
+        reader = pcsv.open_csv(
+            tmp,
+            read_options=pcsv.ReadOptions(block_size=1 << 24),
+            # 岗位描述正文含换行符：PG 的 COPY TO CSV 会正确加引号，但 pyarrow
+            # 默认不接受单元格内换行（newlines_in_values=False），会报
+            # "CSV parser got out of sync with chunker" 并解析错位。开启后
+            # pyarrow 无法再按块并行读，代价是这一遍转换变慢——正确性优先。
+            parse_options=pcsv.ParseOptions(newlines_in_values=True),
+            convert_options=pcsv.ConvertOptions(column_types=types),
+        )
+    except BaseException:
+        _unlink_with_retry(tmp)
+        raise
     writer = None
     try:
         for batch in reader:
@@ -731,7 +737,13 @@ def build(*, fresh: bool = False, reverify: bool = False) -> Path:
 
     # 幂等重跑：同输入且已 formal_pass → 直接返回。旧实现无条件重建，
     # 9.4GB corpus 已在而 manifest 缺失时仍会整轮重扫（实测白跑约 8 小时）。
-    if not fresh and manifest_path.exists():
+    # --reverify 时仍进入早退检查之外（用户显式要求重核快照）；两个 parquet
+    # 任一被删时早退不生效（返回的 manifest 必须对应在盘产物）。
+    if (
+        not fresh
+        and not reverify
+        and manifest_path.exists()
+    ):
         try:
             previous = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
@@ -742,12 +754,20 @@ def build(*, fresh: bool = False, reverify: bool = False) -> Path:
             and previous.get("strata_config_sha256") == cfg_sha
             and previous.get("pre_discovery_governance_sha256") == v3_sha
         ):
+            corpus_path_early = out_dir / "dictionary_discovery_corpus_v1.parquet"
+            frame_path_early = out_dir / "discovery_frame_v1.parquet"
+            if corpus_path_early.exists() and frame_path_early.exists():
+                logger.info(
+                    "manifest 已 formal_pass 且三个输入哈希未变，跳过构建: %s",
+                    manifest_path,
+                )
+                return manifest_path
             logger.info(
-                "manifest 已 formal_pass 且三个输入哈希未变，跳过构建: %s",
-                manifest_path,
+                "manifest 有效但 parquet 产物缺失，全量重建（corpus/frame "
+                "必须在盘）"
             )
-            return manifest_path
-        logger.info("manifest 存在但输入已变化或未通过，全量重建")
+        elif previous:
+            logger.info("manifest 存在但输入已变化或未通过，全量重建")
 
     # 源快照核对（结果缓存）：门禁是 4 张大表共约 2 亿行的精确 count，
     # 同一审计哈希核对过一次后不再重付（eps 为只读源库，策略上无写入方）。
@@ -796,9 +816,12 @@ def build(*, fresh: bool = False, reverify: bool = False) -> Path:
     if resume_valid and _table_exists(STAGE):
         logger.info("resume：复用已有 stage 表（不 DROP）")
     else:
-        _create_stage()
+        # 先落盘清空 shards 再 DROP/CREATE stage：若顺序相反，在 DROP 清空
+        # 数据之后、断点落盘之前崩溃，磁盘断点仍记着旧分片 done，下次重跑
+        # 会跳过"已完成"分片而 stage 已空——静默丢掉整个分片的数据。
         progress["shards"] = {}
         _save_progress(progress)
+        _create_stage()
         logger.info("stage 表已重建（全量扫描起点）")
 
     scan_stats = _scan_source(cfg, lex, progress)
@@ -932,9 +955,11 @@ def build(*, fresh: bool = False, reverify: bool = False) -> Path:
         encoding="utf-8",
     )
     # 收尾：stage 是纯中间态（实测可达 38GB），构建成功后清理；断点文件
-    # 同步删除（manifest 的幂等检查取代它成为重跑门槛）。
+    # 同步删除（manifest 的幂等检查取代它成为重跑门槛）。用重试删除：
+    # 此刻若被 Windows 索引/防病毒短暂持有，裸 unlink 会让一次成功的构建
+    # 以非零退出码收场。
     _drop_stage()
-    _progress_path().unlink(missing_ok=True)
+    _unlink_with_retry(_progress_path())
     logger.info(
         "构建完成: manifest=%s（stage 已清理，断点文件已删除）总用时 %.1f 小时",
         manifest_path, (time.time() - t_start) / 3600,

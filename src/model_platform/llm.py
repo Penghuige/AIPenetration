@@ -282,7 +282,14 @@ class OpenAICompatClient:
                 status = getattr(
                     getattr(exc, "response", None), "status_code", None
                 )
-                if status is not None and 400 <= status < 500:
+                if (
+                    status is not None
+                    and 400 <= status < 500
+                    and status != 429
+                ):
+                    # 4xx 是确定性失败（如 prompt+max_tokens 超 vLLM 上限的
+                    # 400），重试只会原样失败并白烧超时预算；429 是限流，
+                    # 属暂态、应重试。
                     raise RuntimeError(
                         f"LLM 请求被拒绝（HTTP {status}，确定性失败不重试）: "
                         f"{exc}"
