@@ -33,7 +33,9 @@ def setup_logging(log_path: Path | None = None) -> None:
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
     fmt = logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"
+        # 带日期：discovery 等长跑跨天，仅时分秒无法对齐时间线。
+        "%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
 
     has_stdout = any(

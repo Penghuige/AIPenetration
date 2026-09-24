@@ -8,6 +8,7 @@
     AIPEN_LLM_BASE_URL — OpenAI-compatible API 地址
     AIPEN_LLM_MODEL    — 模型名
     AIPEN_LLM_API_KEY  — API key
+    AIPEN_LLM_TIMEOUT  — 单次请求超时秒数（默认 600）
 """
 
 from __future__ import annotations
@@ -71,6 +72,16 @@ def _adapt_guided_decoding(extra: dict[str, Any]) -> dict[str, Any]:
     return adapted
 
 
+class LLMTimeout(TimeoutError):
+    """LLM 请求超时（连接/读取超时重试耗尽后抛出）。
+
+    继承内建 ``TimeoutError``，使 discovery_extract / model_benchmark 等调用方
+    既有的 ``except TimeoutError`` 分流真正生效——requests 的
+    ``Timeout`` 体系不是内建 ``TimeoutError`` 的子类，旧实现把它包成
+    ``RuntimeError`` 抛出，超时全部被误计入 runtime_failed。
+    """
+
+
 class LLMClient(Protocol):
     """统一 LLM client 协议。"""
 
@@ -112,10 +123,91 @@ class LLMClient(Protocol):
         """批量生成文本。"""
 
 
+def _strip_llm_wrappers(text: str) -> str:
+    """剥离模型输出首尾的推理标签与 markdown 围栏，不动字符串内部内容。
+
+    只处理三种形态：开头的完整 ``<think>…</think>`` 推理段（或裸闭合标签）、
+    结尾的 ``</think>`` 残留、以及**首尾成对**的 ``` 围栏。全局删除会改写
+    JSON 字符串里恰好含这些字面量的合法内容（实测 JD 常含 ``` 代码块、
+    讨论 LLM 标签的正文可含成对 think 标签），一律不做。
+
+    Args:
+        text: LLM 原始回复文本。
+
+    Returns:
+        去掉首尾包装后的文本。
+    """
+    s = (text or "").strip()
+    m = re.match(
+        r"^<think(?:ing)?>.*?</think(?:ing)?>\s*", s, flags=re.DOTALL
+    )
+    if m is None:
+        m = re.match(r"^</think(?:ing)?>\s*", s)
+    if m is not None:
+        s = s[m.end():]
+    s = re.sub(r"\s*</think(?:ing)?>\s*$", "", s)
+    m = re.match(r"^```(?:json)?\s*", s)
+    if m is not None and s.endswith("```"):
+        s = s[m.end():]
+        if s.endswith("```"):
+            s = s[:-3]
+        s = s.strip()
+    return s
+
+
+def _first_balanced_json(s: str) -> dict[str, Any] | list[Any] | None:
+    """从文本中提取首个括号平衡、可解析的 JSON 对象/数组。
+
+    比 ``re.search(r"\\{.*\\}")`` 的贪婪匹配多回收一类输入：JSON 之后跟有
+    含 ``}`` 的尾随文字时，贪婪匹配吞到最后的 ``}`` 导致整段不可解析；
+    平衡扫描（跳过字符串字面量）只取首个完整块。
+
+    Args:
+        s: 已剥包装的文本。
+
+    Returns:
+        解析结果；不存在可解析块时返回 None。
+    """
+    for opener, closer in (("{", "}"), ("[", "]")):
+        i = s.find(opener)
+        if i < 0:
+            continue
+        depth = 0
+        in_str = False
+        esc = False
+        for j in range(i, len(s)):
+            ch = s[j]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == opener:
+                depth += 1
+            elif ch == closer:
+                depth -= 1
+                if depth == 0:
+                    try:
+                        parsed = json.loads(s[i:j + 1])
+                    except (json.JSONDecodeError, TypeError):
+                        break
+                    if isinstance(parsed, (dict, list)):
+                        return parsed
+                    break
+        # 当前 opener 找不到平衡块时继续尝试另一种（如文本只有数组）。
+    return None
+
+
 def extract_json_from_response(text: str) -> dict[str, Any] | list[Any] | None:
     """从 LLM 回复中提取 JSON 对象或数组。
 
-    兼容 ```json 代码块包裹和前后附带说明文字的情况。
+    兼容 ```json 代码块包裹、前后推理标签和首尾附带说明文字的情况；
+    字符串内部出现的围栏/标签字面量原样保留。
 
     Args:
         text: LLM 原始回复文本。
@@ -123,36 +215,14 @@ def extract_json_from_response(text: str) -> dict[str, Any] | list[Any] | None:
     Returns:
         解析出的 dict/list；无法解析时返回 None。
     """
-    # 剥离推理标签。Qwen3 在 enable_thinking=False 下仍偶发在 JSON 之后输出
-    # </think>（技术基准实测 2/2000），使本可解析的 JSON 判为失败；在发现
-    # 阶段这类失败会让整个 chunk 重试，代价更大。
-    # 只剥完整的推理段与**首尾**标签，不做全局删除：全局删除会破坏字符串里
-    # 恰好含该字面量的内容（实测 {"a":"x</think>y"} 会被改成 "xy"）。
-    # 注意：已观测到的那个案例即使剥离标签仍无法解析——其 evidence 字符串
-    # 未闭合（受控解码未拦住非法 JSON），此处不修复那种情况，仅做防御。
-    raw = re.sub(
-        r"<think(?:ing)?>.*?</think(?:ing)?>", "", text or "", flags=re.DOTALL
-    )
-    raw = re.sub(r"^\s*</?think(?:ing)?>\s*", "", raw)
-    raw = re.sub(r"\s*</?think(?:ing)?>\s*$", "", raw)
-    cleaned = re.sub(r"```(?:json)?|```", "", raw.strip())
+    cleaned = _strip_llm_wrappers(text)
     try:
         parsed = json.loads(cleaned)
         if isinstance(parsed, (dict, list)):
             return parsed
     except (json.JSONDecodeError, TypeError):
         pass
-    # 尝试提取首个平衡的 {...} 或 [...]
-    for pattern in (r"\{.*\}", r"\[.*\]"):
-        match = re.search(pattern, cleaned, re.DOTALL)
-        if match:
-            try:
-                parsed = json.loads(match.group(0))
-                if isinstance(parsed, (dict, list)):
-                    return parsed
-            except (json.JSONDecodeError, TypeError):
-                continue
-    return None
+    return _first_balanced_json(cleaned)
 
 
 @dataclass
@@ -167,7 +237,24 @@ class OpenAICompatClient:
     extra_headers: dict[str, str] = field(default_factory=dict)
 
     def _post_chat(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """发送一次 chat completions 请求，带指数退避重试。"""
+        """发送一次 chat completions 请求，按失败类别分流重试。
+
+        - 连接错误 / 5xx：指数退避重试，耗尽后 RuntimeError；
+        - 4xx：确定性失败（如 prompt+max_tokens 超 vLLM 上限的 400），
+          立即 RuntimeError 不重试——重试只会原样失败并白烧超时预算；
+        - 超时：重试耗尽后抛 :class:`LLMTimeout`（内建 TimeoutError 子类），
+          使调用方 ``except TimeoutError`` 的超时分流真正生效。
+
+        Args:
+            payload: chat completions 请求体。
+
+        Returns:
+            服务端 JSON 响应 dict。
+
+        Raises:
+            LLMTimeout: 超时重试耗尽。
+            RuntimeError: 其余失败重试耗尽，或 4xx 立即失败。
+        """
         url = f"{self.base_url.rstrip('/')}/chat/completions"
         headers = {"Content-Type": "application/json", **self.extra_headers}
         if self.api_key:
@@ -175,16 +262,52 @@ class OpenAICompatClient:
         last_error: Exception | None = None
         for attempt in range(1, max(1, self.retry) + 1):
             try:
-                resp = requests.post(url, json=payload, headers=headers, timeout=self.timeout)
+                resp = requests.post(
+                    url, json=payload, headers=headers, timeout=self.timeout
+                )
                 resp.raise_for_status()
                 return resp.json()
+            except requests.exceptions.Timeout as exc:
+                last_error = exc
+                logger.warning(
+                    "LLM 请求超时 attempt=%s/%s timeout=%ss error=%s",
+                    attempt, self.retry, self.timeout, exc,
+                )
+                if attempt >= max(1, self.retry):
+                    raise LLMTimeout(
+                        f"LLM 请求超时（{self.timeout}s，重试 "
+                        f"{self.retry} 次后放弃）: {exc}"
+                    ) from exc
+            except requests.exceptions.HTTPError as exc:
+                status = getattr(
+                    getattr(exc, "response", None), "status_code", None
+                )
+                if status is not None and 400 <= status < 500:
+                    raise RuntimeError(
+                        f"LLM 请求被拒绝（HTTP {status}，确定性失败不重试）: "
+                        f"{exc}"
+                    ) from exc
+                last_error = exc
+                logger.warning(
+                    "LLM 请求失败 attempt=%s/%s error=%s",
+                    attempt, self.retry, exc,
+                )
+                if attempt >= max(1, self.retry):
+                    raise RuntimeError(
+                        f"LLM 请求失败: {last_error}"
+                    ) from last_error
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
                 logger.warning(
-                    "LLM 请求失败 attempt=%s/%s error=%s", attempt, self.retry, exc
+                    "LLM 请求失败 attempt=%s/%s error=%s",
+                    attempt, self.retry, exc,
                 )
-                if attempt < self.retry:
-                    time.sleep(min(2 ** (attempt - 1), 8))
+                if attempt >= max(1, self.retry):
+                    raise RuntimeError(
+                        f"LLM 请求失败: {last_error}"
+                    ) from last_error
+            if attempt < self.retry:
+                time.sleep(min(2 ** (attempt - 1), 8))
         raise RuntimeError(f"LLM 请求失败: {last_error}") from last_error
 
     def complete_text(
@@ -322,4 +445,8 @@ def create_llm_client(
         api_key=os.getenv("AIPEN_LLM_API_KEY") or str(llm_cfg.get("api_key", "EMPTY")),
         model=os.getenv("AIPEN_LLM_MODEL") or str(llm_cfg.get("model", "Qwen3-8B")),
         retry=int(os.getenv("AIPEN_LLM_RETRY") or llm_cfg.get("retry", 2)),
+        timeout=float(
+            os.getenv("AIPEN_LLM_TIMEOUT")
+            or llm_cfg.get("timeout", 600.0)
+        ),
     )

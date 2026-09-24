@@ -43,6 +43,10 @@ generation:
   # 正常样本有可观测劣化（surface 回填率 1.00 -> 0.88-0.93），不能设为
   # 全局默认。§8.6 未规定该参数，按 §8.4「解码参数必须固定」冻结于此。
   repair_repetition_penalty: 1.1
+  # 与 model_config_v1.yaml 逐键对齐：_comparable_config 比较整个 generation
+  # 段，本文件缺键时 fp8 候选即使胜出也会在 select 的逐键相等校验上报错，
+  # 且错误信息不指向根因（缺 extract_base_output_tokens 而非量化差异）。
+  extract_base_output_tokens: 8192
   guided_json: true
   retry_invalid_json: 1
 

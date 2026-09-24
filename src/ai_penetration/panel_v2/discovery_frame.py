@@ -18,6 +18,7 @@ import hashlib
 import io
 import json
 import logging
+import os
 import re
 import time
 import unicodedata
@@ -65,6 +66,110 @@ def _unlink_with_retry(path: Path, attempts: int = 6) -> None:
             logger.warning(
                 "临时文件仍被占用，保留 %s —— 产物已写出，不阻断构建", path
             )
+
+
+PROGRESS_NAME = "discovery_frame_progress.json"
+
+
+def _guard_single_instance() -> None:
+    """单实例保护：已有更早启动的 discovery_frame 进程在跑则本进程退出。
+
+    防止两个 build 并发互踩：第二个进程的 DROP/CREATE stage 会毁掉第一个
+    进程已写入的数据（2026-09-24 曾发生两轮构建重叠）。实现沿用
+    fused_national._guard_single_instance 的既有模式。
+    """
+    try:
+        import psutil
+    except ImportError:
+        return
+    me = os.getpid()
+    my_start = psutil.Process(me).create_time()
+    for p in psutil.process_iter():
+        try:
+            if p.pid == me:
+                continue
+            if "python" not in (p.name() or "").lower():
+                continue
+            cmd = " ".join(p.cmdline() or [])
+            if "discovery_frame" in cmd and "pytest" not in cmd:
+                if p.create_time() < my_start:
+                    logger.warning(
+                        "检测到更早启动的 discovery_frame PID=%s，本实例退出"
+                        "（单实例保护）", p.pid,
+                    )
+                    raise SystemExit(0)
+        except (psutil.Error, OSError):
+            continue
+
+
+def _progress_path() -> Path:
+    """断点文件路径（与 corpus 同目录，构建成功后删除）。"""
+    return (
+        get_project_paths().output_dir / "dictionary" / PROGRESS_NAME
+    )
+
+
+def _load_progress() -> dict:
+    """读取断点；文件缺失/损坏时返回空 dict（视为无断点）。"""
+    path = _progress_path()
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        logger.warning("断点文件损坏，忽略并从零开始: %s", path)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_progress(progress: dict) -> None:
+    """原子写入断点文件（先写 tmp 再替换，避免半写断点误导 resume）。"""
+    path = _progress_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(
+        json.dumps(progress, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    tmp.replace(path)
+
+
+def _table_exists(table: str) -> bool:
+    conn = _results_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT to_regclass(%s)", (f"public.{table}",))
+        return cur.fetchone()[0] is not None
+    finally:
+        conn.close()
+
+
+def _drop_stage() -> None:
+    """构建成功后清理 stage 中间表（纯中间态，非交付物，实测可达 38GB）。"""
+    conn = _results_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(f"DROP TABLE IF EXISTS public.{STAGE}")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _delete_shard_rows(city: str) -> None:
+    """删除某分片已写入 stage 的行（该分片上次中断、本次重扫时防重复）。"""
+    conn = _results_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            f"DELETE FROM public.{STAGE} WHERE source_city = %s", (city,)
+        )
+        deleted = cur.rowcount
+        conn.commit()
+    finally:
+        conn.close()
+    if deleted:
+        logger.info(
+            "清除中断分片 %s 的部分数据: %s 行", city, deleted
+        )
 
 
 def _sha(path: Path) -> str:
@@ -193,8 +298,13 @@ def _verify_source_snapshot(audit: dict) -> None:
             raise RuntimeError("source audit manifest 缺 tables 快照统计")
         drift = []
         for table, meta in tables.items():
+            t0 = time.time()
             cur.execute(f"SELECT count(*) FROM public.{table}")
             now = int(cur.fetchone()[0])
+            logger.info(
+                "快照核对 %s: rows=%s 用时 %.1f 分钟",
+                table, now, (time.time() - t0) / 60,
+            )
             expected = int(meta.get("rows", -1))
             if now != expected:
                 drift.append(f"{table}:{expected}->{now}")
@@ -207,16 +317,21 @@ def _verify_source_snapshot(audit: dict) -> None:
         conn.close()
 
 
-def _pre_discovery_lexicon():
-    paths = get_project_paths()
+def _v3_governance_path() -> Path:
+    """pre-discovery v3 治理表路径；缺失即 fail-closed。"""
     path = (
-        paths.output_dir / "dictionary"
+        get_project_paths().output_dir / "dictionary"
         / "skill_legacy_graded_BCD_v3.csv"
     )
     if not path.exists():
         raise RuntimeError(
             "缺 pre-discovery v3 治理表；请先完成 legacy_freq + lexicon_llm merge"
         )
+    return path
+
+
+def _pre_discovery_lexicon():
+    path = _v3_governance_path()
     grades = pd.read_csv(path, encoding="utf-8-sig")
     mapping = governed_skill_map(grades)
     formal = grades[grades.final_grade.isin(["A", "B", "C"])]
@@ -355,14 +470,52 @@ def _copy_rows(rows: list[tuple]) -> None:
         conn.close()
 
 
-def _scan_source(cfg: dict, lex) -> dict:
+def _scan_source(cfg: dict, lex, progress: dict) -> dict:
+    """全量扫描源表写入 stage；按分片（城市）断点续扫。
+
+    每个分片完成即把 done 标志与计数落盘到断点文件；中断后重跑跳过已完成
+    分片，只清除并重扫中断的那个分片——不再像旧实现那样整轮从零开始
+    （实测一轮全量扫描 7-8 小时）。分片内每 50 万行打一条进度日志。
+
+    Args:
+        cfg: 冻结的 discovery_strata_v1 配置。
+        lex: union 词表（build_union_lexicon 产物）。
+        progress: 断点 dict（就地更新并周期性落盘）。
+
+    Returns:
+        三分片合计的 {rows_seen, rows_kept, invalid_year}。
+    """
     bins = [float(x) for x in cfg["text_length"]["bins"]]
     labels = [str(x) for x in cfg["text_length"]["labels"]]
     tech = re.compile(str(cfg["tech_flag"]["position_regex"]), re.I)
-    stats = {"rows_seen": 0, "rows_kept": 0, "invalid_year": 0}
+    totals = {"rows_seen": 0, "rows_kept": 0, "invalid_year": 0}
     conn = psycopg2.connect(**eps_conn_params())
     try:
         for city, job_table, _city_id in SHARDS:
+            shard_state = progress["shards"].get(job_table, {})
+            if shard_state.get("done"):
+                logger.info(
+                    "分片 %s(%s) 已完成（断点跳过）: rows_seen=%s "
+                    "rows_kept=%s",
+                    city, job_table,
+                    shard_state.get("rows_seen"),
+                    shard_state.get("rows_kept"),
+                )
+                for key in totals:
+                    totals[key] += int(shard_state.get(key, 0))
+                continue
+            if shard_state.get("started"):
+                logger.info(
+                    "分片 %s(%s) 上次中断，清除部分数据后重扫",
+                    city, job_table,
+                )
+                _delete_shard_rows(city)
+            progress["shards"][job_table] = {"started": True}
+            _save_progress(progress)
+            t_shard = time.time()
+            stats = {"rows_seen": 0, "rows_kept": 0, "invalid_year": 0}
+            next_milestone = 500_000
+            logger.info("分片开始 %s(%s)", city, job_table)
             ent_table = job_table.replace("job_", "ent_", 1)
             query = _source_query(conn, job_table, ent_table, cfg)
             cur = conn.cursor(f"discovery_{job_table}")
@@ -411,13 +564,33 @@ def _scan_source(cfg: dict, lex) -> dict:
                     if len(buf) >= 50000:
                         _copy_rows(buf)
                         buf = []
-                if buf:
-                    _copy_rows(buf)
-                    buf = []
+                if stats["rows_seen"] >= next_milestone:
+                    elapsed = time.time() - t_shard
+                    logger.info(
+                        "扫描 %s 进行中: rows_seen=%s rows_kept=%s "
+                        "速率=%.0f 行/s 已用=%.1f 分钟",
+                        city, stats["rows_seen"], stats["rows_kept"],
+                        stats["rows_seen"] / max(elapsed, 1e-6),
+                        elapsed / 60,
+                    )
+                    next_milestone += 500_000
+            if buf:
+                _copy_rows(buf)
+                buf = []
             cur.close()
+            progress["shards"][job_table] = {"done": True, **stats}
+            _save_progress(progress)
+            logger.info(
+                "分片完成 %s(%s): rows_seen=%s rows_kept=%s "
+                "invalid_year=%s 用时=%.1f 分钟",
+                city, job_table, stats["rows_seen"], stats["rows_kept"],
+                stats["invalid_year"], (time.time() - t_shard) / 60,
+            )
+            for key in totals:
+                totals[key] += stats[key]
     finally:
         conn.close()
-    return stats
+    return totals
 
 
 def _materialize_final() -> int:
@@ -467,6 +640,7 @@ def _export_table(table: str, out: Path, columns: list[str],
                   types: dict[str, pa.DataType]) -> None:
     tmp = out.with_suffix(".csv.tmp")
     conn = _results_conn()
+    copy_ok = False
     try:
         cur = conn.cursor()
         with tmp.open("w", encoding="utf-8", newline="") as fh:
@@ -476,8 +650,13 @@ def _export_table(table: str, out: Path, columns: list[str],
                 "TO STDOUT WITH (FORMAT csv, HEADER true)",
                 fh,
             )
+        copy_ok = True
     finally:
         conn.close()
+        if not copy_ok:
+            # COPY 中途失败时 tmp 是半写的孤儿文件（实测可达 19GB），
+            # 旧实现此路径无任何清理。
+            _unlink_with_retry(tmp)
     reader = pcsv.open_csv(
         tmp,
         read_options=pcsv.ReadOptions(block_size=1 << 24),
@@ -509,11 +688,29 @@ def _export_table(table: str, out: Path, columns: list[str],
         raise RuntimeError(f"{table} 导出为空")
 
 
-def build() -> Path:
+def build(*, fresh: bool = False, reverify: bool = False) -> Path:
+    """构建正式 discovery frame；带分片断点、进度日志与产物复用。
+
+    Args:
+        fresh: 忽略断点与已有 manifest，从零重建。
+        reverify: 强制重跑源快照行数核对（默认同一审计哈希只核对一次）。
+
+    Returns:
+        manifest 路径。
+    """
     paths = get_project_paths()
     setup_logging(paths.log_dir / "discovery_frame.log")
+    _guard_single_instance()
+    t_start = time.time()
+    logger.info(
+        "discovery frame 构建开始（fresh=%s reverify=%s）", fresh, reverify
+    )
+
     cfg, cfg_path = _load_config()
+    logger.info("分层配置冻结校验通过: %s", cfg_path.name)
     _validate_source_fields(cfg)
+    logger.info("源表字段校验通过（%s 个分片）", len(SHARDS))
+
     audit_manifest = (
         paths.output_dir / "data_audit" / "source_db_manifest_v1.json"
     )
@@ -522,15 +719,95 @@ def build() -> Path:
     audit = json.loads(audit_manifest.read_text(encoding="utf-8"))
     if audit.get("status") != "formal_pass":
         raise RuntimeError("source_db_manifest_v1 未 formal_pass")
-    _verify_source_snapshot(audit)
+    audit_sha = _sha(audit_manifest)
 
-    lex, v3_path = _pre_discovery_lexicon()
-    _create_stage()
-    scan_stats = _scan_source(cfg, lex)
-    n = _materialize_final()
+    v3_path = _v3_governance_path()
+    v3_sha = _sha(v3_path)
+    cfg_sha = _sha(cfg_path)
 
     out_dir = paths.output_dir / "dictionary"
     out_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = out_dir / "discovery_frame_manifest_v1.json"
+
+    # 幂等重跑：同输入且已 formal_pass → 直接返回。旧实现无条件重建，
+    # 9.4GB corpus 已在而 manifest 缺失时仍会整轮重扫（实测白跑约 8 小时）。
+    if not fresh and manifest_path.exists():
+        try:
+            previous = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            previous = {}
+        if (
+            previous.get("status") == "formal_pass"
+            and previous.get("source_audit_sha256") == audit_sha
+            and previous.get("strata_config_sha256") == cfg_sha
+            and previous.get("pre_discovery_governance_sha256") == v3_sha
+        ):
+            logger.info(
+                "manifest 已 formal_pass 且三个输入哈希未变，跳过构建: %s",
+                manifest_path,
+            )
+            return manifest_path
+        logger.info("manifest 存在但输入已变化或未通过，全量重建")
+
+    # 源快照核对（结果缓存）：门禁是 4 张大表共约 2 亿行的精确 count，
+    # 同一审计哈希核对过一次后不再重付（eps 为只读源库，策略上无写入方）。
+    progress = _load_progress() if not fresh else {}
+    if not reverify and progress.get("verified_audit_sha256") == audit_sha:
+        logger.info(
+            "源快照核对跳过（同审计哈希已于 %s 核对过；--reverify 强制重核）",
+            progress.get("verified_at", "未知时间"),
+        )
+    else:
+        t0 = time.time()
+        _verify_source_snapshot(audit)
+        progress["verified_audit_sha256"] = audit_sha
+        progress["verified_at"] = datetime.now().isoformat(
+            timespec="seconds"
+        )
+        _save_progress(progress)
+        logger.info(
+            "源快照核对通过，用时 %.1f 分钟", (time.time() - t0) / 60
+        )
+
+    # 断点仅在三个输入哈希一致时可续用。
+    resume_valid = (
+        not fresh
+        and progress.get("audit_sha256") == audit_sha
+        and progress.get("strata_config_sha256") == cfg_sha
+        and progress.get("pre_discovery_governance_sha256") == v3_sha
+        and isinstance(progress.get("shards"), dict)
+    )
+    if not resume_valid:
+        progress = {
+            "audit_sha256": audit_sha,
+            "strata_config_sha256": cfg_sha,
+            "pre_discovery_governance_sha256": v3_sha,
+            "verified_audit_sha256": progress.get("verified_audit_sha256"),
+            "verified_at": progress.get("verified_at"),
+            "shards": {},
+        }
+        logger.info(
+            "断点不可复用（首次构建/输入变化/--fresh），从零扫描"
+        )
+
+    lex, _v3_used = _pre_discovery_lexicon()
+    logger.info("union 词表构建完成")
+
+    if resume_valid and _table_exists(STAGE):
+        logger.info("resume：复用已有 stage 表（不 DROP）")
+    else:
+        _create_stage()
+        progress["shards"] = {}
+        _save_progress(progress)
+        logger.info("stage 表已重建（全量扫描起点）")
+
+    scan_stats = _scan_source(cfg, lex, progress)
+    logger.info(
+        "扫描合计: rows_seen=%s rows_kept=%s invalid_year=%s",
+        scan_stats["rows_seen"], scan_stats["rows_kept"],
+        scan_stats["invalid_year"],
+    )
+
     corpus_path = out_dir / "dictionary_discovery_corpus_v1.parquet"
     corpus_cols = [
         "job_id AS representative_job_id", "year", "industry", "position_group", "company_size",
@@ -552,7 +829,45 @@ def build() -> Path:
         "enterprise_count": pa.int64(), "year_min": pa.int32(),
         "year_max": pa.int32(), "job_ids_json": pa.string(),
     }
-    _export_table(FINAL, corpus_path, corpus_cols, types)
+
+    corpus_reusable = (
+        resume_valid
+        and progress.get("corpus_sha256")
+        and corpus_path.exists()
+        and _sha(corpus_path) == progress["corpus_sha256"]
+    )
+    if corpus_reusable:
+        logger.info("corpus parquet 与断点记录一致，跳过物化与导出")
+        n = int(progress.get("n_unique_platform_texts", 0))
+    else:
+        if resume_valid and progress.get("final_built") and _table_exists(FINAL):
+            logger.info("FINAL 表已物化（断点），跳过 DISTINCT ON 重物化")
+            conn = _results_conn()
+            try:
+                cur = conn.cursor()
+                cur.execute(f"SELECT count(*) FROM public.{FINAL}")
+                n = int(cur.fetchone()[0])
+            finally:
+                conn.close()
+        else:
+            t0 = time.time()
+            n = _materialize_final()
+            progress["final_built"] = True
+            progress["n_unique_platform_texts"] = n
+            _save_progress(progress)
+            logger.info(
+                "FINAL 物化完成: %s 组，用时 %.1f 分钟",
+                n, (time.time() - t0) / 60,
+            )
+        t0 = time.time()
+        _export_table(FINAL, corpus_path, corpus_cols, types)
+        progress["corpus_sha256"] = _sha(corpus_path)
+        progress.pop("final_built", None)
+        _save_progress(progress)
+        logger.info(
+            "corpus parquet 导出完成（zstd），用时 %.1f 分钟",
+            (time.time() - t0) / 60,
+        )
 
     frame_path = out_dir / "discovery_frame_v1.parquet"
     source_cols = [
@@ -560,6 +875,7 @@ def build() -> Path:
         "company_size", "text_length_bin", "tech_flag", "platform",
         "anchor_main", "matched_skill_count", "text_hash", "description",
     ]
+    t0 = time.time()
     pf = pq.ParquetFile(corpus_path)
     writer = None
     try:
@@ -583,8 +899,12 @@ def build() -> Path:
     finally:
         if writer is not None:
             writer.close()
+        pf.close()
     if writer is None:
         raise RuntimeError("discovery frame 为空")
+    logger.info(
+        "frame parquet 写出完成，用时 %.1f 分钟", (time.time() - t0) / 60
+    )
 
     manifest = {
         "status": "formal_pass",
@@ -596,20 +916,28 @@ def build() -> Path:
             "year_asc", "stable_job_id_asc",
         ],
         "source_snapshot_id": audit.get("snapshot_id"),
-        "source_audit_sha256": _sha(audit_manifest),
-        "strata_config_sha256": _sha(cfg_path),
-        "pre_discovery_governance_sha256": _sha(v3_path),
+        "source_audit_sha256": audit_sha,
+        "strata_config_sha256": cfg_sha,
+        "pre_discovery_governance_sha256": v3_sha,
         "scan_stats": scan_stats,
         "n_unique_platform_texts": n,
         "corpus_sha256": _sha(corpus_path),
         "frame_sha256": _sha(frame_path),
         "corpus_path": str(corpus_path),
         "frame_path": str(frame_path),
+        "build_wall_seconds": round(time.time() - t_start, 1),
     }
-    manifest_path = out_dir / "discovery_frame_manifest_v1.json"
     manifest_path.write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2),
         encoding="utf-8",
+    )
+    # 收尾：stage 是纯中间态（实测可达 38GB），构建成功后清理；断点文件
+    # 同步删除（manifest 的幂等检查取代它成为重跑门槛）。
+    _drop_stage()
+    _progress_path().unlink(missing_ok=True)
+    logger.info(
+        "构建完成: manifest=%s（stage 已清理，断点文件已删除）总用时 %.1f 小时",
+        manifest_path, (time.time() - t_start) / 3600,
     )
     return manifest_path
 
@@ -624,8 +952,16 @@ def main() -> None:
     ap = argparse.ArgumentParser(
         description="构建正式 dictionary discovery frame（§6.2.0 + handoff）"
     )
-    ap.parse_args()
-    build()
+    ap.add_argument(
+        "--fresh", action="store_true",
+        help="忽略断点与已有 manifest，从零重建",
+    )
+    ap.add_argument(
+        "--reverify", action="store_true",
+        help="强制重跑源快照行数核对（默认同一审计哈希只核对一次）",
+    )
+    args = ap.parse_args()
+    build(fresh=args.fresh, reverify=args.reverify)
 
 
 if __name__ == "__main__":

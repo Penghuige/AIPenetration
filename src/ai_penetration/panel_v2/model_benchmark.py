@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import os
 import re
 import time
@@ -25,6 +26,10 @@ import yaml
 
 from config.paths import get_project_paths, load_config_yaml
 from src.model_platform.llm import create_llm_client, extract_json_from_response
+
+from ..common import setup_logging
+
+logger = logging.getLogger(__name__)
 
 THRESHOLDS = {
     "json_schema_valid_rate": 0.995,
@@ -550,6 +555,11 @@ def run(
     repeats = 2 if phase == "technical" else 1
     samples = _load_samples(sample_file, minimum)
     paths = get_project_paths()
+    setup_logging(paths.log_dir / "panel_v2_model_benchmark.log")
+    logger.info(
+        "技术基准开始: phase=%s candidate=%s 样本=%s repeats=%s",
+        phase, candidate_id, len(samples), repeats,
+    )
     prompt_path = paths.config_dir / "skill_extraction_prompt_v1.md"
     schema_path = paths.config_dir / "skill_extraction_schema_v1.json"
     system = prompt_path.read_text(encoding="utf-8")
@@ -599,12 +609,22 @@ def run(
         jid: json.dumps({"job_id": jid, "text": text}, ensure_ascii=False)
         for _rep, jid, text in tasks
     }
+    if len(payloads) != len({t[1] for t in tasks}):
+        # payload 按 job_id 建字典：样本含重复 job_id 时前一重复行会拿到
+        # 最后一行的文本发给模型、却用自己的文本校验 span，指标被污染。
+        raise ValueError("基准样本存在重复 job_id，并发 payload 构造会错位")
+    logger.info(
+        "调用阶段开始: tasks=%s workers=%s", len(tasks), workers
+    )
+    t_calls = time.time()
+    done_calls = 0
     # pool.map 按输入顺序产出结果，边取边写即与串行版记录顺序一致；每条
     # 立即 flush，长跑时可随时从 raw 文件观察进度，中断后也保留已完成部分。
     peak_vram_mb = _device_used_mb(torch)
     sampled = 0
     with raw_path.open("w", encoding="utf-8") as fh:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
+        pool = ThreadPoolExecutor(max_workers=workers)
+        try:
             for (rep, jid, _text), out in zip(
                 tasks,
                 pool.map(
@@ -655,6 +675,27 @@ def run(
                     "error": error,
                 }, ensure_ascii=False) + "\n")
                 fh.flush()
+                done_calls += 1
+                if done_calls % 100 == 0 or done_calls == len(tasks):
+                    elapsed = time.time() - t_calls
+                    logger.info(
+                        "基准进度: %s/%s（%.1f%%），平均 %.1fs/条，已用 %.1f 分钟",
+                        done_calls, len(tasks),
+                        done_calls * 100.0 / max(len(tasks), 1),
+                        elapsed / max(done_calls, 1), elapsed / 60,
+                    )
+        except BaseException:
+            # 消费循环中断（写盘失败/Ctrl+C）时取消排队任务：with 退出的
+            # shutdown(wait=True) 默认不取消已排队 future，会把整个队列跑完
+            # 却不再落盘（prerun 规模实测可假死约 2 小时）。
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+        else:
+            pool.shutdown(wait=True)
+    logger.info(
+        "调用阶段完成: %s 条，用时 %.1f 分钟",
+        done_calls, (time.time() - t_calls) / 60,
+    )
 
     calls = len(samples) * repeats
     repeat_exact = 1.0
@@ -715,6 +756,7 @@ def run(
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "n_samples": len(samples),
         "repeats": repeats,
+        "workers": workers,
         "gpu_name": gpu_name,
         "model_signature": model_signature,
         "metrics": metrics,
@@ -767,7 +809,13 @@ def run(
         lines.append("- 无")
     report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     if not passed:
+        # SystemExit 不打印 traceback：不留日志的话进程会"无声消失"。
+        logger.error(
+            "技术基准未通过（exit 2）: candidate=%s phase=%s 指标=%s",
+            candidate_id, phase, json.dumps(metrics, ensure_ascii=False),
+        )
         raise SystemExit(2)
+    logger.info("技术基准 formal_pass: manifest=%s", manifest_path)
     return manifest_path
 
 

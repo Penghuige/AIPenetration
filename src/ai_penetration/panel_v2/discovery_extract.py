@@ -9,8 +9,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import os
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -19,8 +21,53 @@ import pandas as pd
 from config.paths import get_project_paths, load_config_yaml
 from src.model_platform.llm import create_llm_client, extract_json_from_response
 
+from ..common import setup_logging
+
 _BOUNDARY_RE = re.compile(r"[\n。！？；;!?]+")
 STATUS = {"pending", "success", "empty", "schema_failed", "timeout", "runtime_failed"}
+
+logger = logging.getLogger(__name__)
+
+
+def _load_existing_records(raw_path: Path) -> list[dict]:
+    """读取断点 raw 文件为记录列表，容忍末尾撕裂行。
+
+    强杀进程可能在 flush 中途留下半行 JSON（单条记录含完整 LLM 原文，可达
+    数十 KB，flush 不保证单行原子落盘）。末尾撕裂行丢弃并告警；**非末尾**
+    行损坏说明文件深层损坏，fail-closed 报出行号——静默跳过中间记录会导致
+    该 chunk 被当作"已发出未完成"永久 pending。
+
+    Args:
+        raw_path: 断点 jsonl 文件。
+
+    Returns:
+        按文件顺序的全部完整记录。
+    """
+    if not raw_path.exists():
+        return []
+    try:
+        text = raw_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        text = raw_path.read_bytes().decode("utf-8", errors="replace")
+        logger.warning("断点文件含非法 UTF-8（疑似撕裂尾行），按 replace 解码")
+    lines = text.splitlines()
+    out: list[dict] = []
+    for i, line in enumerate(lines):
+        if not line.strip():
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            if i == len(lines) - 1:
+                logger.warning("忽略断点文件末尾撕裂行（上次进程被强杀）")
+                break
+            raise RuntimeError(
+                f"断点 raw 文件第 {i + 1} 行损坏（非末行），请人工检查: "
+                f"{raw_path}"
+            ) from None
+        if isinstance(rec, dict):
+            out.append(rec)
+    return out
 
 
 def _sha_text(text: str) -> str:
@@ -353,6 +400,8 @@ def _extract_one(
 def run(sample_csv: Path) -> tuple[Path, Path]:
     cfg, tok = _fixed_config()
     paths = get_project_paths()
+    setup_logging(paths.log_dir / "panel_v2_discovery_extract.log")
+    logger.info("正式候选发现抽取开始: sample=%s", sample_csv)
     prompt_path = paths.config_dir / "skill_extraction_prompt_v1.md"
     schema_path = paths.config_dir / "skill_extraction_schema_v1.json"
     prompt = prompt_path.read_text(encoding="utf-8")
@@ -389,20 +438,20 @@ def run(sample_csv: Path) -> tuple[Path, Path]:
 
     latest: dict[str, dict] = {}
     content_cache: dict[str, dict] = {}
-    if raw_path.exists():
-        for line in raw_path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            rec = json.loads(line)
-            record_key = str(rec.get("record_key", ""))
-            if record_key:
-                latest[record_key] = rec
-            chunk_key = str(rec.get("chunk_cache_key", ""))
-            if (
-                chunk_key
-                and rec.get("status") in {"success", "empty"}
-            ):
-                content_cache[chunk_key] = rec
+    for rec in _load_existing_records(raw_path):
+        record_key = str(rec.get("record_key", ""))
+        if record_key:
+            latest[record_key] = rec
+        chunk_key = str(rec.get("chunk_cache_key", ""))
+        if (
+            chunk_key
+            and rec.get("status") in {"success", "empty"}
+        ):
+            content_cache[chunk_key] = rec
+    logger.info(
+        "断点载入: 唯一 record %s 条，可复用 chunk 缓存 %s 条",
+        len(latest), len(content_cache),
+    )
 
     client = create_llm_client()
     expected: list[str] = []
@@ -493,8 +542,16 @@ def run(sample_csv: Path) -> tuple[Path, Path]:
     # 差异仅在于：批次内新增的跨 chunk 缓存复用不再发生（结果由固定 seed +
     # temperature=0 决定，内容等价）。
     workers = max(1, int(os.getenv("AIPEN_EXTRACT_WORKERS", "8")))
+    logger.info(
+        "阶段 2 开始: 待调用 chunk %s，并发 %s（缓存命中 %s 条已在阶段 1 落盘）",
+        len(tasks), workers,
+        len(latest) - len(tasks) if len(latest) >= len(tasks) else 0,
+    )
+    t_phase2 = time.time()
+    done_in_phase2 = 0
     with raw_path.open("a", encoding="utf-8") as fh:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
+        pool = ThreadPoolExecutor(max_workers=workers)
+        try:
             for (record_key, chunk_cache_key, _common, _chunk, _off), final in (
                 zip(
                     tasks,
@@ -514,6 +571,24 @@ def run(sample_csv: Path) -> tuple[Path, Path]:
                 latest[record_key] = final
                 if final["status"] in {"success", "empty"}:
                     content_cache[chunk_cache_key] = final
+                done_in_phase2 += 1
+                if done_in_phase2 % 100 == 0 or done_in_phase2 == len(tasks):
+                    elapsed = time.time() - t_phase2
+                    logger.info(
+                        "抽取进度: %s/%s（%.1f%%），平均 %.1fs/条，已用 %.1f 分钟",
+                        done_in_phase2, len(tasks),
+                        done_in_phase2 * 100.0 / max(len(tasks), 1),
+                        elapsed / max(done_in_phase2, 1), elapsed / 60,
+                    )
+        except BaseException:
+            # 消费循环中断（写盘失败/Ctrl+C）时取消排队任务：with 退出的
+            # shutdown(wait=True) 默认不取消已排队 future，会把整个队列跑完
+            # 却不再落盘（prerun 规模实测可假死约 2 小时）。
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+        else:
+            pool.shutdown(wait=True)
+    logger.info("阶段 2 完成，用时 %.1f 分钟", (time.time() - t_phase2) / 60)
 
     records = []
     for key in expected:
@@ -589,6 +664,7 @@ def run(sample_csv: Path) -> tuple[Path, Path]:
         "total_chunks": total,
         "status_counts": status_counts,
         "failure_rate": failures / max(total, 1),
+        "workers": workers,
         "raw_sha256": hashlib.sha256(
             raw_path.read_bytes()
         ).hexdigest(),
@@ -605,7 +681,13 @@ def run(sample_csv: Path) -> tuple[Path, Path]:
         encoding="utf-8",
     )
     if manifest["status"] != "formal_pass":
+        # SystemExit 不打印 traceback：不留日志的话进程会"无声消失"。
+        logger.error(
+            "抽取未达 formal_pass: failure_rate=%.4f status_counts=%s",
+            manifest["failure_rate"], status_counts,
+        )
         raise SystemExit(2)
+    logger.info("抽取完成并 formal_pass: manifest=%s", manifest_path)
     return mentions_path, manifest_path
 
 

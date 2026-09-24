@@ -285,29 +285,37 @@ def finalize(
     metrics = pd.read_csv(metrics_path)
     passed = saturation_pass(metrics)
 
-    # 后期 handoff 的基准规则是每个 year×industry 单元都进入样本。
-    frame_units = {
-        (int(y), str(i).strip() or "INDUSTRY_MISSING")
-        for y, i in zip(
-            df.year,
-            df.industry.fillna("INDUSTRY_MISSING"),
-        )
-    }
-    if not {"year", "industry"}.issubset(selected.columns):
-        raise ValueError("selected sample 缺 year/industry，无法验收分层覆盖")
-    selected_units = {
-        (int(y), str(i).strip() or "INDUSTRY_MISSING")
-        for y, i in zip(
-            selected.year,
-            selected.industry.fillna("INDUSTRY_MISSING"),
-        )
-    }
-    missing_units = frame_units - selected_units
-    if missing_units:
+    # 分层验收（与 2026-09-24 采用的"每年 1 万"口径一致，依据见
+    # baseline_sample 的口径决策记录；旧的 year×industry 全单元覆盖校验属于
+    # 8/24 裁决口径，在该口径下不可行已作废——比例分层不保证稀疏单元入样，
+    # 旧校验会使 formal_pass 永远不可达）：
+    # ① 每个出现在 frame 的年份都必须有样本；
+    # ② 样本带 sampling_component 时，基准轮每年条数必须精确等于
+    #    min(1 万, 该年 frame 行数)。
+    frame_years = df.year.astype(int)
+    if "year" not in selected.columns:
+        raise ValueError("selected sample 缺 year，无法验收分层覆盖")
+    sel_years = selected.year.astype(int)
+    missing_years = sorted(
+        set(frame_years.unique()) - set(sel_years.unique())
+    )
+    if missing_years:
         raise ValueError(
-            "基准发现样本未覆盖全部 year×industry 单元: "
-            + ", ".join(map(str, sorted(missing_units)[:10]))
+            "发现样本缺整年份样本（每年 1 万口径）: " + str(missing_years)
         )
+    if "sampling_component" in selected.columns:
+        baseline = selected[
+            selected.sampling_component.astype(str) == "baseline_year"
+        ]
+        frame_counts = frame_years.value_counts()
+        for year, frame_n in frame_counts.items():
+            target = min(BASE_PER_YEAR, int(frame_n))
+            got = int((baseline.year.astype(int) == int(year)).sum())
+            if got != target:
+                raise ValueError(
+                    f"基准轮 {int(year)} 年样本 {got} 条 != 目标 {target} 条"
+                    f"（每年 1 万口径，frame 该年 {int(frame_n)} 行）"
+                )
 
     audit = pd.read_csv(candidate_audit_path)
     required_audit = {
@@ -375,7 +383,31 @@ def finalize(
     manifest = {
         "status": "formal_pass" if passed else "incomplete",
         "seed": SEED,
-        "sampling_protocol": "handoff_20260824_year_industry_10k_saturation_v2",
+        "sampling_protocol": "guideline_9_1_per_year_10k_saturation_v3",
+        "guideline_deviations": [
+            {
+                "field": "baseline_sampling_caliber",
+                "guideline_value": "每年 1 万（指南 §9.1 三处明文）",
+                "adopted_value": "每年 1 万（比例分层覆盖行业等维度）",
+                "reason": (
+                    "8/24 裁决的 year×industry 单元口径实测等于全量取走 "
+                    "9,168,049 条（11527 单元平均约 1449 行），不可行；"
+                    "2026-09-24 复核改回指南口径。依据详见 "
+                    "discovery_formal.baseline_sample docstring。"
+                ),
+            },
+            {
+                "field": "guideline_9_2_rule3_industry_floor",
+                "guideline_value": "年内每行业先保底 min(50, 行业岗位数)",
+                "adopted_value": "未实现；行业仅通过比例分层间接覆盖",
+                "reason": (
+                    "稀疏 year×industry 单元按比例抽样可能 0 条入样；"
+                    "finalize 的分层验收已改为每年条数精确校验（每年 1 万口径），"
+                    "不再要求全单元覆盖。稀疏行业的覆盖缺口由增量轮的"
+                    "低覆盖配额部分补偿，残余缺口在此显式披露。"
+                ),
+            },
+        ],
         "frame_sha256": _sha(frame_path),
         "frame_manifest_sha256": _sha(frame_manifest_path),
         "selected_sha256": _sha(selected_path),
@@ -388,7 +420,7 @@ def finalize(
         "n_formal_candidates": len(formal),
         "rounds": int(metrics["round"].max()) if len(metrics) else 0,
         "required_strata": STRATA,
-        "year_industry_units": len(frame_units),
+        "baseline_caliber": "per_year_10k_proportional",
         "coverage_gain_role": "monitor_only_not_stop_or_admission",
     }
     out = (
