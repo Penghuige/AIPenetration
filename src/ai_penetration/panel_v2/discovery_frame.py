@@ -13,15 +13,18 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import csv
 import hashlib
 import io
 import json
 import logging
 import os
+import pickle
 import re
 import time
 import unicodedata
+from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -470,7 +473,169 @@ def _copy_rows(rows: list[tuple]) -> None:
         conn.close()
 
 
-def _scan_source(cfg: dict, lex, progress: dict) -> dict:
+def _process_rows(
+    rows, city: str, bins: list, labels: list[str], tech, lex,
+) -> tuple[list[tuple], dict]:
+    """单批源行的清洗/哈希/匹配（纯函数，串行与并行路径共用）。
+
+    语义与串行版内循环逐字一致：年份白名单 2014-2025，无效年行计入
+    invalid_year 跳过；其余行按 stage 表列序构造元组。
+
+    Args:
+        rows: 游标批次 ((rid, platform, position, publish_time, desc,
+            industry, company_size, company_id), ...)。
+        city: 分片城市名（写入 source_city 列）。
+        bins: 文本长度分箱边界。
+        labels: 分箱标签。
+        tech: 技术/非技术岗位名正则（已编译）。
+        lex: union 词表（需提供 extract()）。
+
+    Returns:
+        (stage 行元组列表, {"rows_seen","rows_kept","invalid_year"} 增量)。
+    """
+    out: list[tuple] = []
+    stats = {"rows_seen": 0, "rows_kept": 0, "invalid_year": 0}
+    for (
+        rid, platform, position, publish_time, desc,
+        industry, company_size, company_id,
+    ) in rows:
+        stats["rows_seen"] += 1
+        year_s = str(publish_time or "")[:4]
+        if not year_s.isdigit() or not 2014 <= int(year_s) <= 2025:
+            stats["invalid_year"] += 1
+            continue
+        raw = str(desc)
+        match = match_from_raw(raw)
+        h = int(text_hash(match))
+        pos_group = normalize_position(str(position))
+        hits = match_all_versions(match)
+        matched = len(lex.extract(match))
+        raw_platform = str(platform or "").strip()
+        platform_s = _norm_meta(platform, "PLATFORM_MISSING")
+        out.append((
+            int(_stable_job_id(raw_platform, str(rid))),
+            int(year_s),
+            _norm_meta(industry, "INDUSTRY_MISSING"),
+            pos_group or "POSITION_MISSING",
+            _norm_meta(company_size, "COMPANY_SIZE_MISSING"),
+            _bin_length(len(match), bins, labels),
+            int(bool(tech.search(pos_group))),
+            platform_s,
+            int(hits["main"].flag),
+            int(matched),
+            h,
+            raw,
+            _norm_meta(company_id, ""),
+            city,
+            str(rid),
+        ))
+        stats["rows_kept"] += 1
+    return out, stats
+
+
+_WORKER_CTX: dict = {}
+
+
+def _worker_init(cfg: dict, lex_pickle: bytes | None) -> None:
+    """进程池 worker 初始化：反序列化父进程词表；不可 pickle 时自建。
+
+    Args:
+        cfg: 冻结的 discovery_strata 配置。
+        lex_pickle: 父进程 pickle 的 union 词表；None 时 worker 经
+            _pre_discovery_lexicon 从源库重建（每 worker 一次性，秒级）。
+    """
+    if lex_pickle is not None:
+        lex = pickle.loads(lex_pickle)
+    else:
+        lex, _unused = _pre_discovery_lexicon()
+    _WORKER_CTX.clear()
+    _WORKER_CTX.update(
+        lex=lex,
+        bins=[float(x) for x in cfg["text_length"]["bins"]],
+        labels=[str(x) for x in cfg["text_length"]["labels"]],
+        tech=re.compile(str(cfg["tech_flag"]["position_regex"]), re.I),
+    )
+
+
+def _process_rows_worker(item: tuple) -> tuple:
+    """worker 侧入口：解包 (batch, city) 后调用共用纯函数。"""
+    batch, city = item
+    return _process_rows(
+        batch, city, _WORKER_CTX["bins"], _WORKER_CTX["labels"],
+        _WORKER_CTX["tech"], _WORKER_CTX["lex"],
+    )
+
+
+def _iter_processed(batches, city: str, cfg: dict, lex, workers: int):
+    """按批产出 (stage_rows, stats)；workers=1 串行，>1 进程池并行（保序）。
+
+    设计针对本项目历史并行失败的三个机制（逐项绕开）：
+    - 仍由主进程单一命名游标顺序读：PG 侧查询形态、ent 聚合次数与
+      连接负载完全不变（历史坑：多客户端切片使 5000 万行 ent GROUP BY
+      每路重复一次、HDD 多流互抢磁头、PG 并行 worker 曾致 postmaster 崩溃）；
+    - 实测瓶颈在 Python 逐行处理（扫描游标会话持续 ClientRead 等
+      客户端），故只并行 CPU 部分；
+    - 有界在途批次（workers×2）避免物化全量输入；按提交顺序收集，
+      stage 行序与串行完全一致，断点/对账语义不变。
+
+    Args:
+        batches: 批次可迭代对象（每批一批源行元组）。
+        city: 分片城市名。
+        cfg: 冻结配置。
+        lex: union 词表（workers>1 时优先 pickle 传给 worker）。
+        workers: 并行进程数；<=1 走串行纯函数。
+
+    Yields:
+        (stage 行元组列表, stats 增量)，与批次顺序一致。
+    """
+    bins = [float(x) for x in cfg["text_length"]["bins"]]
+    labels = [str(x) for x in cfg["text_length"]["labels"]]
+    if workers <= 1:
+        tech = re.compile(str(cfg["tech_flag"]["position_regex"]), re.I)
+        for batch in batches:
+            yield _process_rows(batch, city, bins, labels, tech, lex)
+        return
+    try:
+        lex_pickle: bytes | None = pickle.dumps(lex)
+        logger.info(
+            "并行扫描：词表经 pickle 传递（%.1f MB），workers=%s",
+            len(lex_pickle) / 1048576, workers,
+        )
+    except Exception:  # noqa: BLE001 - 词表不可 pickle 时退回 worker 自建
+        lex_pickle = None
+        logger.info("并行扫描：词表不可 pickle，worker 各自从源库重建")
+    pool = ProcessPoolExecutor(
+        max_workers=workers,
+        initializer=_worker_init,
+        initargs=(cfg, lex_pickle),
+    )
+    max_pending = workers * 2
+    try:
+        pending = collections.deque()
+        it = iter(batches)
+        exhausted = False
+        while True:
+            while not exhausted and len(pending) < max_pending:
+                batch = next(it, None)
+                if batch is None:
+                    exhausted = True
+                    break
+                pending.append(
+                    pool.submit(_process_rows_worker, (batch, city))
+                )
+            if not pending:
+                break
+            yield pending.popleft().result()
+    except BaseException:
+        # 消费侧中断（异常/Ctrl+C）时取消排队批次，避免 with-exit 排空
+        # 整个队列（进程版同样会"假死排空"）。
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
+        pool.shutdown(wait=True)
+
+
+def _scan_source(cfg: dict, lex, progress: dict, workers: int = 1) -> dict:
     """全量扫描源表写入 stage；按分片（城市）断点续扫。
 
     每个分片完成即把 done 标志与计数落盘到断点文件；中断后重跑跳过已完成
@@ -481,15 +646,13 @@ def _scan_source(cfg: dict, lex, progress: dict) -> dict:
         cfg: 冻结的 discovery_strata_v1 配置。
         lex: union 词表（build_union_lexicon 产物）。
         progress: 断点 dict（就地更新并周期性落盘）。
+        workers: 扫描处理并行进程数（AIPEN_SCAN_WORKERS，默认 1 串行）。
 
     Returns:
         各分片合计的 {rows_seen, rows_kept, invalid_year}。断点按 job_table
         记、清理按 source_city 删——当前 SHARDS 两者一一对应；未来若同城
         多表（GD_SHARDS 模式）需改为按表清理。
     """
-    bins = [float(x) for x in cfg["text_length"]["bins"]]
-    labels = [str(x) for x in cfg["text_length"]["labels"]]
-    tech = re.compile(str(cfg["tech_flag"]["position_regex"]), re.I)
     totals = {"rows_seen": 0, "rows_kept": 0, "invalid_year": 0}
     conn = psycopg2.connect(**eps_conn_params())
     try:
@@ -517,55 +680,33 @@ def _scan_source(cfg: dict, lex, progress: dict) -> dict:
             t_shard = time.time()
             stats = {"rows_seen": 0, "rows_kept": 0, "invalid_year": 0}
             next_milestone = 500_000
-            logger.info("分片开始 %s(%s)", city, job_table)
+            logger.info(
+                "分片开始 %s(%s) workers=%s", city, job_table, workers,
+            )
             ent_table = job_table.replace("job_", "ent_", 1)
             query = _source_query(conn, job_table, ent_table, cfg)
             cur = conn.cursor(f"discovery_{job_table}")
             cur.itersize = 20000
             cur.execute(query)
             buf: list[tuple] = []
-            while True:
-                batch = cur.fetchmany(20000)
-                if not batch:
-                    break
-                for (
-                    rid, platform, position, publish_time, desc,
-                    industry, company_size, company_id,
-                ) in batch:
-                    stats["rows_seen"] += 1
-                    year_s = str(publish_time or "")[:4]
-                    if not year_s.isdigit() or not 2014 <= int(year_s) <= 2025:
-                        stats["invalid_year"] += 1
-                        continue
-                    raw = str(desc)
-                    match = match_from_raw(raw)
-                    h = int(text_hash(match))
-                    pos_group = normalize_position(str(position))
-                    hits = match_all_versions(match)
-                    matched = len(lex.extract(match))
-                    raw_platform = str(platform or "").strip()
-                    platform_s = _norm_meta(platform, "PLATFORM_MISSING")
-                    buf.append((
-                        int(_stable_job_id(raw_platform, str(rid))),
-                        int(year_s),
-                        _norm_meta(industry, "INDUSTRY_MISSING"),
-                        pos_group or "POSITION_MISSING",
-                        _norm_meta(company_size, "COMPANY_SIZE_MISSING"),
-                        _bin_length(len(match), bins, labels),
-                        int(bool(tech.search(pos_group))),
-                        platform_s,
-                        int(hits["main"].flag),
-                        int(matched),
-                        h,
-                        raw,
-                        _norm_meta(company_id, ""),
-                        city,
-                        str(rid),
-                    ))
-                    stats["rows_kept"] += 1
-                    if len(buf) >= 50000:
-                        _copy_rows(buf)
-                        buf = []
+
+            def _batches():
+                while True:
+                    batch = cur.fetchmany(20000)
+                    if not batch:
+                        return
+                    yield batch
+
+            for stage_rows, delta in _iter_processed(
+                _batches(), city, cfg, lex, workers,
+            ):
+                stats["rows_seen"] += delta["rows_seen"]
+                stats["rows_kept"] += delta["rows_kept"]
+                stats["invalid_year"] += delta["invalid_year"]
+                buf.extend(stage_rows)
+                if len(buf) >= 50000:
+                    _copy_rows(buf)
+                    buf = []
                 if stats["rows_seen"] >= next_milestone:
                     elapsed = time.time() - t_shard
                     logger.info(
@@ -824,7 +965,9 @@ def build(*, fresh: bool = False, reverify: bool = False) -> Path:
         _create_stage()
         logger.info("stage 表已重建（全量扫描起点）")
 
-    scan_stats = _scan_source(cfg, lex, progress)
+    scan_workers = max(1, int(os.getenv("AIPEN_SCAN_WORKERS", "1")))
+    logger.info("扫描并行度: %s（AIPEN_SCAN_WORKERS 可覆盖）", scan_workers)
+    scan_stats = _scan_source(cfg, lex, progress, workers=scan_workers)
     logger.info(
         "扫描合计: rows_seen=%s rows_kept=%s invalid_year=%s",
         scan_stats["rows_seen"], scan_stats["rows_kept"],
@@ -943,6 +1086,7 @@ def build(*, fresh: bool = False, reverify: bool = False) -> Path:
         "strata_config_sha256": cfg_sha,
         "pre_discovery_governance_sha256": v3_sha,
         "scan_stats": scan_stats,
+        "scan_workers": scan_workers,
         "n_unique_platform_texts": n,
         "corpus_sha256": _sha(corpus_path),
         "frame_sha256": _sha(frame_path),
