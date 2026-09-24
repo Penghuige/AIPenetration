@@ -12,11 +12,14 @@
 """
 from __future__ import annotations
 
+import argparse
 import csv
 import hashlib
 import io
 import json
+import logging
 import re
+import time
 import unicodedata
 from datetime import datetime
 from pathlib import Path
@@ -38,6 +41,30 @@ from .lexicon import _load_atier_alias_records, build_union_lexicon
 STAGE = "_dictionary_discovery_stage_v1"
 FINAL = "_dictionary_discovery_corpus_v1"
 CONFIG_NAME = "discovery_strata_v1.yaml"
+
+logger = logging.getLogger("ai_penetration.panel_v2.discovery_frame")
+
+
+def _unlink_with_retry(path: Path, attempts: int = 6) -> None:
+    """删除临时文件，被短暂占用时重试；最终失败只告警、不抛异常。
+
+    实测：刚写完的 GB 级文件会被 Windows 的索引/防病毒服务短暂持有，立即
+    unlink 会抛 PermissionError（实测 19 GB 的临时 CSV 在进程退出后即可正常
+    删除，说明锁是瞬时的而非持久）。而清理失败**不应终结整个构建**——此时
+    parquet 产物已完整写出，收尾清理不是交付物；原实现把二者绑在一起，导致
+    一次成功的构建被收尾动作判为失败，白白重跑数小时的扫描。
+    """
+    for i in range(attempts):
+        try:
+            path.unlink(missing_ok=True)
+            return
+        except PermissionError:
+            if i < attempts - 1:
+                time.sleep(1.5 * (i + 1))
+                continue
+            logger.warning(
+                "临时文件仍被占用，保留 %s —— 产物已写出，不阻断构建", path
+            )
 
 
 def _sha(path: Path) -> str:
@@ -149,6 +176,12 @@ def _verify_source_snapshot(audit: dict) -> None:
     conn = psycopg2.connect(**eps_conn_params())
     try:
         cur = conn.cursor()
+        # 关闭本会话的 PG 内部并行扫描。这 4 张表各 4700-5400 万行，count(*)
+        # 会为其启动多个并行 worker，实测连续两次导致 postmaster 终止（服务端
+        # 崩溃并进入恢复模式），且第二次发生时无任何并发客户端，说明问题在
+        # 该阶段本身。会话级设置只作用于本连接的这几次计数：仍是精确计数，
+        # 不改服务器配置，也不改校验强度。
+        cur.execute("SET max_parallel_workers_per_gather = 0")
         cur.execute("SELECT current_database()")
         database = str(cur.fetchone()[0])
         if database != str(audit.get("database", "")):
@@ -448,6 +481,11 @@ def _export_table(table: str, out: Path, columns: list[str],
     reader = pcsv.open_csv(
         tmp,
         read_options=pcsv.ReadOptions(block_size=1 << 24),
+        # 岗位描述正文含换行符：PG 的 COPY TO CSV 会正确加引号，但 pyarrow
+        # 默认不接受单元格内换行（newlines_in_values=False），会报
+        # "CSV parser got out of sync with chunker" 并解析错位。开启后
+        # pyarrow 无法再按块并行读，代价是这一遍转换变慢——正确性优先。
+        parse_options=pcsv.ParseOptions(newlines_in_values=True),
         convert_options=pcsv.ConvertOptions(column_types=types),
     )
     writer = None
@@ -462,7 +500,11 @@ def _export_table(table: str, out: Path, columns: list[str],
     finally:
         if writer is not None:
             writer.close()
-        tmp.unlink(missing_ok=True)
+        # reader 持有 tmp 的句柄。Windows 下不先关闭就 unlink 会抛
+        # PermissionError，而且它发生在 except 路径上会**掩盖真正的异常**
+        # （本次即被掩盖，只看到句柄占用而看不到 CSV 解析失败）。
+        reader.close()
+        _unlink_with_retry(tmp)
     if writer is None:
         raise RuntimeError(f"{table} 导出为空")
 
@@ -573,6 +615,16 @@ def build() -> Path:
 
 
 def main() -> None:
+    """CLI 入口。
+
+    原实现直接调用 build() 而完全不解析 argv，于是任何参数——包括 --help，
+    或一个拼错的选项——都会被静默忽略并启动整轮构建（实测：查参数时误触发了
+    一次约 6 小时的全语料扫描）。此处补上 argparse，使参数错误能立即暴露。
+    """
+    ap = argparse.ArgumentParser(
+        description="构建正式 dictionary discovery frame（§6.2.0 + handoff）"
+    )
+    ap.parse_args()
     build()
 
 

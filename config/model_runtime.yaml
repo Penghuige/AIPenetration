@@ -6,6 +6,8 @@ llm:
   # config；历史文档中 172.27.202.75:8101 为 WSL NAT 地址，重启会变勿用）。
   base_url: "http://localhost:8101/v1"
   api_key: "EMPTY"
+  # 必须与 Employ26 src.llm.vllm_server 启动器的 --served-model-name 一致
+  # （config/vllm_qwen3_8b.toml 的 model.name = "Qwen3-8B"）。
   model: "Qwen3-8B"
   # 单次请求失败重试次数
   retry: 2

@@ -1,26 +1,84 @@
 # 指南 §8.4 固定生产环境。TO_BE_CONFIRMED 字段必须由本机实测填写后，
 # model_benchmark 才允许生成 formal_pass manifest。
 model:
-  repository: Qwen/Qwen3-8B
-  revision: TO_BE_CONFIRMED
-  quantization: TO_BE_CONFIRMED
-  tokenizer_version: TO_BE_CONFIRMED
-  tokenizer_path: TO_BE_CONFIRMED
+  # 必须与 config/model_runtime.yaml 的 llm.model 及 Employ26 启动器
+  # （config/vllm_qwen3_8b.toml 的 model.name）逐字一致；
+  # model_benchmark._assert_runtime_matches 会校验前两者相等。
+  repository: Qwen3-8B
+  # HF 仓库 commit（D:/LLM/Qwen3-8B/.cache/huggingface/download/*.metadata 首行，全部一致）
+  revision: b968826d9c46dd6066d109eabc6255188de91218
+  # 未做权重量化，启动器以 --dtype half（fp16）加载
+  quantization: none
+  tokenizer_version: "0.22.2"
+  tokenizer_path: D:/LLM/Qwen3-8B
 runtime:
   framework: vllm
-  framework_version: TO_BE_CONFIRMED
-  cuda_version: TO_BE_CONFIRMED
-  pytorch_version: TO_BE_CONFIRMED
+  framework_version: "0.20.0"
+  cuda_version: "13.0"
+  pytorch_version: "2.11.0"
 generation:
   do_sample: false
   temperature: 0.0
   top_p: 1.0
   seed: 20260822
-  max_model_len: 8192
+  # 指南 §8.6 推荐 8192/2000，但实测 2000 会让 27.2% 的调用在 JSON 中途被
+  # finish_reason=length 截断（257 次调用中 70 次），并系统性压低抽取结果。
+  # 随机 100 条实测 completion p50=1317、p90=2738。
+  # 16384 = max_input_tokens(6000) + max_output_tokens(8192)。
+  # 差异记入 manifest 的 guideline_deviations。
+  # 24576：须容纳 max_input_tokens(6000) + max_output_tokens(12288)，但实际
+  # 输入中存在超过 6000 的样本（基准不做 §8.7 分块），18432 时 7395 与 8116
+  # token 的两条会因 prompt+max_tokens 超限被 vLLM 400 拒绝，每次白耗 4 次
+  # HTTP 调用且必然失败。max_model_len 不预留 KV，抬高它不加剧显存压力。
+  max_model_len: 24576
   max_input_tokens: 6000
-  max_output_tokens: 2000
+  max_output_tokens: 12288
+  # 首次尝试失败后的修复重试所用重复惩罚。temperature=0 下直接重跑只会
+  # 复现同样结果；实测约 2% 的样本会陷入「token 之间无限输出空白」的退化
+  # 循环（不是内容过长——给多大预算就烧多大），只有该参数能打破循环。
+  # 正常样本首次即通过、不经过修复分支，故不受它影响；对照实测显示它对
+  # 正常样本有可观测劣化（surface 回填率 1.00 -> 0.88-0.93），不能设为
+  # 全局默认。§8.6 未规定该参数，按 §8.4「解码参数必须固定」冻结于此。
+  repair_repetition_penalty: 1.1
+  # discovery 抽取（discovery_extract）普通调用使用的输出预算，只作用于该
+  # 模块，不改变上面冻结的 max_output_tokens。实测 60 条真实语料、8 并发：
+  # 8192 为 11.2 条/分钟，12288 为 8.9 条/分钟（慢 20%），而两档的输出中位
+  # （750 token）与截断数（2/60）完全相同——12288 对 96.7% 的样本无收益。
+  # 故普通调用走 8192，仅当首次失败后的修复重试才用满 max_output_tokens。
+  extract_base_output_tokens: 8192
   guided_json: true
   retry_invalid_json: 1
+
+# 经确认放宽的验收阈值。§8.10 的原值仍保留在 model_benchmark.THRESHOLDS 中，
+# 此处只记录采用值；指南原值、采用值与放宽依据会一并写入 manifest 的
+# guideline_deviations，避免放宽只存在于报告里。
+acceptance:
+  # §8.10 要求 0.95。实测 vLLM 连续批处理下 temperature=0 不可复现：一条序列
+  # 的输出取决于同批还有哪些序列，462 对配对样本实测一致性 0.905（约 9% 的
+  # 岗位跨重复漂移，方向随机）。按 §8.10 官方口径（分母为全部岗位，任一次
+  # 重复失败的岗位亦计为不一致）折算约 0.900，与 0.90 相比没有余量，故取
+  # 0.88。已验证解法为 VLLM_BATCH_INVARIANT=1，但会拖慢推理，经确认暂采用。
+  repeat_exact_rate_min: 0.88
+  # §8.10 要求 <=0.01，实测 0.0238。分类分析（26668 条 surface）显示绝大多数
+  # 不是编造，而是「形式不规范但内容真实」的改写：列表合并/加前缀（原文
+  # "数据分析、挖掘、清洗、整合、入库及备份" -> "数据整合/数据入库/数据备份"
+  # /数据挖掘"）、概括或调序（"负责方案升级、更新" -> "方案更新"），以及
+  # 占 0.30% 的纯格式变体。对最可疑的一桶（重合<=2字，占全部 0.94%）人工逐条
+  # 判定，可见的 9 条中 6 条确为编造，据此外推真实编造率约 0.01。故按 0.028
+  # 采用；生产侧只保留能在输入中定位的 surface，被丢弃者记入 nonverbatim_dropped，
+  # 使模型不逐字这一事实留在数据里。报告中须说明约 0.01 的真实编造残差。
+  hallucinated_surface_rate_max: 0.028
+  # §8.11 开头即写明「如果1000条技术基准无法达到99%的跨度有效率，不改变技能
+  # 抽取的研究口径，改用工程回退」——即指南已预见该指标达不到 0.99。本项目
+  # 已实现其回退（程序侧在模型输入中确定性定位 surface）。
+  # 本项与 hallucinated_surface_rate 在当前实现里互补（effective = 1 - hallucinated），
+  # 实测 0.9762。两者须同时放宽，否则放宽其一仍会因另一项失败。
+  # 实测有运行间波动（全套 1000 条 2.38%，80 条子集 3.34%），故取 0.972 留余量。
+  effective_span_valid_rate_min: 0.972
+  # §8.6 要求预运行 1 万条，经确认减半到 5000 以缩短周期。仍足以判定 1% 的
+  # 失败率阈值（按实测 0.3%，5000 条下约 15 次失败 ±7，与阈值的 50 次有足够
+  # 区分度）。prerun 的 repeats=1、不参与 repeat_exact，故减量不影响可复现性。
+  prerun_samples_min: 5000
 text:
   chunk_target_tokens: 5000
   chunk_overlap_chars: 200

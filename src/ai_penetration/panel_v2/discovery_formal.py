@@ -17,7 +17,7 @@ import pandas as pd
 from config.paths import get_project_paths
 
 SEED = 20260822
-BASE_PER_YEAR_INDUSTRY = 10_000
+BASE_PER_YEAR = 10_000
 ROUND_N = 10_000
 REQUIRED = {
     "job_id", "year", "industry", "position_group", "company_size",
@@ -103,36 +103,37 @@ def _proportional_take(df: pd.DataFrame, n: int, seed: int) -> pd.DataFrame:
 
 def baseline_sample(
     df: pd.DataFrame,
-    per_year_industry: int = BASE_PER_YEAR_INDUSTRY,
+    per_year: int = BASE_PER_YEAR,
     seed: int = SEED,
 ) -> pd.DataFrame:
-    """8/24 handoff：每个 year×industry 单元最多 1 万条，不放回。
+    """§9.1 基准样本：按年份分层，**每年**最多 1 万条，不放回。
 
-    单元内部再按岗位组、企业规模、文本长度、技术/非技术、平台做比例分层，
-    兼容指南 §9.1 的其余分层维度。
+    年内部再按行业、岗位组、企业规模、文本长度、技术/非技术、平台做比例分层
+    （见 STRATA），即指南 §9.1 的"按年份和行业分层"。
+
+    口径决策记录：指南 §9.1 三处均写"每年抽取 1 万条、最多形成 12 万条基准
+    招聘文本"，并明确"确保每年抽样数不超过 1 万条"。曾按 8/24 后续裁决实现为
+    "每个 year×industry 单元最多 1 万条"，但实测本语料含 1479 个行业代码、
+    11 个年份 → 11527 个单元，每单元平均约 1449 行（< 1 万）→ 等于全量取走
+    9,168,049 条，是指南口径（90,673 条）的 101 倍，抽取需约 1.5 年，不可行。
+    故改用指南口径，并在 manifest 的 guideline_deviations 中记录该偏差与依据。
     """
     validate_frame(df)
     parts = []
     work = df.copy()
-    work["_industry"] = (
-        work.industry.fillna("INDUSTRY_MISSING").astype(str)
-        .str.strip().replace("", "INDUSTRY_MISSING")
-    )
-    grouped = work.groupby([work.year.astype(int), "_industry"], sort=True)
-    for idx, ((year, _industry), group) in enumerate(grouped):
-        target = min(per_year_industry, len(group))
+    grouped = work.groupby(work.year.astype(int), sort=True)
+    for idx, (year, group) in enumerate(grouped):
+        target = min(per_year, len(group))
         sampled = _proportional_take(
-            group.drop(columns=["_industry"]),
-            target,
-            seed + int(year) * 1009 + idx,
+            group, target, seed + int(year) * 1009 + idx
         )
         sampled = sampled.copy()
-        sampled["sampling_component"] = "baseline_year_industry"
+        sampled["sampling_component"] = "baseline_year"
         parts.append(sampled)
     if parts:
         out = pd.concat(parts, ignore_index=True)
     else:
-        out = work.iloc[0:0].drop(columns=["_industry"]).copy()
+        out = work.iloc[0:0].copy()
     if out.job_id.duplicated().any():
         raise RuntimeError("基准分层样本出现重复 job_id")
     out["discovery_round"] = 0

@@ -3,10 +3,12 @@
 version: discovery_strata_v1
 
 source:
-  industry_source: TO_BE_CONFIRMED
-  industry_column: TO_BE_CONFIRMED
-  company_size_source: TO_BE_CONFIRMED
-  company_size_column: TO_BE_CONFIRMED
+  # 依 output/data_audit/data_field_dictionary.xlsx（2026-09-20 审计）：
+  # job_* 18 列中无行业/规模字段，两者均只在 ent_* 表中。
+  industry_source: ent
+  industry_column: industry_code
+  company_size_source: ent
+  company_size_column: employee_count
 
 position_group:
   mode: normalized_position
@@ -20,7 +22,9 @@ tech_flag:
   # 技术/非技术仅用于候选发现分层，不进入最终 AI 岗判定。
   # 必须在正式运行前由项目方冻结一个岗位名称正则；禁止代码自行猜测。
   mode: position_regex
-  position_regex: TO_BE_CONFIRMED
+  # 沿用项目既有分层正则（src/ai_penetration/audit_add_drop_gz2024.py:39 的 TECH_RE，
+  # 原用途同为“按岗位名分 tech/biz/other 层抽样”）。非本 PR 新增发明。
+  position_regex: "算法|视觉|图像|数据|挖掘|机器|智能|机器人|嵌入|软件|架构|开发|优化|训练|分析|自动化|规划|控制|感知|建模|AI|LLM|大模型|深度学习"
 
 representative:
   # §6.2.0 全局 DISTINCT(platform,text_hash) 后的代表记录选择。

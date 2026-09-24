@@ -9,7 +9,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pandas as pd
@@ -156,31 +158,36 @@ def _validate(
     chunk: str,
     offset: int,
     allowed_types: set[str],
-) -> tuple[str, list[dict]]:
-    if not isinstance(parsed, dict) or str(parsed.get("job_id")) != jid:
-        return "schema_failed", []
+) -> tuple[str, list[dict], list[dict]]:
+    if not isinstance(parsed, dict):
+        return "schema_failed", [], []
+    # 不校验 job_id 是否逐字回显：与 model_benchmark 同因——schema 对 job_id
+    # 只要求 type=string、minLength=1，逐字复制 32 位十六进制串是额外的业务
+    # 校验且是 LLM 已知弱点，模型会幻觉出重复片段。抽取正确性已由 surface
+    # 在 chunk 内可定位（否则判 schema_failed）独立保证。
     skills = parsed.get("skills")
     if not isinstance(skills, list):
-        return "schema_failed", []
+        return "schema_failed", [], []
     out = []
+    dropped: list[dict] = []
     for rec in skills:
         if not isinstance(rec, dict):
-            return "schema_failed", []
+            return "schema_failed", [], []
         required = {
             "surface", "canonical_suggestion", "skill_type",
             "evidence", "start", "end", "existing_skill_id",
         }
         if not required.issubset(rec):
-            return "schema_failed", []
+            return "schema_failed", [], []
         surface = str(rec.get("surface", ""))
         canonical = str(rec.get("canonical_suggestion", ""))
         stype = str(rec.get("skill_type", ""))
         evidence = str(rec.get("evidence", ""))
         if not surface or not canonical or not evidence or stype not in allowed_types:
-            return "schema_failed", []
+            return "schema_failed", [], []
         existing = rec.get("existing_skill_id")
         if existing is not None and not isinstance(existing, str):
-            return "schema_failed", []
+            return "schema_failed", [], []
         span_source = "model"
         multiple = 0
         try:
@@ -194,7 +201,14 @@ def _validate(
         ):
             located = _locate_surface(chunk, surface, evidence)
             if located is None:
-                return "schema_failed", []
+                # §8.11 第 7 条：surface 无法在模型输入文本中找到时判为**该条**
+                # 跨度失败。原实现 return "schema_failed", [] 会丢弃整个 chunk
+                # 的全部技能——按实测 2.4% 的非逐字率，含 n 个技能的 chunk 整块
+                # 失败的概率是 1-0.976^n（n=30 时约 52%），会丢掉近半数据。
+                # 改为只丢弃该条，并把丢弃内容随记录留存，使模型不逐字这一
+                # 事实留在数据里而不是被静默吞掉。
+                dropped.append({"surface": surface, "skill_type": stype})
+                continue
             start, end, multiple = located
             span_source = "deterministic_fallback"
         out.append({
@@ -207,8 +221,133 @@ def _validate(
             "existing_skill_id": existing,
             "span_source": span_source,
             "multiple_span_flag": multiple,
+            # 本字段恒为 True：能走到这里就说明 surface 在 chunk 内可逐字
+            # 定位（不可定位的已在上方丢弃并记入 nonverbatim_dropped）。
+            # 显式写出是为了让下游可以依赖这个契约，而不是依赖注释。
+            "verbatim": True,
         })
-    return ("empty" if not out else "success"), out
+    return ("empty" if not out else "success"), out, dropped
+
+
+def _extract_one(
+    client,
+    prompt: str,
+    cfg: dict,
+    schema: dict,
+    allowed_types: set,
+    common: dict,
+    chunk: str,
+    offset: int,
+    retry_invalid: int,
+) -> dict:
+    """单个 chunk 的抽取调用（含 invalid JSON/schema 重试）。
+
+    并发化改造：原实现嵌在 for row / for chunk 双层循环里串行调用，
+    网络等待期间 GPU 空转（实测单请求约 11.3s）。抽成独立函数后由线程池
+    并发执行；重试条件、状态判定与落盘字段均与原实现逐字一致。
+
+    Args:
+        client: LLM 客户端。
+        prompt: system prompt 文本。
+        cfg: 冻结的 model_config_v1 内容。
+        schema: 受控 JSON schema。
+        allowed_types: 允许的 skill_type 枚举。
+        common: 该 chunk 的公共字段（含 record_key/job_id/定位信息）。
+        chunk: 该 chunk 的正文。
+        offset: chunk 在原文中的起始位置（供 _validate 回查 span）。
+        retry_invalid: schema 失败时的额外重试次数。
+
+    Returns:
+        待落盘的 final 记录（含 status/skills/raw/error/attempt）。
+    """
+    jid = str(common["job_id"])
+    user = json.dumps(
+        {"job_id": jid, "text": chunk},
+        ensure_ascii=False,
+    )
+    final = None
+    # 修复重试用的重复惩罚。temperature=0 下重跑是确定性的、只会复现同样
+    # 结果；实测约 2% 的样本会陷入「token 之间无限输出空白」的退化循环
+    # （不是内容过长——给多大预算就烧多大），靠该参数才能打破循环。
+    # 正常样本首次尝试即通过，不会进入修复分支，因此不受它影响。
+    repair_penalty = float(
+        cfg["generation"].get("repair_repetition_penalty", 1.0)
+    )
+    # 两档输出预算。实测（60 条真实语料、8 并发）：
+    #   8192  -> 11.2 条/分钟    12288 -> 8.9 条/分钟（慢 20%）
+    #   两档的输出中位同为 750 token、截断数同为 2/60
+    # 即：12288 对占多数(96.7%)的普通样本毫无收益，只为极少数技能极密的样本
+    # 准备；而后者在 8192 下同样截断，说明它们需要的超过 12288。故普通调用走
+    # base（快 20%），只有已失败的修复重试才用满 config 的 max_output_tokens
+    # ——既拿到速度，也不放弃对密集样本的补救机会。
+    # 不直接改 config 的 max_output_tokens：那会使技术基准与 prerun 已冻结并
+    # 通过验收的取值失配。
+    base_out = int(
+        cfg["generation"].get("extract_base_output_tokens", 8192)
+    )
+    for attempt in range(1, retry_invalid + 2):
+        status = "runtime_failed"
+        skills: list[dict] = []
+        dropped: list[dict] = []
+        raw = ""
+        error = ""
+        extra_payload = {
+            "seed": int(cfg["generation"]["seed"]),
+            "chat_template_kwargs": {"enable_thinking": False},
+            "guided_json": schema,
+        }
+        if attempt > 1 and repair_penalty > 1.0:
+            extra_payload["repetition_penalty"] = repair_penalty
+        try:
+            raw = client.complete_text(
+                system_prompt=prompt,
+                user_prompt=user,
+                temperature=float(
+                    cfg["generation"]["temperature"]
+                ),
+                max_output_tokens=(
+                    int(cfg["generation"]["max_output_tokens"])
+                    if attempt > 1
+                    else base_out
+                ),
+                extra_payload=extra_payload,
+            )
+            try:
+                parsed = extract_json_from_response(raw)
+            except ValueError as exc:
+                status = "schema_failed"
+                error = str(exc)
+            else:
+                status, skills, dropped = _validate(
+                    parsed, jid, chunk, offset, allowed_types
+                )
+                if status == "schema_failed":
+                    error = "schema_or_span_validation_failed"
+        except TimeoutError as exc:
+            status, error = "timeout", str(exc)
+        except Exception as exc:
+            status = "runtime_failed"
+            error = f"{type(exc).__name__}: {exc}"
+
+        final = {
+            **common,
+            "status": status,
+            "skills": skills,
+            "raw": raw,
+            "error": error,
+            "attempt": attempt,
+            # 模型给出但无法在 chunk 中逐字定位、因而被丢弃的条目。留在这里是
+            # 为了不让「模型不逐字」这一事实随丢弃一起消失：下游若要评估抽取
+            # 质量或复算非逐字率，可直接统计本字段。
+            "nonverbatim_dropped": dropped,
+            "nonverbatim_dropped_count": len(dropped),
+        }
+        # 指南只要求 invalid JSON/schema 重试；运行/超时保留原状态。
+        if status != "schema_failed" or attempt > retry_invalid:
+            break
+    if final is None:
+        raise RuntimeError("候选抽取未产生最终状态")
+    return final
 
 
 def run(sample_csv: Path) -> tuple[Path, Path]:
@@ -267,6 +406,11 @@ def run(sample_csv: Path) -> tuple[Path, Path]:
 
     client = create_llm_client()
     expected: list[str] = []
+
+    # 阶段 1（顺序）：按原顺序遍历，落 pending、处理缓存命中，并把需要
+    # 真实调用的 chunk 收集为任务。pending 仍在发请求前写入并 flush，
+    # 因此断点语义不变：崩溃后能看出哪些 chunk 已发出、哪些未开始。
+    tasks: list[tuple] = []
     with raw_path.open("a", encoding="utf-8") as fh:
         for row in sample.itertuples(index=False):
             jid = str(row.job_id)
@@ -336,64 +480,33 @@ def run(sample_csv: Path) -> tuple[Path, Path]:
                     latest[record_key] = final
                     continue
 
-                user = json.dumps(
-                    {"job_id": jid, "text": chunk},
-                    ensure_ascii=False,
+                tasks.append(
+                    (record_key, chunk_cache_key, common, chunk, offset)
                 )
-                final = None
-                for attempt in range(1, retry_invalid + 2):
-                    status = "runtime_failed"
-                    skills: list[dict] = []
-                    raw = ""
-                    error = ""
-                    try:
-                        raw = client.complete_text(
-                            system_prompt=prompt,
-                            user_prompt=user,
-                            temperature=float(
-                                cfg["generation"]["temperature"]
-                            ),
-                            max_output_tokens=int(
-                                cfg["generation"]["max_output_tokens"]
-                            ),
-                            extra_payload={
-                                "seed": int(cfg["generation"]["seed"]),
-                                "chat_template_kwargs": {
-                                    "enable_thinking": False
-                                },
-                                "guided_json": schema,
-                            },
-                        )
-                        try:
-                            parsed = extract_json_from_response(raw)
-                        except ValueError as exc:
-                            status = "schema_failed"
-                            error = str(exc)
-                        else:
-                            status, skills = _validate(
-                                parsed, jid, chunk, offset, allowed_types
-                            )
-                            if status == "schema_failed":
-                                error = "schema_or_span_validation_failed"
-                    except TimeoutError as exc:
-                        status, error = "timeout", str(exc)
-                    except Exception as exc:
-                        status = "runtime_failed"
-                        error = f"{type(exc).__name__}: {exc}"
 
-                    final = {
-                        **common,
-                        "status": status,
-                        "skills": skills,
-                        "raw": raw,
-                        "error": error,
-                        "attempt": attempt,
-                    }
-                    # 指南只要求 invalid JSON/schema 重试；运行/超时保留原状态。
-                    if status != "schema_failed" or attempt > retry_invalid:
-                        break
-                if final is None:
-                    raise RuntimeError("候选抽取未产生最终状态")
+    # 阶段 2（并发 + 顺序落盘）：网络等待是主要瓶颈（实测单请求约 11.3s），
+    # 串行时 GPU 空转。pool.map 按 tasks 顺序产出结果，边取边写即与串行版
+    # 记录顺序一致，同时每条立即 flush：长跑可观察进度，中断后已完成部分
+    # 仍留在 raw 文件里，不必重跑。
+    #
+    # 并发上限由服务端 --max-num-seqs 决定（AIPEN_EXTRACT_WORKERS 可覆盖）。
+    # 差异仅在于：批次内新增的跨 chunk 缓存复用不再发生（结果由固定 seed +
+    # temperature=0 决定，内容等价）。
+    workers = max(1, int(os.getenv("AIPEN_EXTRACT_WORKERS", "8")))
+    with raw_path.open("a", encoding="utf-8") as fh:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for (record_key, chunk_cache_key, _common, _chunk, _off), final in (
+                zip(
+                    tasks,
+                    pool.map(
+                        lambda t: _extract_one(
+                            client, prompt, cfg, schema, allowed_types,
+                            t[2], t[3], t[4], retry_invalid,
+                        ),
+                        tasks,
+                    ),
+                )
+            ):
                 fh.write(
                     json.dumps(final, ensure_ascii=False) + "\n"
                 )

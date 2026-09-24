@@ -26,6 +26,50 @@ from config.paths import load_config_yaml
 
 logger = logging.getLogger(__name__)
 
+# vLLM 0.20 起移除了 guided_json / guided_regex / guided_choice / guided_grammar
+# 请求参数，受控解码改为顶层 structured_outputs={"json": <schema>}。旧字段仍能
+# 通过请求体校验，但会被**静默忽略**并退化为无约束生成——模型照常返回 200，
+# 调用方却拿到不合 schema 的输出。调用方按策略语义传 guided_json（与
+# config/model_config_v1.yaml 的冻结项同名），在此适配为服务端接受的字段。
+_GUIDED_DECODING_KEYS = (
+    "guided_json", "guided_regex", "guided_choice", "guided_grammar",
+)
+
+
+def _adapt_guided_decoding(extra: dict[str, Any]) -> dict[str, Any]:
+    """把旧式 guided_* 字段适配为 vLLM 当前的 structured_outputs 字段。
+
+    Args:
+        extra: 调用方传入的 extra_payload。
+
+    Returns:
+        适配后的请求体字段；不含 guided_* 时返回原字典。
+
+    Raises:
+        ValueError: 同时指定 guided_* 与 structured_outputs，或使用了在
+            vLLM 0.20 已无对应字段的受控解码类型（宁可显式失败，也不静默降级）。
+    """
+    present = [k for k in _GUIDED_DECODING_KEYS if extra.get(k) is not None]
+    if not present:
+        return extra
+    if len(present) > 1:
+        raise ValueError(
+            "extra_payload 一次只能指定一种受控解码: " + ", ".join(present)
+        )
+    if "structured_outputs" in extra:
+        raise ValueError(
+            f"extra_payload 不能同时指定 {present[0]} 与 structured_outputs"
+        )
+    if present[0] != "guided_json":
+        raise ValueError(
+            f"{present[0]} 在 vLLM 0.20 已无对应字段，请改用 guided_json"
+        )
+    adapted = {
+        k: v for k, v in extra.items() if k not in _GUIDED_DECODING_KEYS
+    }
+    adapted["structured_outputs"] = {"json": extra["guided_json"]}
+    return adapted
+
 
 class LLMClient(Protocol):
     """统一 LLM client 协议。"""
@@ -79,7 +123,19 @@ def extract_json_from_response(text: str) -> dict[str, Any] | list[Any] | None:
     Returns:
         解析出的 dict/list；无法解析时返回 None。
     """
-    cleaned = re.sub(r"```(?:json)?|```", "", (text or "").strip())
+    # 剥离推理标签。Qwen3 在 enable_thinking=False 下仍偶发在 JSON 之后输出
+    # </think>（技术基准实测 2/2000），使本可解析的 JSON 判为失败；在发现
+    # 阶段这类失败会让整个 chunk 重试，代价更大。
+    # 只剥完整的推理段与**首尾**标签，不做全局删除：全局删除会破坏字符串里
+    # 恰好含该字面量的内容（实测 {"a":"x</think>y"} 会被改成 "xy"）。
+    # 注意：已观测到的那个案例即使剥离标签仍无法解析——其 evidence 字符串
+    # 未闭合（受控解码未拦住非法 JSON），此处不修复那种情况，仅做防御。
+    raw = re.sub(
+        r"<think(?:ing)?>.*?</think(?:ing)?>", "", text or "", flags=re.DOTALL
+    )
+    raw = re.sub(r"^\s*</?think(?:ing)?>\s*", "", raw)
+    raw = re.sub(r"\s*</?think(?:ing)?>\s*$", "", raw)
+    cleaned = re.sub(r"```(?:json)?|```", "", raw.strip())
     try:
         parsed = json.loads(cleaned)
         if isinstance(parsed, (dict, list)):
@@ -153,6 +209,8 @@ class OpenAICompatClient:
             temperature: 采样温度。
             extra_payload: 追加到请求体的额外字段（如
                 ``{"chat_template_kwargs": {"enable_thinking": false}}``）。
+                其中 ``guided_json`` 会按当前 vLLM 版本适配为
+                ``structured_outputs``，见 :func:`_adapt_guided_decoding`。
 
         Returns:
             助手回复文本。
@@ -172,7 +230,7 @@ class OpenAICompatClient:
         if temperature is not None:
             payload["temperature"] = float(temperature)
         if extra_payload:
-            payload.update(extra_payload)
+            payload.update(_adapt_guided_decoding(extra_payload))
         response = self._post_chat(payload)
         try:
             return str(response["choices"][0]["message"]["content"] or "")
