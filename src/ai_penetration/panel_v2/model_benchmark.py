@@ -610,10 +610,11 @@ def run(
         jid: json.dumps({"job_id": jid, "text": text}, ensure_ascii=False)
         for _rep, jid, text in tasks
     }
-    if len(payloads) != len(tasks):
-        # payload 按 job_id 建字典：样本含重复 job_id 时前一重复行会拿到
-        # 最后一行的文本发给模型、却用自己的文本校验 span，指标被污染。
-        # （len(payloads)=唯一 jid 数，须与任务总数比，而非与另一个唯一数比。）
+    if len(payloads) != len(samples):
+        # payload 按 job_id 建字典：样本文件本身含重复 job_id（不同文本）时，
+        # 前一重复行会拿到最后一行的文本发给模型、却用自己的文本校验 span。
+        # 判据与样本数比较——technical 的 repeats=2 是同一 job 的合法两次
+        # 重复运行（repeat_exact 的测量对象），不是样本重复，不在此列。
         raise ValueError("基准样本存在重复 job_id，并发 payload 构造会错位")
     logger.info(
         "调用阶段开始: tasks=%s workers=%s", len(tasks), workers
