@@ -19,6 +19,12 @@ from config.paths import get_project_paths
 SEED = 20260822
 BASE_PER_YEAR = 10_000
 ROUND_N = 10_000
+# §9.2.3 行业保底与决策点 A 的"主要行业"量化定义（guideline clarification，
+# 记入 manifest）
+INDUSTRY_FLOOR = 50
+MAJOR_INDUSTRY_MIN = 100
+COVERAGE_STOP_PP = 0.1
+ANCHOR_UNCOVERED_STOP_PP = 0.1
 REQUIRED = {
     "job_id", "year", "industry", "position_group", "company_size",
     "text_length_bin", "tech_flag", "platform", "anchor_main",
@@ -101,39 +107,112 @@ def _proportional_take(df: pd.DataFrame, n: int, seed: int) -> pd.DataFrame:
     return out.drop(columns=["_stratum", "_rank"], errors="ignore").head(n)
 
 
+def _norm_industry(value) -> str:
+    """行业字段的确定性清洗（§9.1：空白归 INDUSTRY_MISSING，strip）。"""
+    text = str(value if value is not None else "").strip()
+    return text if text else "INDUSTRY_MISSING"
+
+
+def _industry_quota(sizes: "pd.Series[int]", n: int) -> dict[str, int]:
+    """§9.2.3-4 年内行业配额：保底 + 比例 + 差额补齐。
+
+    年内首先向每个非空行业分配 ``min(50, 该行业岗位数)`` 条；剩余名额按
+    该行业在本年度**剩余**岗位中的比例分配；舍入造成的差额按行业剩余
+    岗位数**由大到小**补齐。保底总额超过样本名额（行业极多而名额少，
+    指南未覆盖的情形）时，按行业岗位数由大到小保留保底并截断到 n
+    （guideline clarification）。
+
+    Args:
+        sizes: {行业键: 该年岗位数}。
+        n: 该年样本名额（min(1 万, 年量)）。
+
+    Returns:
+        {行业键: 配额}，合计恰为 min(n, 全部岗位数)。
+    """
+    if n <= 0 or sizes.empty:
+        return {}
+    floors = {k: min(INDUSTRY_FLOOR, int(v)) for k, v in sizes.items()}
+    total_floor = sum(floors.values())
+    if total_floor >= n:
+        quotas: dict[str, int] = {}
+        acc = 0
+        for key in sorted(sizes.index, key=lambda k: (-int(sizes[k]), str(k))):
+            take = min(floors[key], n - acc)
+            if take <= 0:
+                break
+            quotas[key] = take
+            acc += take
+        return quotas
+    quotas = dict(floors)
+    remaining = n - total_floor
+    residual = {k: int(sizes[k]) - floors[k] for k in sizes.index}
+    total_residual = sum(residual.values())
+    if remaining <= 0 or total_residual <= 0:
+        return quotas
+    raw = {
+        k: remaining * v / total_residual
+        for k, v in residual.items() if v > 0
+    }
+    alloc = {k: int(v) for k, v in raw.items()}
+    diff = remaining - sum(alloc.values())
+    order = sorted(alloc, key=lambda k: (-residual[k], str(k)))
+    i = 0
+    while diff > 0 and order:
+        alloc[order[i % len(order)]] += 1
+        diff -= 1
+        i += 1
+    for k, v in alloc.items():
+        quotas[k] += v
+    return quotas
+
+
 def baseline_sample(
     df: pd.DataFrame,
     per_year: int = BASE_PER_YEAR,
     seed: int = SEED,
 ) -> pd.DataFrame:
-    """§9.1 基准样本：按年份分层，**每年**最多 1 万条，不放回。
+    """§9.1/§9.2.1-9.2.5 基准样本：按年分层，每年最多 1 万条，不放回。
 
-    年内部再按行业、岗位组、企业规模、文本长度、技术/非技术、平台做比例分层
-    （见 STRATA），即指南 §9.1 的"按年份和行业分层"。
+    年内实行指南两阶段行业配额（:func:`_industry_quota`：保底
+    min(50,·) + 剩余岗位比例 + 差额按剩余岗位数由大到小补齐）；行业配额
+    内部再按岗位组、企业规模、文本长度、技术/非技术、平台做比例分层
+    （行业子集内 industry 维恒定，分层自动退化为其余五维）。
 
     口径决策记录：指南 §9.1 三处均写"每年抽取 1 万条、最多形成 12 万条基准
-    招聘文本"，并明确"确保每年抽样数不超过 1 万条"。曾按 8/24 后续裁决实现为
-    "每个 year×industry 单元最多 1 万条"，但实测本语料含 1479 个行业代码、
-    11 个年份 → 11527 个单元，每单元平均约 1449 行（< 1 万）→ 等于全量取走
-    9,168,049 条，是指南口径（90,673 条）的 101 倍，抽取需约 1.5 年，不可行。
-    故改用指南口径，并在 manifest 的 guideline_deviations 中记录该偏差与依据。
+    招聘文本"。曾按 8/24 后续裁决实现为"每个 year×industry 单元最多 1 万条"，
+    但实测本语料 11527 个单元平均约 1449 行，等于全量取走 9,168,049 条
+    （指南口径的 101 倍、约 1.5 年抽取），不可行，故回归指南口径。
+    min(50) 行业保底此前未实现、现按指南补齐；偏差仍记入 manifest 的
+    guideline_deviations。
     """
     validate_frame(df)
     parts = []
     work = df.copy()
+    work["_industry"] = work.industry.map(_norm_industry)
     grouped = work.groupby(work.year.astype(int), sort=True)
     for idx, (year, group) in enumerate(grouped):
         target = min(per_year, len(group))
-        sampled = _proportional_take(
-            group, target, seed + int(year) * 1009 + idx
-        )
-        sampled = sampled.copy()
-        sampled["sampling_component"] = "baseline_year"
+        sizes = group.groupby("_industry").size()
+        quotas = _industry_quota(sizes, target)
+        seed_year = seed + int(year) * 1009 + idx
+        year_parts = []
+        for j, (ind, quota_n) in enumerate(sorted(quotas.items())):
+            sub = group[group["_industry"] == ind].drop(columns=["_industry"])
+            take = _proportional_take(
+                sub, quota_n, seed_year + j * 101
+            )
+            take = take.copy()
+            take["sampling_component"] = "baseline_year"
+            year_parts.append(take)
+        if year_parts:
+            sampled = pd.concat(year_parts, ignore_index=True)
+        else:
+            sampled = group.iloc[0:0].drop(columns=["_industry"])
         parts.append(sampled)
     if parts:
         out = pd.concat(parts, ignore_index=True)
     else:
-        out = work.iloc[0:0].copy()
+        out = work.iloc[0:0].drop(columns=["_industry"]).copy()
     if out.job_id.duplicated().any():
         raise RuntimeError("基准分层样本出现重复 job_id")
     out["discovery_round"] = 0
@@ -176,12 +255,19 @@ def incremental_round(df: pd.DataFrame, selected_ids: set,
 
 
 def saturation_pass(metrics: pd.DataFrame) -> bool:
-    """8/24 handoff：连续两轮新增有效标准概念 <5 即满足饱和。
+    """§9.2.2 默认饱和标准（四条件，连续两轮）。
 
-    coverage_gain_pp 仍保存为监测指标，但任何覆盖率派生条件都不参与停止。
-    年份×行业抽样完整性由 finalize 直接从 frame/selected 验证。
+    1. 每 1 万条新增有效标准概念 <5；
+    2. 覆盖率提升 <0.1pp（覆盖率缺失/NaN 时 fail-closed 不饱和——
+       覆盖率必须每轮真实计算，见 coverage 模块）；
+    3. 各年份与主要行业入批由 finalize 从 frame/selected 验证（§9.2.2.3）；
+    4. 主锚点命中岗位的未覆盖比例不再明显下降（最后两轮降幅
+       <0.1pp，决策点 A 的 guideline clarification）。
     """
-    required = {"round", "new_standard_concepts", "coverage_gain_pp"}
+    required = {
+        "round", "new_standard_concepts", "coverage_gain_pp",
+        "anchor_uncovered_pp",
+    }
     missing = required - set(metrics.columns)
     if missing:
         raise ValueError("round metrics 缺列: " + ", ".join(sorted(missing)))
@@ -191,7 +277,16 @@ def saturation_pass(metrics: pd.DataFrame) -> bool:
     last = incremental.sort_values("round").tail(2)
     if int(last["round"].iloc[1]) != int(last["round"].iloc[0]) + 1:
         return False
-    return bool((last.new_standard_concepts < 5).all())
+    if not (last.new_standard_concepts < 5).all():
+        return False
+    cov = pd.to_numeric(last.coverage_gain_pp, errors="coerce")
+    if cov.isna().any() or not (cov < COVERAGE_STOP_PP).all():
+        return False
+    unc = pd.to_numeric(last.anchor_uncovered_pp, errors="coerce")
+    if unc.isna().any():
+        return False
+    drop = float(unc.iloc[0]) - float(unc.iloc[1])
+    return drop < ANCHOR_UNCOVERED_STOP_PP
 
 
 def build_round_metrics(
@@ -230,11 +325,13 @@ def build_round_metrics(
         .size().to_dict()
     )
     coverage: dict[int, float] = {}
+    anchor_unc: dict[int, float] = {}
     if coverage_path is not None:
         cov = pd.read_csv(coverage_path)
-        if not {"round", "coverage_gain_pp"} <= set(cov.columns):
+        if not {"round", "coverage_gain_pp", "anchor_uncovered_pp"} <= set(cov.columns):
             raise ValueError(
-                "coverage monitor CSV 必须含 round,coverage_gain_pp"
+                "coverage monitor CSV 必须含 round,coverage_gain_pp,"
+                "anchor_uncovered_pp"
             )
         if cov["round"].astype(int).duplicated().any():
             raise ValueError("coverage monitor round 重复")
@@ -242,11 +339,16 @@ def build_round_metrics(
             int(r): float(v)
             for r, v in zip(cov["round"], cov["coverage_gain_pp"])
         }
+        anchor_unc = {
+            int(r): float(v)
+            for r, v in zip(cov["round"], cov["anchor_uncovered_pp"])
+        }
     rows = [
         {
             "round": r,
             "new_standard_concepts": int(new_counts.get(r, 0)),
             "coverage_gain_pp": coverage.get(r, np.nan),
+            "anchor_uncovered_pp": anchor_unc.get(r, np.nan),
         }
         for r in rounds
     ]
@@ -316,6 +418,26 @@ def finalize(
                     f"基准轮 {int(year)} 年样本 {got} 条 != 目标 {target} 条"
                     f"（每年 1 万口径，frame 该年 {int(frame_n)} 行）"
                 )
+    # §9.2.2.3：各年份和主要行业均已至少进入一个批次。"主要行业"按
+    # 决策点 A 定义为该年 frame 岗位数 >=100 的行业（guideline
+    # clarification；保底抽样下自然满足，此校验 fail-closed 防回归）。
+    if "industry" in selected.columns:
+        frame_ind = df.industry.map(_norm_industry)
+        sel_ind = selected.industry.map(_norm_industry)
+        major_missing = []
+        for year in sorted(set(frame_years.unique())):
+            in_year = frame_ind[frame_years == year]
+            majors = set(in_year.value_counts()[
+                lambda s: s >= MAJOR_INDUSTRY_MIN
+            ].index)
+            covered = set(sel_ind[frame_years == year].unique())
+            for ind in sorted(majors - covered):
+                major_missing.append(f"{int(year)}×{ind}")
+        if major_missing:
+            raise ValueError(
+                "主要行业（该年 >=100 岗位）未进入任何批次: "
+                + ", ".join(major_missing[:10])
+            )
 
     audit = pd.read_csv(candidate_audit_path)
     required_audit = {
@@ -388,23 +510,39 @@ def finalize(
             {
                 "field": "baseline_sampling_caliber",
                 "guideline_value": "每年 1 万（指南 §9.1 三处明文）",
-                "adopted_value": "每年 1 万（比例分层覆盖行业等维度）",
+                "adopted_value": "每年 1 万（行业保底+比例配额，§9.2.3-4 逐字实现）",
                 "reason": (
                     "8/24 裁决的 year×industry 单元口径实测等于全量取走 "
                     "9,168,049 条（11527 单元平均约 1449 行），不可行；"
-                    "2026-09-24 复核改回指南口径。依据详见 "
+                    "2026-09-24 复核改回指南口径；2026-09-25 补齐 min(50) "
+                    "行业保底与差额补齐（此前未实现）。依据详见 "
                     "discovery_formal.baseline_sample docstring。"
                 ),
             },
             {
-                "field": "guideline_9_2_rule3_industry_floor",
-                "guideline_value": "年内每行业先保底 min(50, 行业岗位数)",
-                "adopted_value": "未实现；行业仅通过比例分层间接覆盖",
+                "field": "guideline_9_2_2_saturation_conditions",
+                "guideline_value": (
+                    "四条件：新增<5、覆盖率提升<0.1pp、年份与主要行业入批、"
+                    "锚点未覆盖比例不再明显下降"
+                ),
+                "adopted_value": (
+                    "四条件全部实现（2026-09-25 起；此前 8/24 裁决曾将"
+                    "覆盖率降级为仅监测）"
+                ),
                 "reason": (
-                    "稀疏 year×industry 单元按比例抽样可能 0 条入样；"
-                    "finalize 的分层验收已改为每年条数精确校验（每年 1 万口径），"
-                    "不再要求全单元覆盖。稀疏行业的覆盖缺口由增量轮的"
-                    "低覆盖配额部分补偿，残余缺口在此显式披露。"
+                    "guideline clarification（决策点 A，用户批准）：\"不再明显"
+                    "下降\"量化为最后两轮降幅 <0.1pp；\"主要行业\"定义为该年 "
+                    "frame 岗位数 >=100 的行业。覆盖率由 coverage 模块每轮对"
+                    "全体去重岗位确定性匹配计算，缺失时 fail-closed。"
+                ),
+            },
+            {
+                "field": "guideline_9_2_3_floor_overflow",
+                "guideline_value": "指南未覆盖（保底总额超过样本名额的情形）",
+                "adopted_value": "按行业岗位数由大到小保留保底并截断到名额",
+                "reason": (
+                    "行业极多而名额少时 min(50) 保底总额可能溢出；截断规则"
+                    "为本项目补充定义，大行业优先。"
                 ),
             },
         ],

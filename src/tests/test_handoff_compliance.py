@@ -103,9 +103,13 @@ def test_materialized_release_dictionary_contains_formal_abc_only():
 def test_saturation_uses_two_consecutive_incremental_rounds_only():
     from src.ai_penetration.panel_v2.discovery_formal import saturation_pass
 
+    # 2026-09-25 口径回归：§9.2.2 四条件（新增<5 + 覆盖率<0.1pp +
+    # 锚点未覆盖降幅<0.1pp）；round 0 不参与
     metrics = pd.DataFrame([
-        {"round": 0, "new_standard_concepts": 1, "coverage_gain_pp": 99.0},
-        {"round": 1, "new_standard_concepts": 4, "coverage_gain_pp": 99.0},
+        {"round": 0, "new_standard_concepts": 1,
+         "coverage_gain_pp": 99.0, "anchor_uncovered_pp": 50.0},
+        {"round": 1, "new_standard_concepts": 4,
+         "coverage_gain_pp": 99.0, "anchor_uncovered_pp": 50.0},
     ])
     assert not saturation_pass(metrics)
 
@@ -113,7 +117,11 @@ def test_saturation_uses_two_consecutive_incremental_rounds_only():
         metrics,
         pd.DataFrame([{
             "round": 2, "new_standard_concepts": 3,
-            "coverage_gain_pp": 99.0,
+            "coverage_gain_pp": 0.05, "anchor_uncovered_pp": 8.00,
+        }]),
+        pd.DataFrame([{
+            "round": 3, "new_standard_concepts": 2,
+            "coverage_gain_pp": 0.04, "anchor_uncovered_pp": 7.96,
         }]),
     ], ignore_index=True)
     assert saturation_pass(metrics)
@@ -123,8 +131,10 @@ def test_saturation_rejects_nonconsecutive_incremental_rounds():
     from src.ai_penetration.panel_v2.discovery_formal import saturation_pass
 
     metrics = pd.DataFrame([
-        {"round": 1, "new_standard_concepts": 2, "coverage_gain_pp": 0.0},
-        {"round": 3, "new_standard_concepts": 1, "coverage_gain_pp": 0.0},
+        {"round": 1, "new_standard_concepts": 2,
+         "coverage_gain_pp": 0.0, "anchor_uncovered_pp": 8.0},
+        {"round": 3, "new_standard_concepts": 1,
+         "coverage_gain_pp": 0.0, "anchor_uncovered_pp": 8.0},
     ])
     assert not saturation_pass(metrics)
 
