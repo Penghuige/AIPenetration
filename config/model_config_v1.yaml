@@ -49,36 +49,14 @@ generation:
   guided_json: true
   retry_invalid_json: 1
 
-# 经确认放宽的验收阈值。§8.10 的原值仍保留在 model_benchmark.THRESHOLDS 中，
-# 此处只记录采用值；指南原值、采用值与放宽依据会一并写入 manifest 的
-# guideline_deviations，避免放宽只存在于报告里。
-acceptance:
-  # §8.10 要求 0.95。实测 vLLM 连续批处理下 temperature=0 不可复现：一条序列
-  # 的输出取决于同批还有哪些序列，462 对配对样本实测一致性 0.905（约 9% 的
-  # 岗位跨重复漂移，方向随机）。按 §8.10 官方口径（分母为全部岗位，任一次
-  # 重复失败的岗位亦计为不一致）折算约 0.900，与 0.90 相比没有余量，故取
-  # 0.88。已验证解法为 VLLM_BATCH_INVARIANT=1，但会拖慢推理，经确认暂采用。
-  repeat_exact_rate_min: 0.88
-  # §8.10 要求 <=0.01，实测 0.0238。分类分析（26668 条 surface）显示绝大多数
-  # 不是编造，而是「形式不规范但内容真实」的改写：列表合并/加前缀（原文
-  # "数据分析、挖掘、清洗、整合、入库及备份" -> "数据整合/数据入库/数据备份"
-  # /数据挖掘"）、概括或调序（"负责方案升级、更新" -> "方案更新"），以及
-  # 占 0.30% 的纯格式变体。对最可疑的一桶（重合<=2字，占全部 0.94%）人工逐条
-  # 判定，可见的 9 条中 6 条确为编造，据此外推真实编造率约 0.01。故按 0.028
-  # 采用；生产侧只保留能在输入中定位的 surface，被丢弃者记入 nonverbatim_dropped，
-  # 使模型不逐字这一事实留在数据里。报告中须说明约 0.01 的真实编造残差。
-  hallucinated_surface_rate_max: 0.028
-  # §8.11 开头即写明「如果1000条技术基准无法达到99%的跨度有效率，不改变技能
-  # 抽取的研究口径，改用工程回退」——即指南已预见该指标达不到 0.99。本项目
-  # 已实现其回退（程序侧在模型输入中确定性定位 surface）。
-  # 本项与 hallucinated_surface_rate 在当前实现里互补（effective = 1 - hallucinated），
-  # 实测 0.9762。两者须同时放宽，否则放宽其一仍会因另一项失败。
-  # 实测有运行间波动（全套 1000 条 2.38%，80 条子集 3.34%），故取 0.972 留余量。
-  effective_span_valid_rate_min: 0.972
-  # §8.6 要求预运行 1 万条，经确认减半到 5000 以缩短周期。仍足以判定 1% 的
-  # 失败率阈值（按实测 0.3%，5000 条下约 15 次失败 ±7，与阈值的 50 次有足够
-  # 区分度）。prerun 的 repeats=1、不参与 repeat_exact，故减量不影响可复现性。
-  prerun_samples_min: 5000
+# 2026-09-25 基准线回归：删除经确认放宽的验收阈值段，指南 §8.10 原值
+# （THRESHOLDS：json_schema_valid>=0.995 / effective_span>=0.99 /
+#  hallucinated<=0.01 / failure<=0.01 / repeat_exact>=0.95）直接生效。
+# 依据：VLLM_BATCH_INVARIANT=1 批不变模式下 40 条×两轮乱序快测
+#  exact_agreement=1.000（2026-09-25，logs/quicktest_result.txt），
+#  repeat_exact 达 0.95 以上有余量；此前放宽的其余阈值随完整重测复核。
+#  历史放宽值与依据见 git 历史（283714f 之前版本）。
+
 text:
   chunk_target_tokens: 5000
   chunk_overlap_chars: 200
