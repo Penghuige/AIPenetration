@@ -55,7 +55,19 @@ generation:
 # 依据：VLLM_BATCH_INVARIANT=1 批不变模式下 40 条×两轮乱序快测
 #  exact_agreement=1.000（2026-09-25，logs/quicktest_result.txt），
 #  repeat_exact 达 0.95 以上有余量；此前放宽的其余阈值随完整重测复核。
-#  历史放宽值与依据见 git 历史（283714f 之前版本）。
+# 历史放宽值与依据见 git 历史（283714f 之前版本）。
+#
+# 2026-09-26 裁决回归（用户批准）：完整重测（qwen_candidate_1_batchinv，
+# 2000 调用）复核出 effective_span 0.9762 / hallucinated 0.0236，与
+# 283714f 之前登记的放宽测量值一致——两项属模型固有改写特性而非批处理
+# 问题；批不变只修复 repeat_exact（实测 0.997，已按指南原值 0.95 通过，
+# 0.88 放宽不再恢复）。仅恢复以下两项登记式放宽，依据全文见
+# model_benchmark._DEVIATION_REASONS 并随 manifest 落盘；
+# prerun 样本量维持指南 10000，不恢复 5000。
+
+acceptance:
+  effective_span_valid_rate_min: 0.972
+  hallucinated_surface_rate_max: 0.028
 
 text:
   chunk_target_tokens: 5000
